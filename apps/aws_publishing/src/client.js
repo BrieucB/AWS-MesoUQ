@@ -11,7 +11,7 @@ export function validateRuntime(config, location = globalThis.location) {
   return config;
 }
 export class Api {
-  constructor(config,token,fetcher=fetch,{expiresAt=Infinity,onUnauthorized=()=>{}}={}){this.config=config;this.token=token;this.fetcher=fetcher;this.expiresAt=expiresAt;this.onUnauthorized=onUnauthorized;this.authFailed=false;}
+  constructor(config,token,fetcher=fetch,{expiresAt=Infinity,onUnauthorized=()=>{}}={}){this.config=config;this.token=token;this.fetcher=fetcher.bind(globalThis);this.expiresAt=expiresAt;this.onUnauthorized=onUnauthorized;this.authFailed=false;}
   invalidate(){if(!this.authFailed){this.authFailed=true;this.token='';this.onUnauthorized();}}
   async request(path,body,method=body===undefined?'GET':'POST'){
     if(this.authFailed||Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}

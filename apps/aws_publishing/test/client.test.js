@@ -34,6 +34,28 @@ test('API sends bearer only to API with private cache, encoded IDs, and safe ser
   assert.equal(api.project('a/b','/jobs'),'/v1/projects/a%2Fb/jobs');await assert.rejects(api.request('/v1/me'),/Membership required/);
   assert.equal(sent[1].headers.Authorization,'Bearer private-token');assert.equal(sent[1].credentials,'omit');assert.equal(sent[1].redirect,'error');assert.equal(sent[1].cache,'no-store');
 });
+test('browser fetch keeps its global receiver for API requests and storage uploads',async(t)=>{
+  const calls=[];
+  function browserFetch(url,opts){
+    if(this!==globalThis)throw new TypeError('Illegal invocation');
+    calls.push({url,opts});
+    if(url.endsWith('/v1/me'))return Promise.resolve(response({sub:'invited-user'}));
+    if(url.endsWith('/artifacts'))return Promise.resolve(response({artifact:{id:'curve-1'},upload_url:'https://private-bucket.example.org/upload'}));
+    if(url.endsWith('/complete'))return Promise.resolve(response({artifact:{id:'curve-1',verified:true}}));
+    assert.equal(url,'https://private-bucket.example.org/upload');
+    assert.equal(opts.method,'PUT');
+    assert.equal(opts.headers.Authorization,undefined);
+    return Promise.resolve(response({}));
+  }
+  t.mock.method(globalThis,'fetch',browserFetch);
+  for(const injected of [false,true]){
+    const api=injected?new Api(config,'private-token',browserFetch):new Api(config,'private-token');
+    assert.deepEqual(await api.request('/v1/me'),{sub:'invited-user'});
+    assert.deepEqual(await api.upload('p',new File(['1,2\n3,4'],'curve.csv',{type:'text/csv'}),'curve',{}),{id:'curve-1',verified:true});
+  }
+  assert.equal(calls.length,8);
+  assert.equal(calls.filter(({opts})=>opts.method==='PUT').length,2);
+});
 test('artifact lifecycle hashes original bytes, preserves explicit metadata, PUT has no token, complete unwraps',async()=>{
   for(const wrapped of [true,false]){
     const calls=[];const file=new File(['force,d\n1,2\n3,4'],'curve.csv',{type:'text/csv'});
