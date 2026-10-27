@@ -90,3 +90,81 @@ test('synthetic minimal upload submits exact locked preset, supports diagnostics
     click('tab',{tab:'workspace'});change('diameter','3.4');assert.doesNotMatch(element.innerHTML,/synthetic.csv/);click('submit');await settle(/Exactly one verified curve/);
   }finally{globalThis.setTimeout=originalTimeout;globalThis.setInterval=originalInterval;}
 });
+
+test('both drawing modes use the existing CSV upload/submission flow and reset on metadata/project/logout',async(t)=>{
+  const listeners={},requests=[],csvDownloads=[],redirects=[];let widget,staged,releasePut,jobCount=0;
+  const config={apiBaseUrl:'https://api.example.test',cognitoDomain:'https://identity.example.test',clientId:'public',redirectUri:'https://portal.example.test/auth/callback',logoutUri:'https://portal.example.test/auth/login',uploadOrigins:['https://artifacts.example.test']};
+  function editorDom(){
+    const nodes=new Map();
+    const find=key=>{
+      if(!nodes.has(key))nodes.set(key,{value:key.includes('Max')?'1':'0',innerHTML:'',textContent:'',disabled:false,dataset:{},handlers:{},addEventListener(name,fn){this.handlers[name]=fn;},removeEventListener(name,fn){if(this.handlers[name]===fn)delete this.handlers[name];},setAttribute(){},matches(selector){return key.startsWith(selector.replace(']','='))||key===selector;}});
+      return nodes.get(key);
+    };
+    const root=find('root');root.querySelector=find;root.querySelectorAll=()=>['apply-ranges','add-point','undo','clear','download','use'].map(action=>{const button=find(`[data-editor-action="${action}"]`);button.dataset.editorAction=action;return button;});
+    const svg=find('[data-editor-canvas]');svg.getBoundingClientRect=()=>({left:0,top:0,width:640,height:360});svg.focus=()=>{};svg.setPointerCapture=id=>svg.pointer=id;svg.hasPointerCapture=id=>id===svg.pointer;svg.releasePointerCapture=()=>svg.pointer=null;
+    return {root,find,svg,action(name,force=false){const button=find(`[data-editor-action="${name}"]`);if(force)button.disabled=false;root.handlers.click({target:{closest:()=>button},preventDefault(){}});},pointer(type,x,y){svg.handlers[type]?.({pointerId:1,button:0,isPrimary:true,clientX:x,clientY:y,preventDefault(){}});},mode(value){const input=find('[data-editor-mode]');input.value=value;root.handlers.change({target:input});}};
+  }
+  const element={innerHTML:'',addEventListener:(name,fn)=>listeners[name]=fn,querySelector(selector){
+    if(selector==='[data-curve-editor]'){if(!this.innerHTML.includes('data-curve-editor'))return null;widget=editorDom();return widget.root;}
+    return {replaceChildren(){},disabled:false,value:''};
+  }};
+  globalThis.document={querySelector:selector=>selector==='#app'?element:null,hidden:false,createElement:()=>({click(){}})};
+  globalThis.location={origin:'https://portal.example.test',pathname:'/',search:'',assign:value=>redirects.push(String(value))};globalThis.history={replaceState(){}};globalThis.sessionStorage={removeItem(){}};
+  const oldTimeout=globalThis.setTimeout,oldInterval=globalThis.setInterval;globalThis.setTimeout=()=>0;globalThis.setInterval=()=>0;
+  t.mock.method(URL,'createObjectURL',blob=>{csvDownloads.push(blob);return 'blob:synthetic';});
+  globalThis.fetch=async(input,options={})=>{
+    const path=String(input);requests.push({path,options});let data;
+    if(path==='/auth/session')data={access_token:'memory-only-synthetic',expires_at:Math.floor(Date.now()/1000)+300};
+    else if(path==='runtime-config.json')data=config;
+    else if(path==='presets/indentation-v1.json')data=preset;
+    else if(path.endsWith('/v1/me'))data={subject:'researcher',email:'synthetic@example.test'};
+    else if(path.endsWith('/v1/projects'))data={projects:[{id:'p',name:'Synthetic P'},{id:'q',name:'Synthetic Q'}]};
+    else if(path.endsWith('/models'))data={models:[{model_version:'approved-v1',status:'released',provenance:{pipeline_binding:{id:preset.scientific_profile}}}]};
+    else if(path.endsWith('/artifacts')&&options.method==='POST'){staged={...JSON.parse(options.body),id:'drawn-'+requests.length};data={artifact:staged,upload_url:'https://artifacts.example.test/upload'};}
+    else if(path==='https://artifacts.example.test/upload'){await new Promise(resolve=>releasePut=resolve);data={};}
+    else if(path.endsWith('/complete'))data={artifact:staged};
+    else if(path.endsWith('/jobs')&&options.method==='POST')data={...JSON.parse(options.body),id:'job-'+(++jobCount),owner_sub:'researcher',status:'pending'};
+    else if(path.endsWith('/jobs'))data={jobs:[]};
+    else if(path==='/auth/logout')data={logout_url:config.cognitoDomain+'/logout?'+new URLSearchParams({client_id:config.clientId,logout_uri:location.origin+'/auth/login'})};
+    else throw Error('Unrecognized synthetic drawing request');
+    return {ok:true,status:200,json:async()=>data};
+  };
+  const settle=async predicate=>{for(let i=0;i<300&&!predicate();i++)await pause(2);assert.ok(predicate());};
+  const click=(action,extra={})=>listeners.click({target:{closest:()=>({dataset:{action,...extra},disabled:false})}});
+  const change=(id,value)=>listeners.change({target:{id,value}});
+  try{
+    await import('../src/app.js?drawing-workspace');await settle(()=>element.innerHTML.includes('Configure your analysis'));
+    for(const [order,mode] of [['force-displacement','freehand'],['displacement-force','points']]){
+      change('order',order);assert.equal(widget.find('[data-editor-count]').textContent,'0');widget.mode(mode);
+      widget.pointer('pointerdown',202,93);
+      if(mode==='freehand'){widget.pointer('pointermove',478,231);widget.pointer('pointerup',478,231);}
+      else{widget.pointer('pointerup',202,93);widget.pointer('pointerdown',478,231);widget.pointer('pointerup',478,231);}
+      assert.equal(widget.find('[data-editor-count]').textContent,'2');
+      widget.action('download');const csv=await csvDownloads.at(-1).text();assert.equal(csv.split('\n')[0],order==='force-displacement'?'force,displacement':'displacement,force');
+      assert.doesNotMatch(csv,/memory-only-synthetic/);
+      widget.action('use');await settle(()=>element.innerHTML.includes('Drawn curve · converted to CSV'));
+      assert.match(element.innerHTML,/drawn-curve.csv/);releasePut=undefined;click('upload');await settle(()=>typeof releasePut==='function');
+      const before=widget.find('[data-editor-count]').textContent;
+      for(const name of ['clear','undo','add-point','apply-ranges','download','use'])widget.action(name,true);
+      widget.pointer('pointerdown',340,162);widget.mode(mode==='points'?'freehand':'points');
+      assert.equal(widget.find('[data-editor-count]').textContent,before);
+      releasePut();await settle(()=>element.innerHTML.includes('Curve uploaded and verified'));
+      const put=requests.filter(r=>r.path==='https://artifacts.example.test/upload').at(-1);
+      assert.equal(new TextDecoder().decode(put.options.body),csv);assert.equal(put.options.headers.Authorization,undefined);
+      const original=JSON.parse(requests.filter(r=>r.path.endsWith('/artifacts')&&r.options.method==='POST').at(-1).options.body);
+      assert.deepEqual(original.metadata,{force_unit:'uN',displacement_unit:'um',column_order:order,nominal_diameter_um:3.2});
+      assert.equal(original.size_bytes,new TextEncoder().encode(csv).length);
+      click('submit');await settle(()=>element.innerHTML.includes('Calculation accepted'));
+      const submitted=JSON.parse(requests.filter(r=>r.path.endsWith('/jobs')&&r.options.method==='POST').at(-1).options.body);
+      assert.equal(submitted.input_artifacts.length,1);assert.equal(submitted.kind,'calibration');assert.deepEqual(submitted.configuration,preset.configuration);
+      click('tab',{tab:'workspace'});
+    }
+    change('forceUnit','N');assert.equal(widget.find('[data-editor-count]').textContent,'0');assert.doesNotMatch(element.innerHTML,/drawn-curve.csv/);
+    widget.find('[data-editor-coordinate="displacement"]').value='.2';widget.find('[data-editor-coordinate="force"]').value='.3';widget.action('add-point');
+    change('project','q');await settle(()=>element.innerHTML.includes('Configure your analysis')&&!/<select id="project" disabled>/.test(element.innerHTML));
+    assert.equal(widget.find('[data-editor-count]').textContent,'0');
+    widget.find('[data-editor-coordinate="displacement"]').value='.2';widget.find('[data-editor-coordinate="force"]').value='.3';widget.action('add-point');
+    click('logout');await settle(()=>redirects.length>0);assert.doesNotMatch(element.innerHTML,/data-curve-editor|drawn-curve.csv/);
+    assert.equal(jobCount,2);
+  }finally{globalThis.setTimeout=oldTimeout;globalThis.setInterval=oldInterval;}
+});

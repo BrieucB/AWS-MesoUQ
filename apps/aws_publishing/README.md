@@ -16,6 +16,30 @@ kb uncertainty is excluded. The result/configuration declares interval probabili
 posterior samples, fitted-curve and resonance numerical data, and PNG/PDF figures.
 Private filesystem paths are never fetched as downloads.
 
+## Draw an input curve
+
+Choose the force/displacement units, CSV column order and nominal diameter first.
+The drawing area uses displacement on X and force on Y. Set finite axis minima
+and maxima (initially 0–1), then apply the ranges. Negative ranges are supported.
+Use **Freehand** to drag with a mouse, trackpad or touch, or **Click to add points**
+to place individual samples. Numeric displacement/force fields provide a keyboard
+alternative; Enter adds a point. With the plot focused, arrow keys move the cursor,
+Enter/Space adds a point, Ctrl/⌘ Z undoes a point, and Escape ends a stroke.
+
+The editor retains the points in input order, with no smoothing, sorting or
+resampling. It skips identical consecutive pointer samples and stops explicitly
+at 1,000 points. Separate strokes stay separate on screen; ending or cancelling
+a stroke keeps its collected points. Undo and Clear let you revise the drawing.
+Changing axes preserves the numeric samples and rejects bounds that exclude them.
+
+**Download drawn CSV** exports the selected column order. **Use drawn curve**
+creates `drawn-curve.csv`, then runs the existing CSV parser, preview, private
+upload verification and locked calibration flow. At least two distinct points
+are required. Drawn inputs are labelled as drawn, rather than measured data.
+Changing metadata, project or selected file clears the drawing and selected
+input; editing drawn points also clears any prior preview/upload selection.
+All drawing controls are locked during uploads and other pending operations.
+
 ## Local checks
 
 Use Node 20 or newer. There are no npm dependencies to install.
