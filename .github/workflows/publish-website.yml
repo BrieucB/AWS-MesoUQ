@@ -3,14 +3,6 @@ name: Publish website static delta
 on:
   workflow_dispatch:
     inputs:
-      publication_role_arn:
-        description: Existing scoped website publication role ARN (private)
-        required: true
-        type: string
-      website_bucket:
-        description: Existing private website bucket (private)
-        required: true
-        type: string
       baseline_commit:
         description: Exact source commit matching the current website baseline
         required: true
@@ -38,6 +30,9 @@ jobs:
     steps:
       - name: Validate dispatch and mask private destination
         shell: bash
+        env:
+          PUBLICATION_ROLE_INPUT: ${{ secrets.AWS_WEBSITE_PUBLICATION_ROLE_ARN }}
+          WEBSITE_BUCKET_INPUT: ${{ secrets.AWS_WEBSITE_BUCKET }}
         run: |
           python3 - <<'PY'
           import json
@@ -49,8 +44,8 @@ jobs:
                   raise ValueError()
               with open(os.environ['GITHUB_EVENT_PATH']) as event_file:
                   inputs = json.load(event_file)['inputs']
-              role = inputs['publication_role_arn']
-              bucket = inputs['website_bucket']
+              role = os.environ['PUBLICATION_ROLE_INPUT']
+              bucket = os.environ['WEBSITE_BUCKET_INPUT']
               baseline = inputs['baseline_commit']
               source = inputs['expected_source_commit']
               if any(not isinstance(value, str) for value in (role, bucket, baseline, source)):
