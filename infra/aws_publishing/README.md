@@ -7,6 +7,17 @@ private application; actual deployment state and acceptance are recorded private
 GitHub OIDC defaults to that exact repository. Actual account/resource identifiers,
 operator memberships, approved models and keys are supplied privately for each deployment.
 
+`cognito_domain_prefix` defaults to `mesouq`, independently of the resource `name`.
+The sign-in domain appends a hyphen and the first 12 hexadecimal characters of
+SHA256 over `account_id:region:name` to reduce collisions without putting the
+account ID itself in the sign-in URL. An optional override belongs in private
+operator tfvars. The base must contain 1–50 lowercase letters, numbers or hyphens,
+start and end with a letter or number, and exclude `aws`, `amazon` and `cognito`
+anywhere. The suffix keeps the full prefix within Cognito's 63-character limit;
+availability is confirmed when AWS creates the domain. See the AWS
+[reserved terms](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-assign-domain.html#cognito-user-pools-assign-domain-things-to-know)
+and [domain constraints](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_CreateUserPoolDomain.html#CognitoUserPools-CreateUserPoolDomain-request-Domain).
+
 The module defines private S3 data and website buckets, CloudFront/OAC,
 DynamoDB job metadata, encrypted SQS revision notifications/dead letters, ECR,
 Lambda, HTTP API Gateway, required-TOTP invitation-only Cognito Lite/classic UI,
