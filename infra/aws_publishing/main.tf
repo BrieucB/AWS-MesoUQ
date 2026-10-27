@@ -200,13 +200,15 @@ resource "aws_iam_role_policy" "backend" {
   ] })
 }
 resource "aws_lambda_function" "backend" {
-  function_name                  = "${var.name}-backend"
-  role                           = aws_iam_role.backend.arn
-  package_type                   = "Image"
-  image_uri                      = var.image_uri
-  memory_size                    = 256
-  timeout                        = 28
-  reserved_concurrent_executions = 2
+  function_name = "${var.name}-backend"
+  role          = aws_iam_role.backend.arn
+  package_type  = "Image"
+  image_uri     = var.image_uri
+  memory_size   = 256
+  timeout       = 28
+  # Use the account's unreserved pool. New Free accounts can allow only ten
+  # concurrent executions and cannot satisfy AWS's minimum unreserved pool required
+  # to allocate reserved concurrency. API throttles and job admission still apply.
   environment {
     variables = {
       STATE_TABLE                  = aws_dynamodb_table.state.name

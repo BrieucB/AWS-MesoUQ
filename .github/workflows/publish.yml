@@ -1,0 +1,222 @@
+name: Publish backend image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-publishing-main
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: aws-publishing
+    env:
+      AWS_PUBLISH_ROLE_ARN: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ECR_REPOSITORY_NAME: ${{ secrets.AWS_ECR_REPOSITORY_NAME }}
+      AWS_ECR_REPOSITORY_URL: ${{ secrets.AWS_ECR_REPOSITORY_URL }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_CLI_AUTO_PROMPT: 'off'
+      AWS_PAGER: ''
+    steps:
+      - name: Validate private destination and register log masks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          try:
+              if os.environ['GITHUB_REF'] != 'refs/heads/main' or os.environ['GITHUB_EVENT_NAME'] != 'workflow_dispatch':
+                  raise ValueError('Invalid publication event')
+              names = ('AWS_PUBLISH_ROLE_ARN', 'AWS_REGION', 'AWS_ECR_REPOSITORY_NAME', 'AWS_ECR_REPOSITORY_URL')
+              values = {name: os.environ[name] for name in names}
+              if any(not value or value != value.strip() or any(ord(char) < 32 for char in value) for value in values.values()):
+                  raise ValueError('Invalid secret configuration')
+              role = re.fullmatch(r'arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9_+=,.@/-]+', values['AWS_PUBLISH_ROLE_ARN'])
+              if role is None:
+                  raise ValueError('Invalid publication role')
+              account = role[1]
+              region = values['AWS_REGION']
+              repository = values['AWS_ECR_REPOSITORY_NAME']
+              uri = values['AWS_ECR_REPOSITORY_URL']
+              registry, path = uri.split('/', 1)
+              if not re.fullmatch(r'[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+', region):
+                  raise ValueError('Invalid region')
+              if not re.fullmatch(r'[a-z0-9]+(?:[._/-][a-z0-9]+)*', repository) or not 2 <= len(repository) <= 256 or path != repository:
+                  raise ValueError('Invalid repository')
+              if not re.fullmatch(re.escape(account) + r'\.dkr\.ecr\.' + re.escape(region) + r'\.amazonaws\.com', registry):
+                  raise ValueError('Invalid private registry')
+              sha = os.environ['GITHUB_SHA']
+              if not re.fullmatch(r'[a-f0-9]{40}', sha):
+                  raise ValueError('Invalid source commit')
+              for value in (*values.values(), account, registry, uri + ':source-' + sha):
+                  print('::add-mask::' + value.replace('%', '%25'), flush=True)
+          except Exception:
+              sys.exit('Publication configuration is missing or invalid; inspect environment secrets privately.')
+          PY
+      - name: Checkout the exact main commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Obtain ephemeral ECR publication credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: aws-mesouq-${{ github.run_id }}
+          role-duration-seconds: 900
+          mask-aws-account-id: true
+          output-credentials: false
+          output-env-credentials: true
+          unset-current-credentials: true
+          translate-env-variables: false
+      - name: Publish or verify the immutable source image
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import tarfile
+          import tempfile
+
+          stage = 'configuration'
+          builder = None
+          registry = None
+          os.umask(0o077)
+          def mask(value):
+              print('::add-mask::' + value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'), flush=True)
+          def command(argv, data=None, timeout=900):
+              # Neither command output nor exceptions containing argv/identifiers
+              # reach public logs. No build records or deployment outputs upload.
+              return subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    check=True, timeout=timeout).stdout
+          def ecr(operation, *arguments):
+              return json.loads(command(['aws', 'ecr', operation, '--region', region,
+                                         '--no-cli-pager', '--output', 'json', *arguments]))
+          def image():
+              response = ecr('batch-get-image', '--registry-id', account, '--repository-name', repository,
+                             '--image-ids', 'imageTag=' + tag, '--accepted-media-types', media)
+              images, failures = response.get('images', []), response.get('failures', [])
+              if not images and len(failures) == 1 and failures[0].get('failureCode') == 'ImageNotFound':
+                  return None
+              if len(images) != 1 or failures:
+                  raise ValueError('Cannot identify a unique existing image')
+              item = images[0]
+              digest = item['imageId']['imageDigest']
+              if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
+                  raise ValueError('Invalid image digest')
+              mask(digest)
+              mask(uri + '@' + digest)
+              raw = item['imageManifest'].encode()
+              manifest = json.loads(raw)
+              if ('sha256:' + hashlib.sha256(raw).hexdigest() != digest
+                      or item.get('imageManifestMediaType') != media or manifest.get('mediaType') != media
+                      or manifest.get('schemaVersion') != 2 or 'manifests' in manifest):
+                  raise ValueError('Expected one checksum-bound OCI image manifest')
+              for descriptor in [manifest['config'], *manifest['layers']]:
+                  mask(descriptor['digest'])
+              return digest, manifest
+
+          try:
+              if os.environ['GITHUB_REF'] != 'refs/heads/main' or os.environ['GITHUB_EVENT_NAME'] != 'workflow_dispatch':
+                  raise ValueError('Invalid publication event')
+              sha = os.environ['GITHUB_SHA']
+              if command(['git', 'rev-parse', 'HEAD']).decode().strip() != sha:
+                  raise ValueError('Checkout differs from the selected source commit')
+              region = os.environ['AWS_REGION']
+              repository = os.environ['AWS_ECR_REPOSITORY_NAME']
+              uri = os.environ['AWS_ECR_REPOSITORY_URL']
+              account = os.environ['AWS_PUBLISH_ROLE_ARN'].split(':')[4]
+              registry = uri.split('/', 1)[0]
+              tag = 'source-' + sha
+              reference = uri + ':' + tag
+              source = 'https://github.com/' + os.environ['GITHUB_REPOSITORY']
+              media = 'application/vnd.oci.image.manifest.v1+json'
+              for value in (account, registry, uri, reference):
+                  mask(value)
+              stage = 'immutable repository verification'
+              described = ecr('describe-repositories', '--registry-id', account, '--repository-names', repository)['repositories']
+              if (len(described) != 1 or described[0]['repositoryUri'] != uri
+                      or described[0]['repositoryName'] != repository or described[0]['registryId'] != account
+                      or described[0].get('imageTagMutability') != 'IMMUTABLE'
+                      or described[0].get('imageTagMutabilityExclusionFilters')):
+                  raise ValueError('The exact destination must enforce immutable tags without exclusions')
+              existing = image()
+              with tempfile.TemporaryDirectory(prefix='aws-mesouq-publish-', dir=os.environ['RUNNER_TEMP']) as temporary:
+                  root = Path(temporary)
+                  os.environ['DOCKER_CONFIG'] = str(root / 'docker-auth')
+                  Path(os.environ['DOCKER_CONFIG']).mkdir(mode=0o700)
+                  stage = 'ephemeral registry authentication'
+                  password = command(['aws', 'ecr', 'get-login-password', '--region', region, '--no-cli-pager'])
+                  command(['docker', 'login', '--username', 'AWS', '--password-stdin', registry], data=password)
+                  published_digest = None
+                  try:
+                      if existing is None:
+                          stage = 'public source context preparation'
+                          context = root / 'context'
+                          context.mkdir(mode=0o700)
+                          selected = ['services/aws_publishing/Dockerfile', 'services/aws_publishing/pyproject.toml',
+                                      'services/aws_publishing/aws_publishing', 'src/aws_mesouq/__init__.py',
+                                      'src/aws_mesouq/contracts.py', 'src/aws_mesouq/release.py', 'src/aws_mesouq/presets']
+                          archive = command(['git', 'archive', '--format=tar', sha, *selected])
+                          with tarfile.open(fileobj=io.BytesIO(archive)) as files:
+                              for member in files.getmembers():
+                                  parts = Path(member.name).parts
+                                  if Path(member.name).is_absolute() or '..' in parts or not (member.isdir() or member.isfile()):
+                                      raise ValueError('Unexpected source archive entry')
+                              files.extractall(context, filter='data')
+                          stage = 'single-platform OCI image build and publication'
+                          builder = 'aws-mesouq-publisher'
+                          command(['docker', 'buildx', 'create', '--name', builder, '--driver', 'docker-container', '--use'])
+                          metadata = root / 'build-metadata.json'
+                          command(['docker', 'buildx', 'build', '--builder', builder, '--platform', 'linux/amd64',
+                                   '--provenance=false', '--sbom=false', '--metadata-file', str(metadata),
+                                   '--label', 'org.opencontainers.image.revision=' + sha,
+                                   '--label', 'org.opencontainers.image.source=' + source,
+                                   '--output', 'type=image,name=' + reference + ',push=true,oci-mediatypes=true',
+                                   '--file', str(context / 'services/aws_publishing/Dockerfile'), str(context)])
+                          published_digest = json.loads(metadata.read_text())['containerimage.digest']
+                          mask(published_digest)
+                          existing = image()
+                      stage = 'remote image digest and source-label verification'
+                      if existing is None or (published_digest is not None and existing[0] != published_digest):
+                          raise ValueError('Published image does not match the build digest')
+                      digest, manifest = existing
+                      immutable = uri + '@' + digest
+                      mask(immutable)
+                      command(['docker', 'pull', '--platform', 'linux/amd64', immutable])
+                      inspected = json.loads(command(['docker', 'image', 'inspect', immutable]))
+                      if len(inspected) != 1:
+                          raise ValueError('Cannot inspect a unique immutable image')
+                      config = inspected[0]
+                      labels = config.get('Config', {}).get('Labels') or {}
+                      if (config.get('Os') != 'linux' or config.get('Architecture') != 'amd64'
+                              or config.get('Id') != manifest['config']['digest']
+                              or labels.get('org.opencontainers.image.revision') != sha
+                              or labels.get('org.opencontainers.image.source') != source
+                              or immutable not in config.get('RepoDigests', [])):
+                          raise ValueError('Existing tag does not identify the exact source/platform image')
+                      print('Immutable backend image verified for the selected main commit; destination and digest remain private.')
+                  finally:
+                      if builder:
+                          subprocess.run(['docker', 'buildx', 'rm', builder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      subprocess.run(['docker', 'logout', registry], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          except Exception:
+              print('::error::Image publishing failed during ' + stage + '; command output and AWS identifiers were withheld.')
+              sys.exit(1)
+          PY

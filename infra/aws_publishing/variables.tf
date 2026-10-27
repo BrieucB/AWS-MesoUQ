@@ -19,6 +19,14 @@ variable "github_environment" {
   type    = string
   default = "aws-publishing"
 }
+variable "github_oidc_subject_prefix" {
+  type        = string
+  description = "Exact sub_claim_prefix reported by the repository OIDC settings API, including immutable owner/repository IDs when enabled. Supply privately; no environment/ref suffix."
+  validation {
+    condition     = can(regex("^repo:[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$", var.github_oidc_subject_prefix))
+    error_message = "Use the exact repo:OWNER/REPOSITORY prefix, including @ID suffixes when configured. Wildcards and environment/ref suffixes are forbidden."
+  }
+}
 variable "github_oidc_provider_arn" {
   type        = string
   description = "Existing GitHub OIDC provider ARN in the target account; avoids duplicate providers."

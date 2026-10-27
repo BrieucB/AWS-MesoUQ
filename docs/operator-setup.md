@@ -6,6 +6,76 @@ private account configuration, and an AWS account within the authorized spending
 boundary. Deployment and scientific acceptance require private evidence; source
 checks do not establish that a live deployment has passed.
 
+## Publish the backend image
+
+Live operations require owner authorization for their account, resource changes,
+and spending boundary. Existing authorization for this project applies within
+that agreed scope. Offline validation remains offline; the publication workflow
+does not deploy Lambda, apply Terraform, administer IAM, invite users, or change
+an account plan. Website publication is a separate future operation.
+
+An operator provisions the private ECR repository with immutable tags and no
+mutability exclusions, plus an ECR-only OIDC publication role. Configure the
+GitHub environment `aws-publishing` to allow deployments from `main` only, and
+scope the role trust to this exact repository and environment. Verify the actual
+GitHub OIDC subject format when setting the trust policy; do not broaden it to
+wildcard repositories, environments, or branches. Configure these four values as
+environment **secrets**, including values that are not AWS credentials:
+
+| Secret | Private value |
+| --- | --- |
+| `AWS_PUBLISH_ROLE_ARN` | The narrowly scoped OIDC role ARN |
+| `AWS_REGION` | The repository's AWS Region |
+| `AWS_ECR_REPOSITORY_NAME` | The existing private repository name |
+| `AWS_ECR_REPOSITORY_URL` | Its registry/repository URI, without a tag or scheme |
+
+In a private operator session, read the repository's current OIDC configuration:
+
+```sh
+gh api repos/OWNER/REPOSITORY/actions/oidc/customization/sub --jq '{use_immutable_subject, sub_claim_prefix}'
+```
+
+Use the returned `sub_claim_prefix` unchanged as the private Terraform input
+`github_oidc_subject_prefix`; the trust policy appends exactly
+`:environment:aws-publishing`. Preserve immutable subjects when enabled. Do not
+opt out, substitute a guessed legacy prefix, or add a wildcard to compensate for
+a subject mismatch. Keep the resulting account/trust configuration private.
+
+Run **Publish backend image** manually from `main` after its required source
+checks pass. The job also checks `refs/heads/main`, uses the protected environment,
+and checks out the exact dispatch commit. The AWS credential action is pinned to
+the reviewed official release commit and obtains a short-lived OIDC session;
+long-lived AWS keys are not configured. ECR login state is temporary and removed
+after the image operation.
+
+The workflow publishes only `source-<full Git commit SHA>` in the configured
+repository. It builds a minimal context from selected tracked control-plane,
+contract, and preset files, excluding measurements, models, connector journals,
+deployment configuration, and the HPC engine. The image targets `linux/amd64`
+with one OCI image manifest, with provenance and SBOM attestations disabled to
+avoid a Lambda-incompatible image index. It verifies the registry manifest digest,
+image configuration, architecture, and OCI source/revision labels.
+
+If that immutable source tag already exists, the job verifies its exact source
+labels, digest, and platform and succeeds without rebuilding or overwriting it.
+A mutable repository, mismatched image, unsupported manifest, or uncertain AWS
+response fails closed. Base images and dependencies can change between builds;
+rerunning a source commit preserves its already published verified image.
+
+Account, role, repository, registry, image URI, and discovered digests remain
+masked. AWS/Docker output is captured rather than streamed, and the workflow
+uploads no build records, artifacts, deployment outputs, or account configuration.
+Keep debug logging disabled. A failure reports only its operation stage; inspect
+any required destination details through authorized private operator tooling.
+Obtain the verified immutable `@sha256:...` image reference privately for a
+separate reviewed Terraform plan. Never paste it into a public issue, workflow
+output, source file, or pull-request comment.
+
+These choices follow the official
+[AWS credential action](https://github.com/aws-actions/configure-aws-credentials),
+[Lambda image requirements](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html),
+and [ECR tag immutability guidance](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-tag-mutability.html).
+
 ## Local connector identity
 
 Install the package in an isolated Python 3.11+ environment on the collaborator's
