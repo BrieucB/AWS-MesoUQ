@@ -10,6 +10,15 @@ variable "name" {
     error_message = "Use a lowercase resource prefix of 3–36 characters."
   }
 }
+variable "cognito_domain_prefix" {
+  type        = string
+  default     = "mesouq"
+  description = "Cognito domain base; a hyphen and deterministic 12-character account/region/name hash are appended."
+  validation {
+    condition     = length(var.cognito_domain_prefix) <= 50 && can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", var.cognito_domain_prefix)) && !can(regex("aws|amazon|cognito", var.cognito_domain_prefix))
+    error_message = "Use 1-50 lowercase letters, numbers or hyphens, starting and ending with a letter or number, without aws, amazon or cognito. The generated suffix keeps the full domain within 63 characters."
+  }
+}
 variable "github_repository" {
   type        = string
   default     = "BrieucB/AWS-MesoUQ"

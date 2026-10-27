@@ -151,7 +151,7 @@ resource "aws_cognito_user_pool" "users" {
   tags = local.tags
 }
 resource "aws_cognito_user_pool_domain" "users" {
-  domain                = "${var.name}-${data.aws_caller_identity.current.account_id}"
+  domain                = "${var.cognito_domain_prefix}-${substr(sha256("${data.aws_caller_identity.current.account_id}:${var.region}:${var.name}"), 0, 12)}"
   user_pool_id          = aws_cognito_user_pool.users.id
   managed_login_version = 1
 }
