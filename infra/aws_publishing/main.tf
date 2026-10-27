@@ -267,8 +267,8 @@ resource "aws_apigatewayv2_route" "api" {
   authorizer_id        = aws_apigatewayv2_authorizer.users.id
   authorization_scopes = ["openid"]
 }
-# Browsers send preflights without bearer tokens. The explicit method takes
-# priority over ANY; API Gateway's existing CORS policy answers valid preflights.
+# Browsers send preflights without bearer tokens. This route takes priority over
+# ANY; Lambda returns an empty 204 and Gateway applies its configured CORS policy.
 resource "aws_apigatewayv2_route" "preflight" {
   api_id             = aws_apigatewayv2_api.api.id
   route_key          = "OPTIONS /v1/{proxy+}"

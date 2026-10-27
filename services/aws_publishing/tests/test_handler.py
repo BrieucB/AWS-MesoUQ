@@ -52,6 +52,59 @@ def test_gateway_access_token_required(configured):
     assert handler.handler(event, None)["statusCode"] == 401
 
 
+def test_preflight_returns_empty_response_without_initialization_or_parsing(monkeypatch):
+    from container_smoke import event
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Preflight must not initialize services or parse a body")
+
+    class NoEnvironment:
+        get = __getitem__ = forbidden
+
+    request = event("/v1/projects/synthetic/jobs", "OPTIONS")
+    request.update(body="not base64 or JSON", isBase64Encoded=True)
+    request["headers"] = {"origin": "https://untrusted.invalid"}
+    with monkeypatch.context() as isolated:
+        isolated.setattr(handler, "application", forbidden)
+        isolated.setattr(handler, "site_auth", forbidden)
+        isolated.setattr(handler.base64, "b64decode", forbidden)
+        isolated.setattr(handler.json, "loads", forbidden)
+        isolated.setattr(handler.os, "environ", NoEnvironment())
+        response = handler.handler(request, None)
+    assert response["statusCode"] == 204 and response["body"] == ""
+    assert response["headers"]["cache-control"] == "no-store"
+    assert not any(key.lower().startswith("access-control-") for key in response["headers"])
+    assert "untrusted.invalid" not in json.dumps(response)
+
+
+@pytest.mark.parametrize(
+    "method,path,route_key",
+    [
+        ("GET", "/v1/me", "OPTIONS /v1/{proxy+}"),
+        ("POST", "/v1/projects/synthetic/jobs", "OPTIONS /v1/{proxy+}"),
+        ("OPTIONS", "/v1/me", "ANY /v1/{proxy+}"),
+        ("OPTIONS", "/v1/me", "GET /v1/me"),
+        ("OPTIONS", "/v1", "OPTIONS /v1/{proxy+}"),
+        ("OPTIONS", "/health", "OPTIONS /v1/{proxy+}"),
+    ],
+)
+def test_preflight_exception_cannot_bypass_actual_methods_or_routes(
+    configured, monkeypatch, method, path, route_key
+):
+    from container_smoke import event
+
+    def forbidden():
+        raise AssertionError("Unauthenticated requests must not reach the application")
+
+    monkeypatch.setattr(handler, "application", forbidden)
+    request = event(path, method)
+    request["routeKey"] = route_key
+    request["body"] = "invalid JSON must be rejected after authentication"
+    response = handler.handler(request, None)
+    assert response["statusCode"] == 401
+    assert json.loads(response["body"])["error"]["code"] == "unauthenticated"
+
+
 def test_invalid_json_and_nonfinite_values(configured):
     for value in ("{", '{"unsafe":NaN}', '{"unsafe":Infinity}'):
         event = {**configured, "body": value}

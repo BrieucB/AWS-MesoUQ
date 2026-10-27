@@ -5,7 +5,8 @@ For a container on an internal no-egress network, copy this file into /tmp and r
 it with the image's Python via docker exec and --base-url http://127.0.0.1:8080.
 The HTTP client must share the emulator's network namespace in that case.
 Only loopback destinations are accepted. This client never supplies an authorizer
-or accesses AWS; /health is public and /v1/me must retain its authentication guard.
+or accesses AWS; preflight is empty, /health is public, and actual API methods
+must retain their authentication guards.
 """
 
 from __future__ import annotations
@@ -44,10 +45,13 @@ def invocation_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/2015-03-31/functions/function/invocations"
 
 
-def event(path: str) -> dict:
+def event(path: str, method: str = "GET") -> dict:
+    route = method + " " + path
+    if path.startswith("/v1/"):
+        route = ("OPTIONS" if method == "OPTIONS" else "ANY") + " /v1/{proxy+}"
     return {
         "version": "2.0",
-        "routeKey": "GET " + path,
+        "routeKey": route,
         "rawPath": path,
         "rawQueryString": "",
         "headers": {},
@@ -56,7 +60,7 @@ def event(path: str) -> dict:
             "requestId": "local-container-smoke",
             "stage": "$default",
             "http": {
-                "method": "GET",
+                "method": method,
                 "path": path,
                 "protocol": "HTTP/1.1",
                 "sourceIp": "127.0.0.1",
@@ -105,6 +109,16 @@ def invoke(
 
 def smoke(base_url: str, *, invoker=invoke) -> None:
     url = invocation_url(base_url)
+    # Invoke preflight first, before health initializes the application clients.
+    preflight = event("/v1/me", "OPTIONS")
+    preflight["headers"] = {
+        "origin": "https://portal.example.invalid",
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "authorization",
+    }
+    empty = invoker(url, preflight)
+    assert empty.get("statusCode") == 204 and empty["body"] == "", "Image rejected preflight"
+    assert not any(key.lower().startswith("access-control-") for key in empty.get("headers", {})), "Gateway must own CORS headers"
     healthy = invoker(url, event("/health"))
     assert (
         healthy.get("statusCode") == 200
@@ -114,10 +128,13 @@ def smoke(base_url: str, *, invoker=invoke) -> None:
     denied = invoker(url, event("/v1/me"))
     assert denied.get("statusCode") == 401, "Image bypassed authentication for /v1/me"
     assert json.loads(denied["body"]).get("error", {}).get("code") == "unauthenticated"
+    denied_post = invoker(url, event("/v1/projects/synthetic/jobs", "POST"))
+    assert denied_post.get("statusCode") == 401, "Image bypassed authentication for POST"
+    assert json.loads(denied_post["body"]).get("error", {}).get("code") == "unauthenticated"
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:9000")
     smoke(parser.parse_args().base_url)
-    print("Real Lambda image health and unauthenticated-route smoke passed")
+    print("Real Lambda image preflight, health and authentication smoke passed")
