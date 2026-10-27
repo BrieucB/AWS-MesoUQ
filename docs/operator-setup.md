@@ -85,13 +85,21 @@ Dispatch `publish-website.yml` manually on `main` in the existing
 `aws-publishing` environment. Supply the exact reviewed main SHA as
 `expected_source_commit`, the exact source SHA matching the currently deployed
 baseline as `baseline_commit` (initial default:
-`457c2baa2860d3b144ac5e045e98c2769c69f21a`), and the existing scoped publication
-role ARN and website bucket as private inputs. Check both commits and destination
-privately before approving the environment deployment. Keep debug logging
-disabled and do not copy private inputs into issues, PRs or release notes.
+`457c2baa2860d3b144ac5e045e98c2769c69f21a`). These two public commit SHAs are the
+only dispatch inputs; dispatch event metadata is not confidential.
 
-The first step reads dispatch input values from the event file and masks role,
-account and bucket before exporting them. Authentication executes the unchanged
+Configure the existing destination as two environment secrets in
+`aws-publishing`: `AWS_WEBSITE_PUBLICATION_ROLE_ARN` for the scoped publication
+role ARN and `AWS_WEBSITE_BUCKET` for the website bucket. These secrets contain
+destination metadata, not AWS credentials, and require no new IAM resources or
+permissions. GitHub masks their values before step logging. Check both commits
+and the destination privately before approving the environment deployment. Keep
+debug logging disabled and do not copy destination metadata into issues, PRs or
+release notes.
+
+The first step reads public SHA inputs from the event file and private destination
+values from the environment secrets, then validates and masks role, account and
+bucket before exporting the publication environment. Authentication executes the unchanged
 official AWS credential client bundle from its exact reviewed commit under Node
 24. A bounded wrapper forwards only complete standard log-mask commands from
 its captured stdout/stderr; other authentication output is discarded and failures

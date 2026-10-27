@@ -20,9 +20,11 @@ BASELINE = "b" * 40
 
 class WebsiteWorkflowTests(unittest.TestCase):
     def run_admission(self, patch=None, **environment):
-        inputs = {"publication_role_arn": ROLE, "website_bucket": BUCKET,
-                  "baseline_commit": BASELINE, "expected_source_commit": SHA}
-        inputs.update(patch or {})
+        patch = dict(patch or {})
+        role = patch.pop("publication_role_arn", ROLE)
+        bucket = patch.pop("website_bucket", BUCKET)
+        inputs = {"baseline_commit": BASELINE, "expected_source_commit": SHA}
+        inputs.update(patch)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             event = root / "event.json"
@@ -30,7 +32,8 @@ class WebsiteWorkflowTests(unittest.TestCase):
             destination = root / "environment"
             env = {"GITHUB_REF": "refs/heads/main", "GITHUB_EVENT_NAME": "workflow_dispatch",
                    "GITHUB_SHA": SHA, "GITHUB_EVENT_PATH": str(event),
-                   "GITHUB_ENV": str(destination)}
+                   "GITHUB_ENV": str(destination), "PUBLICATION_ROLE_INPUT": role,
+                   "WEBSITE_BUCKET_INPUT": bucket}
             env.update(environment)
             result = subprocess.run([sys.executable, "-c", ADMISSION], env=env,
                                     capture_output=True, text=True, timeout=5)
@@ -47,6 +50,10 @@ class WebsiteWorkflowTests(unittest.TestCase):
                           "BASELINE_COMMIT=" + BASELINE])
         self.assertNotIn(chr(36) + "{{ inputs.", SOURCE)
         self.assertNotIn("print(inputs", ADMISSION)
+        self.assertNotIn("inputs['publication_role_arn']", ADMISSION)
+        self.assertNotIn("inputs['website_bucket']", ADMISSION)
+        self.assertIn("PUBLICATION_ROLE_INPUT: " + chr(36) + "{{ secrets.AWS_WEBSITE_PUBLICATION_ROLE_ARN }}", SOURCE)
+        self.assertIn("WEBSITE_BUCKET_INPUT: " + chr(36) + "{{ secrets.AWS_WEBSITE_BUCKET }}", SOURCE)
 
     def test_wrong_ref_event_and_unreviewed_source_fail_without_export(self):
         for environment in [
