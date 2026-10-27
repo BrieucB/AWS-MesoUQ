@@ -12,7 +12,7 @@ Live operations require owner authorization for their account, resource changes,
 and spending boundary. Existing authorization for this project applies within
 that agreed scope. Offline validation remains offline; the publication workflow
 does not deploy Lambda, apply Terraform, administer IAM, invite users, or change
-an account plan. Website publication is a separate future operation.
+an account plan. Website publication uses the separate manual static workflow described below.
 
 An operator provisions the private ECR repository with immutable tags and no
 mutability exclusions, plus an ECR-only OIDC publication role. Configure the
@@ -75,6 +75,56 @@ These choices follow the official
 [AWS credential action](https://github.com/aws-actions/configure-aws-credentials),
 [Lambda image requirements](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html),
 and [ECR tag immutability guidance](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-tag-mutability.html).
+
+
+## Publish the inline posterior website update
+
+Use **Publish website static delta** only after the reviewed source change is
+merged, required checks pass, and the operator has approved this static release.
+Dispatch `publish-website.yml` manually on `main` in the existing
+`aws-publishing` environment. Supply the exact reviewed main SHA as
+`expected_source_commit`, the exact source SHA matching the currently deployed
+baseline as `baseline_commit` (initial default:
+`457c2baa2860d3b144ac5e045e98c2769c69f21a`), and the existing scoped publication
+role ARN and website bucket as private inputs. Check both commits and destination
+privately before approving the environment deployment. Keep debug logging
+disabled and do not copy private inputs into issues, PRs or release notes.
+
+The first step reads dispatch input values from the event file and masks role,
+account and bucket before exporting them. Authentication executes the unchanged
+official AWS credential client bundle from its exact reviewed commit under Node
+24. A bounded wrapper forwards only complete standard log-mask commands from
+its captured stdout/stderr; other authentication output is discarded and failures
+report a generic category. No authentication log files are created. The normal
+OIDC client exports short-lived credentials through the runner environment and
+its official cleanup bundle clears them even after publication failure. Owner
+credentials and long-lived AWS keys are not used. The job checks exact source identity
+and baseline ancestry, then builds both public frontend trees under runner
+temporary storage. It uses the existing repository/environment OIDC trust and
+`AWS_REGION` secret, with a short session policy allowing reads of exactly the ten website assets and
+writes to only `src/posterior.js`, `src/style.css` and `src/app.js`. It does not
+change IAM, environment settings, bucket configuration or permissions. The
+session also retains ListBucket on exactly the selected bucket, so a missing
+posterior object yields a distinguishable 404 rather than AccessDenied.
+Destination and object metadata are never logged.
+
+The helper rejects root, IAM user and unexpected assumed-role identities before
+accessing S3. It checks all nine existing assets against the reviewed baseline
+(or exact target bytes on a partial rerun), preserves the live
+`runtime-config.json` byte for byte, and adds the posterior module first,
+replaces CSS second, and replaces the application entry module last.
+Writes use ETag/absence conditions, SHA256 checksums, AES256 encryption and
+`no-store`; readback verifies all ten assets. Unexpected live bytes or metadata
+fail closed. A verified rerun skips already published target bytes. Failure after
+an earlier write can leave a partial static update; inspect the sanitized failure
+category privately and rerun only the same reviewed source/baseline after
+resolving the cause. There is no automatic rollback or deletion.
+
+No artifacts or private reports are uploaded. The workflow prints only sanitized
+verification counts and a manifest digest. CloudFront TTL is zero, so no
+invalidation is requested. This release does not dispatch the backend image
+workflow, deploy backend services, run scientific jobs, or require a new HPC
+calculation to display an existing completed posterior figure.
 
 ## Local connector identity
 

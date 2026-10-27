@@ -16,6 +16,17 @@ kb uncertainty is excluded. The result/configuration declares interval probabili
 posterior samples, fitted-curve and resonance numerical data, and PNG/PDF figures.
 Private filesystem paths are never fetched as downloads.
 
+Choose **Load scientific result** on a completed calculation to show the existing
+posterior distributions figure for kA, kB and d0 beneath the parameter estimates.
+On narrow screens, focus or swipe the figure frame to scroll across its panels.
+The browser accepts only the explicit `figures__posterior.png` output reference,
+verifies matching artifact metadata, an exact PNG media type, byte length,
+SHA256 and PNG signature, and limits the image to 10 MiB before showing it.
+Storage downloads use approved private origins without bearer credentials.
+A missing PNG is reported as unavailable. A failed load or image decode offers
+**Retry figure**, which reloads only the image. Existing numerical and figure
+downloads remain available. Viewing a completed result requires no new HPC run.
+
 ## Draw an input curve
 
 Choose the force/displacement units, CSV column order and nominal diameter first.

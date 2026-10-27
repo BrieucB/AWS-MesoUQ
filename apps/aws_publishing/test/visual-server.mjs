@@ -7,7 +7,7 @@ const root=path.resolve(new URL('..',import.meta.url).pathname);
 const types={'.html':'text/html','.js':'text/javascript','.css':'text/css','.json':'application/json'};
 http.createServer(async(req,res)=>{
   try{
-    res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+    res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     const url=new URL(req.url,'http://127.0.0.1:4173');
     if(url.pathname==='/__fixtures__/workspace'){
       let html=await readFile(path.join(root,'index.html'),'utf8');
@@ -19,4 +19,4 @@ http.createServer(async(req,res)=>{
     if(!file.startsWith(root+path.sep))throw Error('Invalid path');
     res.setHeader('Content-Type',types[path.extname(file)]||'application/octet-stream');res.setHeader('Cache-Control','no-store');res.end(await readFile(rel==='presets/indentation-v1.json'?path.resolve(root,'../../src/aws_mesouq/presets/indentation-v1.json'):file));
   }catch{res.writeHead(404);res.end('Not found');}
-}).listen(4173,'127.0.0.1',()=>console.log('TEST ONLY synthetic fixtures: http://127.0.0.1:4173/__fixtures__/workspace'));
+}).listen(Number(process.env.MESOUQ_VISUAL_PORT||4173),'127.0.0.1',()=>console.log('TEST ONLY synthetic fixtures listening on loopback port '+(process.env.MESOUQ_VISUAL_PORT||4173)));
