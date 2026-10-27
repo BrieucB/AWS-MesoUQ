@@ -78,6 +78,8 @@ jobs:
       - run: terraform -chdir=infra/aws_publishing fmt -check -recursive
       - run: terraform -chdir=infra/aws_publishing init -backend=false -input=false
       - run: terraform -chdir=infra/aws_publishing validate
+      - name: Verify preflight and authenticated route boundaries without AWS
+        run: terraform -chdir=infra/aws_publishing test
 
   container:
     runs-on: ubuntu-latest
