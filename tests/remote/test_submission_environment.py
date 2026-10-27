@@ -62,9 +62,13 @@ def test_actual_helper_strips_submission_overrides_and_forces_one_job(tmp_path, 
     assert scheduler.submit(str(batch)) == '12345'
     recorded = json.loads(capture.read_text())
     assert recorded['argv'] == [str(binary), '--parsable', '--nodes=1', '--ntasks=1', '--no-requeue', '--export=NIL', str(batch)]
-    # CPython may establish LC_CTYPE during startup; the test stub records its
-    # own process environment after that interpreter adjustment.
-    assert set(recorded['environment']) <= {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'LC_CTYPE'}
+    # The stub observes its Python process after startup, when CPython may add
+    # LC_CTYPE and macOS may add exactly __CF_USER_TEXT_ENCODING. These are
+    # observation exceptions; the production helper's allowlist stays unchanged.
+    observed_allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'LC_CTYPE'}
+    if sys.platform == 'darwin':
+        observed_allowed.add('__CF_USER_TEXT_ENCODING')
+    assert set(recorded['environment']) <= observed_allowed
     assert not any(key.startswith(('SBATCH_', 'SLURM_')) for key in recorded['environment'])
     assert not set(hostile) & set(recorded['environment'])
     assert recorded['environment']['PATH'] == str(binary.parent) + os.pathsep + os.defpath

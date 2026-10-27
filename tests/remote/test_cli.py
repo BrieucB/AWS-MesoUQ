@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
+
 from aws_mesouq.connector import cli
 
 
-def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch):
+@pytest.mark.parametrize('site', ['karolina', 'vega'])
+def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch, site):
+    monkeypatch.setenv('MESOUQ_SITE', site)
     registry = tmp_path / 'registry.json'
     registry.write_text('{}')
     performed = []
@@ -21,7 +25,7 @@ def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch):
             performed.append('closed')
     class Connector:
         def __init__(self, *args, **kwargs):
-            pass
+            assert kwargs['site'] == site
         def sweep(self):
             performed.append('sweep')
             return ['job-a', 'job-b']
@@ -34,7 +38,7 @@ def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, 'browser_login', lambda *args: 'in-memory')
     monkeypatch.setattr(cli, 'API', lambda *args: SimpleNamespace())
     monkeypatch.setattr(cli.time, 'sleep', lambda *_args: (_ for _ in ()).throw(AssertionError('once must not sleep')))
-    result = cli.main(['--once', '--site', 'karolina', '--api-url', 'https://api', '--project', 'p',
+    result = cli.main(['--once', '--site', site, '--api-url', 'https://api', '--project', 'p',
         '--oauth-domain', 'https://auth', '--client-id', 'public-client', '--local-cluster',
         '--expected-user', 'ownuser', '--expected-host', 'verified.cluster', '--run-root', '/private/runs',
         '--repository', '/trusted/repo', '--model-registry', str(registry), '--journal', str(tmp_path / 'journal')])
