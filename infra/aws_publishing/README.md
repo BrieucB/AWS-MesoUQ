@@ -1,10 +1,11 @@
 # AWS-MesoUQ infrastructure source
 
 These Terraform inputs belong to
-[BrieucB/AWS-MesoUQ](https://github.com/BrieucB/AWS-MesoUQ). They describe a proposed
-private application, not deployed resources. `name` defaults to `aws-mesouq` and
+[BrieucB/AWS-MesoUQ](https://github.com/BrieucB/AWS-MesoUQ). They describe the
+private application; actual deployment state and acceptance are recorded privately.
+`name` defaults to `aws-mesouq` and
 GitHub OIDC defaults to that exact repository. Actual account/resource identifiers,
-operator memberships, approved models and keys are supplied privately later.
+operator memberships, approved models and keys are supplied privately for each deployment.
 
 The module defines private S3 data and website buckets, CloudFront/OAC,
 DynamoDB job metadata, encrypted SQS revision notifications/dead letters, ECR,
@@ -25,8 +26,10 @@ Vega validation is deferred.
 
 ## Owner prerequisites
 
-Deployment has not been authorized. No workflow may deploy resources, invoke AWS,
-invite users or upgrade an account plan as part of offline validation. The approved
+Live operations require owner authorization for their account, resource changes,
+and spending boundary; existing project authorization applies within its agreed
+scope. Offline validation must not deploy resources, invoke AWS, invite users, or
+upgrade an account plan. The approved
 budget is €0 out of pocket under the AWS Free account plan. The owner must verify
 account-plan/service eligibility, credit expiry and usage coverage before any live
 operation. A monitoring budget is not a spending cap; the module does not create
@@ -39,14 +42,42 @@ owner-controlled secure state backend/access policy before shared operation; thi
 module creates no implicit state backend. Its `.gitignore` excludes local state,
 plans and private tfvars, and is not a substitute for controlling state access.
 
-Initial ECR/image bootstrap requires separate owner-reviewed steps: create ECR,
-build/push the lightweight service image, then supply its immutable `@sha256:...`
+Initial ECR/image bootstrap follows the authorized owner-reviewed sequence: create
+the immutable ECR repository and narrow OIDC role, manually publish the lightweight
+service image from `main`, then supply its private immutable `@sha256:...`
 reference for a full plan. Never apply a placeholder image. The Dockerfile copies
 only dependency-light contracts/release/preset plus the control plane, excluding
 connector/scientific code. An existing GitHub OIDC provider ARN is required; the
-publish role trusts only the exact repository/environment and allows ECR pushes,
-website upload and CloudFront invalidation. It cannot update Lambda or administer
-IAM, Terraform, Cognito, DynamoDB or the science data bucket.
+image workflow's bootstrap role trusts only the exact repository/environment and
+is limited to ECR authentication plus reads/uploads in the exact repository. It
+cannot update Lambda or administer IAM, Terraform, Cognito, DynamoDB or the science
+data bucket. The module's general publication role also describes website upload
+and CloudFront invalidation for a separately scoped later publication step.
+
+The manual [image publication workflow](../../.github/workflows/publish.yml) uses
+the `aws-publishing` GitHub environment, restricted to `main` by environment policy
+and its own ref check. Supply `AWS_PUBLISH_ROLE_ARN`, `AWS_REGION`,
+`AWS_ECR_REPOSITORY_NAME`, and `AWS_ECR_REPOSITORY_URL` as environment secrets.
+Privately read `repos/OWNER/REPOSITORY/actions/oidc/customization/sub` through
+`gh api` and supply its unchanged `sub_claim_prefix` as
+`github_oidc_subject_prefix`. IAM must match that exact prefix plus
+`:environment:aws-publishing`; retain immutable subjects and never use a broad
+wildcard or guessed legacy subject. The prefix and account-specific trust policy
+belong in private operator configuration.
+Its short-lived role requires `ecr:GetAuthorizationToken` on `*`, with
+`ecr:DescribeRepositories`, `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`,
+`ecr:BatchCheckLayerAvailability`, `ecr:InitiateLayerUpload`, `ecr:UploadLayerPart`,
+`ecr:CompleteLayerUpload`, and `ecr:PutImage` restricted to the exact repository.
+It receives no repository-creation, tag-mutability, deletion, deployment, or
+website permissions. See the [operator procedure](../../docs/operator-setup.md#publish-the-backend-image)
+for private configuration and immutable rerun behavior.
+
+The published tag is `source-<full Git commit SHA>`. Builds explicitly target one
+`linux/amd64` OCI manifest with provenance/SBOM disabled. Existing tags must match
+the source/revision labels, platform, configuration, and registry manifest digest;
+they are not overwritten. Destination identifiers, digests, and AWS/Docker output
+remain private; the workflow emits no deployment outputs or build artifacts.
+It publishes the image only and does not apply infrastructure or update Lambda.
 
 Generate an RSA2048 key pair using an approved owner workflow. Supply only the
 public PEM to `site_signing_public_key_pem`. Separately provision its matching
@@ -118,8 +149,11 @@ Incomplete multipart uploads abort after one day; that is separate from verified
 artifact retention. Buckets are not force-destroyed and Cognito/DynamoDB deletion
 protection is enabled. CloudWatch retains seven days, SQS notifications one day and
 dead letters four days; ECR retains three untagged images. No VPC/NAT or idle HPC
-compute cluster is created. Account quotas may reject reserved Lambda concurrency;
-resolve that with owner review without silently changing the approved budget/plan.
+compute cluster is created. Lambda uses the account's unreserved concurrency pool;
+the module does not request a per-function reserved allocation. The ten-active-job
+admission cap is separate from Lambda request concurrency. Inspect account-wide
+service quotas privately and preserve the approved budget/plan; do not silently
+request quota increases or introduce a reserved-concurrency requirement.
 
 Offline commands, when Terraform and the locked provider are locally available:
 
