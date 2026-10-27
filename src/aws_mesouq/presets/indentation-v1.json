@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "id": "indentation-sonovue-v1",
+  "scientific_profile": "uq_emb_sonovue_202607",
+  "supported_diameters_um": [
+    3.2,
+    3.4,
+    5.8
+  ],
+  "configuration": {
+    "scientific_profile": "uq_emb_sonovue_202607",
+    "phase1_contract_mode": "emb_direct_ka_kb",
+    "calibration_data": "curve_only",
+    "experiment": "indentation",
+    "calibration_mode": "individual",
+    "emb_diameters": [
+      3.2
+    ],
+    "frac_diam": 0.2,
+    "use_surrogate": true,
+    "surrogate": {
+      "backend": "dnn",
+      "predictive_mc_samples": 32,
+      "predictive_mc_chunk_size": 8
+    },
+    "pop_size": 50000,
+    "max_gen": -1,
+    "target_cov": 0.8,
+    "covariance_scaling": 0.04,
+    "phase1_burn_in": 1,
+    "prior_ka": [
+      617.0581351146693,
+      42000
+    ],
+    "prior_kb": [
+      100,
+      48000
+    ],
+    "prior_d0": [
+      0,
+      0.5
+    ],
+    "prior_sigma": [
+      0.005,
+      0.3
+    ],
+    "indentation_prior_sigma": [
+      0.045,
+      0.11
+    ],
+    "hbi_pop_size": 50000,
+    "hbi_burn_in": 1,
+    "hbi_target_cov": 0.6,
+    "hbi_covariance_scaling": 0.04,
+    "phase3b_pop_size": 50000,
+    "phase3b_max_gen": -1,
+    "phase3b_target_cov": 0.8,
+    "phase3b_covariance_scaling": 0.015,
+    "hyperprior_mu_ka": [
+      8500,
+      11000
+    ],
+    "hyperprior_sigma_ka": [
+      300,
+      1000
+    ],
+    "hyperprior_mu_kb": [
+      14000,
+      24000
+    ],
+    "hyperprior_sigma_kb": [
+      4000,
+      10000
+    ],
+    "interval_probability": 0.9,
+    "resonance": {
+      "agent": "sonovue",
+      "unit_defaults_modality": "indentation",
+      "evaluator": {
+        "mode": "artifact_polynomial_bank"
+      }
+    }
+  },
+  "resonance_assumption": "Frequency uncertainty propagates ka variation conditional on the approved polynomial bank fixed kb; inferred kb uncertainty is not propagated."
+}

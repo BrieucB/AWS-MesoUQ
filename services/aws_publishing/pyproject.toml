@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesouq-aws-publishing"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["boto3>=1.35,<2", "PyJWT[crypto]>=2.10,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+include = ["aws_publishing*"]

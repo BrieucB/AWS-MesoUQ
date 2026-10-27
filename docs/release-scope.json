@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "repository": "BrieucB/AWS-MesoUQ",
+  "release": "0.1.0",
+  "application_access": "invited users with MFA; entire website protected",
+  "public_material": [
+    "source",
+    "infrastructure definitions",
+    "tests",
+    "documentation"
+  ],
+  "private_material": [
+    "scientific installations",
+    "models",
+    "research measurements",
+    "results",
+    "real validation",
+    "operator configuration",
+    "connector device private keys",
+    "deployment state"
+  ],
+  "workflow": "single-curve indentation calibration",
+  "scientific_preset": "indentation-sonovue-v1",
+  "supported_diameters_um": [
+    3.2,
+    3.4,
+    5.8
+  ],
+  "scientific_engine": "operator-installed MesoUQ on HPC",
+  "connector_platforms": [
+    "macos",
+    "linux"
+  ],
+  "connector_device_enrollment": "operator IAM administration of invited identity connector_public_keys; no browser self-registration",
+  "signed_connector_events": [
+    "succeeded",
+    "archive_verified"
+  ],
+  "scientific_adapter_approval": "operator registry approved_adapter_sha256 pin checked before remote staging and submission",
+  "hpc_sites": [
+    "karolina",
+    "vega"
+  ],
+  "live_vega_validation": "deferred",
+  "max_invited_collaborators": 5,
+  "max_active_jobs": 10,
+  "archive": "separate verified persistent storage; computations use SCRATCH",
+  "aws_file_retention": "at least 30 days from server receipt of the first verified signed archive receipt",
+  "database_summaries": "retained",
+  "recruiter_local_scientific_demo": false,
+  "deferred": [
+    "population calibration",
+    "retraining",
+    "model promotion",
+    "independent scientific engine",
+    "native Windows"
+  ],
+  "release_acceptance": "owner completes private browser-to-AWS-to-Karolina-to-browser workflow; required checks and review pass",
+  "curve_upload_limits": {
+    "max_bytes": 1048576,
+    "min_points": 2,
+    "max_points": 1000,
+    "dialect": "unquoted finite decimal or scientific notation; two columns; optional header"
+  }
+}

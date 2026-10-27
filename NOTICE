@@ -1,0 +1,13 @@
+AWS-MesoUQ includes publishing components derived from MesoUQ by BrieucB,
+under the MIT License reproduced in LICENSE.
+
+The initial selected source export was taken from MesoUQ revision
+031c8286cea273381f872bf7b307a5806e0cb99f. It does not include MesoUQ's Git
+history, scientific runtime, trained checkpoints, or research measurements.
+
+Installed scientific dependencies retain their respective licenses.
+
+The public application package includes its locked preset and standalone adapter,
+but scientific calculations require an independently installed MesoUQ runtime.
+The application's cryptography dependency retains its upstream license; it is
+not a grant of permission to redistribute private models or research data.

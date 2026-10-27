@@ -1,0 +1,275 @@
+{
+  "$id": "urn:mesouq:aws-publishing:v1:result",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "curve",
+              "training_table",
+              "result",
+              "posterior",
+              "model",
+              "validation",
+              "log",
+              "manifest"
+            ]
+          },
+          "media_type": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "sha256",
+          "size_bytes",
+          "media_type"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "curves": {
+      "items": {
+        "properties": {
+          "dataset_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "displacement_unit": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "force": {
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "force_unit": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "lower": {
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "median": {
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "observed_displacement": {
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "upper": {
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "dataset_id",
+          "force",
+          "observed_displacement",
+          "median",
+          "lower",
+          "upper",
+          "force_unit",
+          "displacement_unit"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "diagnostics": {
+      "type": "object"
+    },
+    "interval_probability": {
+      "exclusiveMaximum": 1,
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "kind": {
+      "enum": [
+        "calibration",
+        "prediction",
+        "training"
+      ]
+    },
+    "parameters": {
+      "items": {
+        "properties": {
+          "lower": {
+            "type": "number"
+          },
+          "median": {
+            "type": "number"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "unit": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "upper": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "unit",
+          "lower",
+          "median",
+          "upper"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "provenance": {
+      "properties": {
+        "code_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "config_sha256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "data_sha256": {
+          "additionalProperties": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "job_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "model_sha256": {
+          "oneOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "minProperties": 1,
+              "type": "object"
+            }
+          ]
+        },
+        "model_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runtime": {
+          "properties": {
+            "python": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "python"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "job_id",
+        "model_version",
+        "code_sha256",
+        "model_sha256",
+        "data_sha256",
+        "config_sha256",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "publication_files": {
+      "description": "Connector requires a safe relative allowlist including result.json and provenance.json; execution manifests/scripts are private.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 2,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "resonance": {
+      "properties": {
+        "status": {
+          "enum": [
+            "available",
+            "unavailable"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "training": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "provenance",
+    "interval_probability",
+    "parameters",
+    "curves",
+    "resonance",
+    "diagnostics"
+  ],
+  "type": "object"
+}

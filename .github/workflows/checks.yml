@@ -1,0 +1,106 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python (${{ matrix.os }}, ${{ matrix.site }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        site: [karolina, vega]
+    runs-on: ${{ matrix.os }}
+    env:
+      MESOUQ_SITE: ${{ matrix.site }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_ACCESS_KEY_ID: testing
+      AWS_SECRET_ACCESS_KEY: testing
+      AWS_DEFAULT_REGION: eu-central-1
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip setuptools wheel
+      - run: python -m pip install -e '.[test]' -e 'services/aws_publishing[test]' matplotlib
+      - run: python -m pytest
+      - run: python tools/check_public_export.py
+      - run: python -m pip wheel --no-deps --no-build-isolation . --wheel-dir /tmp/aws-mesouq-wheel
+      - name: Verify installed wheel without source checkout
+        shell: bash
+        run: |
+          python -m pip install --no-index --no-deps --target /tmp/aws-mesouq-installed /tmp/aws-mesouq-wheel/*.whl
+          cd /tmp
+          python -I - <<'PY'
+          import socket
+          import sys
+          from importlib.resources import files
+          def offline(*args, **kwargs):
+              raise AssertionError('Wheel import attempted a network connection')
+          socket.socket.connect = offline
+          socket.create_connection = offline
+          sys.path.insert(0, '/tmp/aws-mesouq-installed')
+          import aws_mesouq.connector.cli
+          import aws_mesouq.adapters.indentation
+          from aws_mesouq.release import preset
+          assert preset()['id'] == 'indentation-sonovue-v1'
+          assert files('aws_mesouq').joinpath('presets/indentation-v1.json').is_file()
+          assert files('aws_mesouq').joinpath('adapters/indentation.py').is_file()
+          assert not {'torch', 'matplotlib', 'meso_uq'}.intersection(sys.modules)
+          PY
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm --prefix apps/aws_publishing ci
+      - run: npm --prefix apps/aws_publishing test
+      - run: npm --prefix apps/aws_publishing run build
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.11.4'
+      - run: terraform -chdir=infra/aws_publishing fmt -check -recursive
+      - run: terraform -chdir=infra/aws_publishing init -backend=false -input=false
+      - run: terraform -chdir=infra/aws_publishing validate
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: docker build -t aws-mesouq-api -f services/aws_publishing/Dockerfile .
+      - name: Start isolated Lambda emulator
+        run: |
+          docker run --detach --name aws-mesouq-api-smoke --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,size=64m \
+            --env AWS_EC2_METADATA_DISABLED=true \
+            --env AWS_REGION=eu-central-1 --env AWS_DEFAULT_REGION=eu-central-1 \
+            --env AWS_ACCESS_KEY_ID=testing --env AWS_SECRET_ACCESS_KEY=testing \
+            --env STATE_TABLE=synthetic-smoke --env DATA_BUCKET=synthetic-smoke \
+            --env EVENT_QUEUE_URL=https://queue.example.invalid/synthetic-smoke \
+            --env COGNITO_ISSUER=https://identity.example.invalid \
+            --env COGNITO_CLIENT_ID=synthetic-smoke aws-mesouq-api
+      - name: Invoke real image health and authentication guard
+        run: |
+          docker exec --interactive aws-mesouq-api-smoke /var/lang/bin/python - --base-url http://127.0.0.1:8080 < services/aws_publishing/tests/container_smoke.py
+      - name: Remove smoke container
+        if: always()
+        run: docker rm --force aws-mesouq-api-smoke || true

@@ -1,0 +1,97 @@
+{
+  "$id": "urn:mesouq:aws-publishing:v1:create-job",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "configuration": {
+      "description": "Scientific settings are additionally checked by validate_job_configuration; runtime paths/code/scheduler fields are rejected.",
+      "type": "object"
+    },
+    "diameter_um": {
+      "enum": [
+        3.2,
+        3.4,
+        5.8
+      ]
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "input_artifacts": {
+      "items": {
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "curve",
+              "training_table",
+              "result",
+              "posterior",
+              "model",
+              "validation",
+              "log",
+              "manifest"
+            ]
+          },
+          "media_type": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "sha256",
+          "size_bytes",
+          "media_type"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": {
+      "enum": [
+        "calibration",
+        "prediction",
+        "training"
+      ]
+    },
+    "model_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "model_version",
+    "diameter_um",
+    "configuration",
+    "input_artifacts",
+    "idempotency_key"
+  ],
+  "type": "object"
+}

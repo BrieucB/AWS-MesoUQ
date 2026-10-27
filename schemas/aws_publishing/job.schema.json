@@ -1,0 +1,165 @@
+{
+  "$id": "urn:mesouq:aws-publishing:v1:job",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "approved_model": {
+      "properties": {
+        "sha256": {
+          "oneOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "minProperties": 1,
+              "type": "object"
+            }
+          ]
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "configuration": {
+      "description": "Scientific settings are additionally checked by validate_job_configuration; runtime paths/code/scheduler fields are rejected.",
+      "type": "object"
+    },
+    "created_at": {
+      "description": "UTC Unix epoch seconds",
+      "type": "number"
+    },
+    "diameter_um": {
+      "enum": [
+        3.2,
+        3.4,
+        5.8
+      ]
+    },
+    "id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "input_artifacts": {
+      "items": {
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "curve",
+              "training_table",
+              "result",
+              "posterior",
+              "model",
+              "validation",
+              "log",
+              "manifest"
+            ]
+          },
+          "media_type": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "sha256",
+          "size_bytes",
+          "media_type"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "kind": {
+      "enum": [
+        "calibration",
+        "prediction",
+        "training"
+      ]
+    },
+    "model_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "owner_sub": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "project_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "claimed",
+        "submitting",
+        "queued",
+        "running",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "submission_unknown"
+      ]
+    },
+    "updated_at": {
+      "description": "UTC Unix epoch seconds",
+      "type": "number"
+    }
+  },
+  "required": [
+    "id",
+    "schema_version",
+    "project_id",
+    "owner_sub",
+    "approved_model",
+    "status",
+    "created_at",
+    "updated_at",
+    "revision"
+  ],
+  "type": "object"
+}
