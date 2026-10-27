@@ -123,6 +123,20 @@ def is_maintenance_event(event):
 
 
 def handler(event, context):
+    # Only the dedicated unauthenticated Gateway route may skip token checks.
+    # Return no data or CORS headers; Gateway applies its configured CORS policy.
+    if (
+        isinstance(event, dict)
+        and event.get("routeKey") == "OPTIONS /v1/{proxy+}"
+        and event.get("requestContext", {}).get("http", {}).get("method") == "OPTIONS"
+        and isinstance(event.get("rawPath"), str)
+        and event["rawPath"].startswith("/v1/")
+    ):
+        return {
+            "statusCode": 204,
+            "headers": {"cache-control": "no-store", "x-content-type-options": "nosniff"},
+            "body": "",
+        }
     if is_maintenance_event(event):
         # Keep failures as invocation errors so Lambda's asynchronous retry policy
         # can retry the durable pending tags; an HTTP503 would count as success.

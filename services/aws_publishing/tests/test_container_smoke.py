@@ -5,15 +5,19 @@ from container_smoke import NoRedirect, event, invocation_url, invoke, smoke
 
 
 def test_smoke_invokes_real_http_api_shapes_without_authorizer():
-    paths = []
+    requests = []
 
     def invoker(url, payload):
         assert url == "http://127.0.0.1:9000/2015-03-31/functions/function/invocations"
         assert payload["version"] == "2.0"
-        assert payload["requestContext"]["http"]["method"] == "GET"
+        method = payload["requestContext"]["http"]["method"]
         assert "authorizer" not in payload["requestContext"]
-        assert not payload["headers"]
-        paths.append(payload["rawPath"])
+        assert "authorization" not in payload["headers"]
+        requests.append((method, payload["rawPath"]))
+        if method == "OPTIONS":
+            assert payload["routeKey"] == "OPTIONS /v1/{proxy+}"
+            assert payload["headers"]["access-control-request-method"] == "GET"
+            return {"statusCode": 204, "body": "", "headers": {"cache-control": "no-store"}}
         if payload["rawPath"] == "/health":
             return {
                 "statusCode": 200,
@@ -23,7 +27,12 @@ def test_smoke_invokes_real_http_api_shapes_without_authorizer():
         return {"statusCode": 401, "body": '{"error":{"code":"unauthenticated"}}'}
 
     smoke("http://127.0.0.1:9000", invoker=invoker)
-    assert paths == ["/health", "/v1/me"]
+    assert requests == [
+        ("OPTIONS", "/v1/me"),
+        ("GET", "/health"),
+        ("GET", "/v1/me"),
+        ("POST", "/v1/projects/synthetic/jobs"),
+    ]
 
 
 @pytest.mark.parametrize(
