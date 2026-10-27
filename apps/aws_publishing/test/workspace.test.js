@@ -16,7 +16,7 @@ test('synthetic minimal upload submits exact locked preset, supports diagnostics
   globalThis.sessionStorage={removeItem:()=>{},getItem:()=>{throw Error('No token storage');},setItem:()=>{throw Error('No token storage');}};
   const originalTimeout=globalThis.setTimeout,originalInterval=globalThis.setInterval;
   globalThis.setTimeout=()=>0;globalThis.setInterval=()=>0;
-  let staged,count=0,submitFails=true;
+  let staged,count=0,submitFails=true,releaseUpload;
   globalThis.fetch=async(input,options={})=>{
     const path=String(input);requests.push({path,options});let data;
     if(path==='/auth/session')data={access_token:'memory-token',expires_at:Math.floor(Date.now()/1000)+300};
@@ -25,7 +25,7 @@ test('synthetic minimal upload submits exact locked preset, supports diagnostics
     else if(path.endsWith('/v1/me'))data={subject:'researcher',email:'synthetic@example.test'};
     else if(path.endsWith('/v1/projects'))data={projects:[{id:'p',name:'Synthetic project',site:'karolina'}]};
     else if(path.endsWith('/models'))data={models:[{model_version:'approved-v1',status:'released',provenance:{pipeline_binding:{id:preset.scientific_profile}}}]};
-    else if(path==='https://artifacts.example.test/upload')data={};
+    else if(path==='https://artifacts.example.test/upload'){await new Promise(resolve=>releaseUpload=resolve);data={};}
     else if(path.endsWith('/artifacts')&&options.method==='POST'){staged={...JSON.parse(options.body),id:`curve-${++count}`};data={artifact:staged,upload_url:'https://artifacts.example.test/upload'};}
     else if(/\/artifacts\/curve-\d+\/complete$/.test(path))data={artifact:staged};
     else if(path.endsWith('/jobs')&&options.method==='POST'){
@@ -50,7 +50,27 @@ test('synthetic minimal upload submits exact locked preset, supports diagnostics
     assert.doesNotMatch(element.innerHTML,/id="(?:kind|mode|model|configuration|calibrationData)"|Retrain|Model registry|density|correlation/);
     change('order','displacement-force');change('forceUnit','nN');change('displacementUnit','nm');change('diameter','5.8');
     change('file',undefined,[new File(['d,f\n1,2\n3,4'],'synthetic.csv',{type:'text/csv'})]);await settle(/Upload &amp; verify curve/);
-    click('upload');await settle(/Curve uploaded and verified/);
+    change('file',undefined,[new File(['1,NaN\n3,4'],'invalid.csv',{type:'text/csv'})]);await settle(/numeric CSV/);
+    assert.doesNotMatch(element.innerHTML,/synthetic.csv|Upload &amp; verify curve/);
+    assert.match(element.innerHTML,/data-action="submit" disabled/);
+    assert.equal(requests.filter(r=>r.path.endsWith('/artifacts')).length,0);
+    change('file',undefined,[new File(['d,f\n1,2\n3,4'],'synthetic.csv',{type:'text/csv'})]);await settle(/Upload &amp; verify curve/);
+    click('upload');
+    for(let i=0;i<100&&!releaseUpload;i++)await pause(2);
+    assert.equal(typeof releaseUpload,'function');
+    for(const id of ['diameter','forceUnit','displacementUnit','order'])assert.match(element.innerHTML,new RegExp(`<select id="${id}" disabled>`));
+    // Stale/programmatic events must not change the captured upload metadata.
+    change('diameter','3.2');change('forceUnit','N');change('displacementUnit','m');change('order','force-displacement');click('remove');
+    releaseUpload();await settle(/Curve uploaded and verified/);
+    for(const value of ['5.8','nN','nm','displacement-force'])assert.ok(element.innerHTML.includes(`<option value="${value}" selected>`));
+    change('file',undefined,[new File(['1,2\n3,4'],'replacement.txt',{type:'text/plain'})]);await settle(/Choose one CSV curve/);
+    assert.doesNotMatch(element.innerHTML,/synthetic.csv|Upload &amp; verify curve|Remove curve/);
+    assert.match(element.innerHTML,/data-action="submit" disabled/);
+    assert.equal(count,1); // Previously verified server object is retained, never deleted.
+    change('file',undefined,[new File(['d,f\n1,2\n3,4'],'synthetic.csv',{type:'text/csv'})]);await settle(/Upload &amp; verify curve/);
+    releaseUpload=undefined;click('upload');
+    for(let i=0;i<100&&!releaseUpload;i++)await pause(2);
+    assert.equal(typeof releaseUpload,'function');releaseUpload();await settle(/Curve uploaded and verified/);
     click('submit');await settle(/Synthetic retryable admission failure/);
     click('submit');await settle(/Calculation accepted/);
     const submitted=requests.filter(r=>r.path.endsWith('/jobs')&&r.options.method==='POST').map(r=>JSON.parse(r.options.body));
