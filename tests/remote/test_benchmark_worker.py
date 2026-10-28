@@ -140,7 +140,7 @@ def write_fixture_receipt(session, entry, status="completed"):
     target.mkdir(parents=True, mode=0o700)
     os.chmod(root / "stages", 0o700)
     source_files = {"fixture.py": "f" * 64}
-    receipt = {"stage": stage, "status": status, "request_fingerprint": entry["claim"]["campaign"]["scientific_request_hash"], "transport_request_fingerprint": entry["claim"]["campaign"]["configuration_hash"], "source_binding": {"files": source_files, "sha256": checksum(source_files)}, "slurm_job_id": entry["job_id"], "wall_seconds": 5}
+    receipt = {"stage": stage, "status": status, "campaign_instance_id": entry["claim"]["campaign"]["id"], "request_fingerprint": entry["claim"]["campaign"]["scientific_request_hash"], "transport_request_fingerprint": entry["claim"]["campaign"]["configuration_hash"], "source_binding": {"files": source_files, "sha256": checksum(source_files)}, "slurm_job_id": entry["job_id"], "wall_seconds": 5}
     if stage == "cases":
         case_blob = b"fixture-only-case-data"
         case_path = target / "cases.npz"
@@ -357,7 +357,7 @@ def test_standalone_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, mo
     from aws_mesouq.adapters import benchmark
     request_path = tmp_path / "request.json"
     request_path.write_bytes(canonical({"fixture": True}))
-    manifest = {"adapter_sha256": "a" * 64, "environment_script": "/trusted/runtime.sh", "environment_sha256": "a" * 64, "repository": "/trusted/science", "science_revision": "b" * 40, "request": str(request_path), "configuration_hash": checksum({"fixture": True}), "python_bin": "/trusted/bin/python", "campaign_root": "/private/fixture", "stage": stage, "internal_seconds": 50, "device": "cpu" if stage == "cases" else "cuda"}
+    manifest = {"adapter_sha256": "a" * 64, "environment_script": "/trusted/runtime.sh", "environment_sha256": "a" * 64, "repository": "/trusted/science", "science_revision": "b" * 40, "request": str(request_path), "configuration_hash": checksum({"fixture": True}), "python_bin": "/trusted/bin/python", "campaign_root": "/private/fixture", "campaign_instance_id": "fixture-campaign", "stage": stage, "internal_seconds": 50, "device": "cpu" if stage == "cases" else "cuda"}
     if stage == "metrics":
         manifest.update(allocation_costs="/trusted/allocation-costs.json", allocation_costs_sha256="a" * 64)
     manifest_path = tmp_path / "manifest.json"
@@ -370,6 +370,7 @@ def test_standalone_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, mo
     assert benchmark.execute(manifest_path) == 0
     assert (commands[0][:3] == ["mpirun", "-np", "1"]) == uses_mpi
     assert "meso_uq.benchmark_lab.cli" in commands[0] and "--request" in commands[0]
+    assert commands[0][commands[0].index("--campaign-instance-id") + 1] == "fixture-campaign"
     if stage == "metrics":
         assert "--allocation-costs" in commands[0] and "--allocation-costs-sha256" in commands[0]
     request_path.write_text('{"fixture": false}')
@@ -437,3 +438,17 @@ def test_compact_archive_verifies_every_original_beyond_two_thousand_files(sessi
     assert copied == verified
     assert len(copied) == receipt["attested_original_file_count"] + 1
     assert (Path(session.operator["archive_root"]) / session.campaign["id"] / "retained/native-2000.json").read_bytes() == b"{}"
+
+
+def test_same_request_receipt_from_another_campaign_is_rejected(session):
+    session.worker.sweep()
+    entry = entries(session)[0]
+    receipt = write_fixture_receipt(session, entry)
+    receipt["campaign_instance_id"] = "different-global-campaign"
+    path = Path(entry["root"]) / "stages/cases/receipt.json"
+    path.write_bytes(canonical(receipt))
+    result = session.worker.sweep()
+    assert not result["errors"]
+    stage = session.store.state["benchmark_campaigns"][session.campaign["id"]]["stages"][0]
+    assert stage["status"] == "failed"
+    assert stage["failure"]["code"] == "invalid_scientific_receipt"

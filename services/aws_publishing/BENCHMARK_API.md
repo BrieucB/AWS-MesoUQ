@@ -165,3 +165,9 @@ signed original-file count and snapshot hash are connector attestations;
 the cloud service cannot inspect PROJECT files independently. Unverified
 partial cloud uploads are explicitly quarantined and remain storage-charged;
 they are not falsely described as committed archived results.
+
+Every scientific invocation also receives the globally unique cloud campaign
+instance ID. Scientific stage dependencies, receipts, checkpoints and allocation
+costs must bind that instance separately from the scientific and transport
+request hashes. Equal requests in different projects cannot reuse a checkpoint.
+This explicit binding remains valid when durable archives are relocated.

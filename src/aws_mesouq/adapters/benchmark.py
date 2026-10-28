@@ -37,6 +37,7 @@ def execute(manifest_path):
         raise ValueError("Frozen scientific request differs from campaign hash")
     command = [manifest["python_bin"], "-m", "meso_uq.benchmark_lab.cli", "run-stage",
                "--request", manifest["request"], "--campaign", manifest["campaign_root"],
+               "--campaign-instance-id", manifest["campaign_instance_id"],
                "--stage", manifest["stage"], "--reserved-seconds", str(manifest["internal_seconds"]),
                "--device", manifest["device"]]
     if manifest["stage"] == "metrics":

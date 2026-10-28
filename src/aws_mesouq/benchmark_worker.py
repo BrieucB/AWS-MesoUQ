@@ -288,7 +288,7 @@ os.close(fd)
         if hashlib.sha256(adapter).hexdigest() != self.operator["adapter_sha256"]:
             raise ValueError("Installed benchmark adapter differs from operator pin")
         window = scheduler_window(stage.get("reserved_seconds", self.operator["stage_seconds"].get(stage["id"], 0)), self.operator["scheduler"]["partition"])
-        manifest = {**{k: self.operator[k] for k in ("repository", "science_revision", "python_bin", "environment_script", "environment_sha256", "adapter_sha256")}, "request": request_path, "campaign_root": root, "configuration_hash": campaign["configuration_hash"], "stage": stage["id"], "internal_seconds": window["internal_seconds"], "device": "cpu" if stage["id"] in ("cases", "reference", "metrics") else "cuda"}
+        manifest = {**{k: self.operator[k] for k in ("repository", "science_revision", "python_bin", "environment_script", "environment_sha256", "adapter_sha256")}, "request": request_path, "campaign_root": root, "campaign_instance_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "stage": stage["id"], "internal_seconds": window["internal_seconds"], "device": "cpu" if stage["id"] in ("cases", "reference", "metrics") else "cuda"}
         if stage["id"] == "metrics":
             costs = self.allocation_snapshot(entry)
             costs_blob = canonical(costs)
@@ -311,7 +311,7 @@ os.close(fd)
         raw = self._slow(entry, self.transport.read_beneath, entry["root"], "stages/cases/receipt.json")
         cases = json.loads(raw)
         scientific_hash = campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"]))
-        if cases.get("request_fingerprint") != scientific_hash or cases.get("transport_request_fingerprint") != campaign["configuration_hash"]:
+        if cases.get("campaign_instance_id") != campaign["id"] or cases.get("request_fingerprint") != scientific_hash or cases.get("transport_request_fingerprint") != campaign["configuration_hash"]:
             raise ValueError("Allocation-cost snapshot differs from frozen case request")
         binding = cases.get("source_binding", {})
         if binding.get("sha256") != checksum(binding.get("files", {})):
@@ -369,7 +369,7 @@ os.close(fd)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         blob = self._slow(entry, self.transport.read_beneath, entry["root"], "stages/" + stage["id"] + "/receipt.json")
         receipt = json.loads(blob)
-        if receipt.get("stage") != stage["id"] or receipt.get("request_fingerprint") != campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])) or str(receipt.get("slurm_job_id")) != entry["job_id"]:
+        if receipt.get("campaign_instance_id") != campaign["id"] or receipt.get("stage") != stage["id"] or receipt.get("request_fingerprint") != campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])) or str(receipt.get("slurm_job_id")) != entry["job_id"]:
             raise ValueError("Scientific receipt is not bound to this frozen request and native stage")
         if receipt.get("transport_request_fingerprint") != campaign["configuration_hash"]:
             raise ValueError("Scientific receipt transport request differs from this campaign")
