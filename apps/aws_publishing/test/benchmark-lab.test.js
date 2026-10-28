@@ -14,8 +14,8 @@ test('synthetic server plot series render as escaped, finite SVG without computi
 test('results present reported method totals and separate reference cost without inventing missing values',()=>{
   const result={costs:{methods:[{method:'HNPE',training_seconds:20,inference_seconds:2,total_seconds:22},{method:'TMCMC',inference_seconds:8,total_seconds:8}],reference_seconds:7},metrics:{'Marginal W2':.08},training_histories:[],failures:[{stage:'Synthetic stage',message:'<unsafe>'}]};
   const markup=benchmarkResults(result);
-  assert.match(markup,/Numerical-reference cost: 7 seconds/);
-  assert.match(markup,/>22<\/strong>/);
+  assert.match(markup,/Numerical-reference summed stage elapsed: 7 seconds/);
+  assert.match(markup,/>22<\/td>/);
   assert.match(markup,/Marginal W2/);
   assert.match(markup,/&lt;unsafe&gt;/);
   assert.match(markup,/Training history not reported/);
@@ -24,7 +24,7 @@ test('results present reported method totals and separate reference cost without
   assert.match(benchmarkResults(null),/publishes verified evidence/);
 });
 
-import {BenchmarkLab} from '../src/benchmark-lab.js';
+import {BenchmarkLab,benchmarkDraftError} from '../src/benchmark-lab.js';
 const defaults={scenario:{family:'baseline',scale:1},seed:1000,controls:{hnpe:{width:128,depth:2,learning_rate:.0003,batch_size:2048,max_updates:1000000,training_budget:1800},tmcmc:{population_size:4096,target_cov:.6,proposal_scale:1,burn_in:7,max_generations:1000}},evaluation:{case_count:16,posterior_draws:2048,cohort:'central_90'},budget:{mode:'fixed',method_gpu_seconds:14400},reference:{initial_power:14,maximum_power:20,scrambles:4,relative_tolerance:.02}};
 function setup(request){
   const calls=[],downloads=[],context={project:'p',api:null,valid:()=>true};
@@ -125,4 +125,35 @@ test('artifact downloads verify selected references and bytes without sending AP
   await f.lab.downloadArtifact(artifact.id);
   assert.equal(f.downloads.length,1);
   assert.match(f.lab.error,/could not complete/);
+});
+
+test('primary comparison uses paired scores and allocated resources, with other native accounting separate',()=>{
+  const result={paired_comparison:{paired_case_count:3,requested_case_count:5,methods:{hnpe:{mean_score:.12,median_score:.1},tmcmc:{mean_score:null,median_score:null}},mean_score_difference_hnpe_minus_tmcmc:null},allocation_costs:{methods:{hnpe:{allocated_gpu_seconds:200,allocated_cpu_seconds:1600,status:'complete',missing_stage_ids:[]},tmcmc:{allocated_gpu_seconds:null,allocated_cpu_seconds:null,status:'unknown',missing_stage_ids:['tmcmc']}},reference:{allocated_gpu_seconds:0,allocated_cpu_seconds:80,status:'complete',missing_stage_ids:[]}},metrics:{hnpe:{counts:{total:5,scored:4,method_failed:1,reference_unresolved:0,budget_exhausted:2},mean_score_on_scored_cases:99}},costs:{methods:[{method:'hnpe',total_seconds:17}]}};
+  const markup=benchmarkResults(result),primary=markup.split('<details>')[0];
+  assert.match(primary,/>3<\/strong> paired cases \/ <strong>5/);
+  assert.match(primary,/Paired mean score/);assert.match(primary,/>0.12<\/td>/);
+  assert.match(primary,/>200<\/td>/);assert.match(primary,/>1,600<\/td>/);
+  assert.match(primary,/Allocated CPU \(core-s\)/);assert.match(primary,/>Unknown<\/td>/);
+  assert.match(primary,/Numerical-reference allocation \(separate\)/);
+  assert.doesNotMatch(primary,/>99<|>17<|Summed stage elapsed/);
+  assert.match(markup,/Method-specific diagnostics \(unpaired\)/);
+  assert.match(markup,/Method failures/);assert.match(markup,/Budget-exhausted cases/);
+  assert.match(benchmarkResults({}),/Not reported/);
+  assert.doesNotMatch(benchmarkResults({plots:[]}),/Posterior accuracy, tails and calibration/);
+});
+test('fresh campaign validation enforces integer training/method limits and strict reference ordering',()=>{
+  assert.equal(benchmarkDraftError(defaults),'');
+  for(const [path,value] of [['controls.hnpe.training_budget',119],['controls.hnpe.training_budget',120.5],['controls.hnpe.max_updates',1000001],['budget.method_gpu_seconds',.5],['reference.initial_power',3],['reference.maximum_power',23],['reference.scrambles',3],['reference.relative_tolerance',.11],['reference.relative_tolerance',0]]){
+    const draft=structuredClone(defaults),keys=path.split('.');let item=draft;for(const key of keys.slice(0,-1))item=item[key];item[keys.at(-1)]=value;
+    assert.notEqual(benchmarkDraftError(draft),'',path);
+  }
+  const equal=structuredClone(defaults);equal.reference.initial_power=20;equal.reference.maximum_power=20;
+  assert.match(benchmarkDraftError(equal),/Reference/);
+  assert.match(benchmarkDraftError(defaults,{'controls.hnpe.width':{choices:[64]}}),/choices/);
+});
+test('invalid draft is rejected before API create without rounding or minting an idempotency key',async()=>{
+  const f=setup(async path=>path.endsWith('/capabilities')?{defaults}:{campaigns:[]});await f.lab.enter();
+  f.lab.draft.controls.hnpe.training_budget=120.5;
+  await f.lab.submit();assert.match(f.lab.error,/integer/);
+  assert.equal(f.calls.filter(call=>call.body).length,0);assert.equal(f.lab.idempotencyKey,null);
 });

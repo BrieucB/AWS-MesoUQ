@@ -51,15 +51,22 @@ function historyPlots(histories){
   }).filter(Boolean);
 }
 
+function allocationRow(label,entry){
+  const complete=entry?.status==='complete';
+  return `<tr><td>${h(label)}</td><td>${h(complete?fmt(entry.allocated_gpu_seconds):'Unknown')}</td><td>${h(complete?fmt(entry.allocated_cpu_seconds):'Unknown')}</td><td>${h(entry?.status||'unknown')}</td><td>${h(Array.isArray(entry?.missing_stage_ids)&&entry.missing_stage_ids.length?entry.missing_stage_ids.join(', '):complete?'None':'Not reported')}</td></tr>`;
+}
+function allocationTable(entries){
+  return `<div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Allocated GPU (s)</th><th>Allocated CPU (core-s)</th><th>Accounting</th><th>Missing stages</th></tr></thead><tbody>${entries.map(([label,value])=>allocationRow(label,value)).join('')}</tbody></table></div>`;
+}
 export function benchmarkResults(result){
   if(!result)return '<p class="lab-note">Results become available after the campaign publishes verified evidence.</p>';
-  const costs=result.costs||{};
+  const costs=result.costs||{},allocations=result.allocation_costs||{},paired=result.paired_comparison;
   const methods=Array.isArray(costs.methods)?costs.methods:[];
-  const costRows=methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.preparation_seconds))}</td><td>${h(fmt(m.training_seconds))}</td><td>${h(fmt(m.inference_seconds))}</td><td><strong>${h(fmt(m.total_seconds))}</strong></td></tr>`).join('');
-  const plots=Array.isArray(result.plots)?result.plots:[];
-  const failures=Array.isArray(result.failures)?result.failures:[];
+  const costRows=methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.preparation_seconds))}</td><td>${h(fmt(m.training_seconds))}</td><td>${h(fmt(m.inference_seconds))}</td><td>${h(fmt(m.total_seconds))}</td></tr>`).join('');
+  const plots=Array.isArray(result.plots)?result.plots:[],failures=Array.isArray(result.failures)?result.failures:[];
   const histories=historyPlots(result.training_histories),limitations=Array.isArray(result.limitations)?result.limitations:result.limitations?[result.limitations]:[];
-  return `<section class="card"><h2>Accuracy and total method cost</h2><p class="lab-note">HNPE preparation, training and inference belong to the method cost. Numerical-reference generation is reported separately. Compare methods on the same cases and declared budgets.</p>${costRows?`<div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Preparation (s)</th><th>Training (s)</th><th>Inference (s)</th><th>Total (s)</th></tr></thead><tbody>${costRows}</tbody></table></div>`:'<p>Total method timing not reported.</p>'}<p class="lab-note">Numerical-reference cost: ${h(fmt(costs.reference_seconds))} seconds. Allocation and elapsed times have different scopes; see the evidence manifests.</p><details><summary>Reported CPU, GPU and wall-clock accounting</summary><div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Wall (s)</th><th>CPU (s)</th><th>GPU (s)</th></tr></thead><tbody>${methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.resource_cost?.wall_seconds))}</td><td>${h(fmt(m.resource_cost?.cpu_seconds))}</td><td>${h(fmt(m.resource_cost?.gpu_seconds))}</td></tr>`).join('')}<tr><td>Numerical reference</td><td>${h(fmt(costs.reference_resource_cost?.wall_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.cpu_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.gpu_seconds))}</td></tr></tbody></table></div><p class="lab-note">Concurrent process clocks, allocated GPU seconds and wall-clock duration are distinct; unreported accounting is not zero.</p></details><h3>Posterior accuracy, tails and calibration</h3>${reportedMetrics(result.metrics)}<div class="lab-plot-grid">${plots.map(benchmarkPlot).join('')}</div><h3>Training histories</h3>${histories.length?histories.map(benchmarkPlot).join(''):'<p class="lab-note">Training history not reported.</p>'}<p class="lab-note">Inspect training_candidate and budget_limited labels in the evidence. Stage completion alone does not certify convergence.</p><h3>Limitations</h3>${limitations.length?`<ul>${limitations.map(value=>`<li>${h(text(value))}</li>`).join('')}</ul>`:'<p class="lab-note">No limitations were supplied.</p>'}<h3>Failures and incomplete stages</h3>${failures.length?failures.map(f=>`<div class="lab-failure"><strong>${h(f.stage||'Campaign stage')}</strong><p>${h(f.message||f.code||'Failed or incomplete; inspect the evidence.')}</p></div>`).join(''):'<p class="lab-note">No failures reported in this result.</p>'}</section>`;
+  const pairedRows=['hnpe','tmcmc'].map(method=>`<tr><td>${h(method.toUpperCase())}</td><td>${h(fmt(paired?.methods?.[method]?.mean_score))}</td><td>${h(fmt(paired?.methods?.[method]?.median_score))}</td></tr>`).join('');
+  return `<section class="card"><h2>Paired accuracy and allocated method cost</h2><p class="lab-note">Primary accuracy uses the intersection of cases scored by both methods against the numerical reference. Failed, unresolved and budget-exhausted cases remain in the diagnostics below.</p><h3>Shared scored cases</h3><p><strong>${h(fmt(paired?.paired_case_count))}</strong> paired cases / <strong>${h(fmt(paired?.requested_case_count))}</strong> requested cases.</p><div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Paired mean score</th><th>Paired median score</th></tr></thead><tbody>${pairedRows}</tbody></table></div><p class="lab-note">Paired mean difference (HNPE − TMCMC): ${h(fmt(paired?.mean_score_difference_hnpe_minus_tmcmc))}. Missing scores are unreported, not zero.</p><h3>Slurm allocated method cost</h3><p class="lab-note">HNPE includes case preparation, all seven fresh factor fits and inference. Failed and cancelled allocations count. CPU core-seconds and GPU seconds describe allocated resources, rather than process clocks.</p>${allocationTable([['HNPE',allocations.methods?.hnpe],['TMCMC',allocations.methods?.tmcmc]])}<h3>Numerical-reference allocation (separate)</h3>${allocationTable([['Numerical reference',allocations.reference]])}<p class="lab-note">Unknown accounting is not zero. Inspect missing stages before comparing costs.</p><details><summary>Other native allocation accounting</summary><p class="lab-note">Legacy native stage accounting is shown separately from the primary comparison. Summed stage elapsed seconds are not campaign makespan or process clocks.</p>${costRows?`<div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Preparation (s)</th><th>Training (s)</th><th>Inference (s)</th><th>Summed stage elapsed (s)</th></tr></thead><tbody>${costRows}</tbody></table></div>`:'<p>Native stage accounting not reported.</p>'}<p>Numerical-reference summed stage elapsed: ${h(fmt(costs.reference_seconds))} seconds.</p></details><details><summary>Method-specific diagnostics (unpaired)</summary>${reportedMetrics(result.metrics)}</details>${plots.length?`<h3>Posterior accuracy, tails and calibration</h3><div class="lab-plot-grid">${plots.map(benchmarkPlot).join('')}</div>`:''}<h3>Training histories</h3>${histories.length?histories.map(benchmarkPlot).join(''):'<p class="lab-note">Training history not reported.</p>'}<p class="lab-note">Inspect training_candidate and budget_limited labels in the evidence. Stage completion alone does not certify convergence.</p><h3>Limitations</h3>${limitations.length?`<ul>${limitations.map(value=>`<li>${h(text(value))}</li>`).join('')}</ul>`:'<p class="lab-note">No limitations were supplied.</p>'}<h3>Failures and incomplete stages</h3>${failures.length?failures.map(f=>`<div class="lab-failure"><strong>${h(f.stage||'Campaign stage')}</strong><p>${h(f.message||f.code||'Failed or incomplete; inspect the evidence.')}</p></div>`).join(''):'<p class="lab-note">No failures reported in this result.</p>'}</section>`;
 }
 
 const controlFields=[
@@ -87,6 +94,24 @@ function numericField(path,label,note,draft,limits,disabled){
   const unitNote=path==='budget.method_gpu_seconds'?` <output data-lab-budget-hours>${h(fmt(value/3600))} GPU hours per method</output>`:'';
   if(Array.isArray(spec.choices))return `<label>${h(label)}<select data-lab-field="${h(path)}" ${disabled?'disabled':''}>${spec.choices.map(choice=>`<option value="${h(choice)}" ${choice===value?'selected':''}>${h(choice)}</option>`).join('')}</select><small>${h(note)}${unitNote}</small></label>`;
   return `<label>${h(label)}<input type="number" data-lab-field="${h(path)}" value="${h(value??'')}" ${spec.min!==undefined?`min="${h(spec.min)}"`:''} ${spec.max!==undefined?`max="${h(spec.max)}"`:''} step="${h(spec.step??(path.includes('learning_rate')||path.includes('target_cov')||path.includes('proposal_scale')?'any':1))}" required ${disabled?'disabled':''}><small>${h(note)}${unitNote}</small></label>`;
+}
+
+export function benchmarkDraftError(draft,limits={}){
+  const bounded=(path,minimum,maximum,integer=false)=>{
+    const value=get(draft,path);
+    return typeof value==='number'&&Number.isFinite(value)&&value>=minimum&&value<=maximum&&(!integer||Number.isInteger(value));
+  };
+  if(!bounded('controls.hnpe.training_budget',120,14400,true))return 'Fit time per factor must be an integer from 120 to 14400 seconds.';
+  if(!bounded('controls.hnpe.max_updates',1,1000000,true))return 'Maximum optimizer updates must be an integer from 1 to 1000000.';
+  if(!bounded('budget.method_gpu_seconds',1,2147483647,true))return 'Total method budget must be a positive integer number of GPU seconds.';
+  if(!bounded('reference.initial_power',4,20,true)||!bounded('reference.maximum_power',5,22,true)||draft.reference.initial_power>=draft.reference.maximum_power||!bounded('reference.scrambles',4,16,true)||!bounded('reference.relative_tolerance',Number.MIN_VALUE,.1))return 'Reference controls are outside the supported benchmark profile. Refresh campaign controls.';
+  for(const [path,spec] of Object.entries(limits)){
+    const value=get(draft,path);
+    if(Array.isArray(spec.choices)&&!spec.choices.includes(value))return 'A campaign control is outside the supported choices.';
+    if(spec.minimum!==undefined&&!(typeof value==='number'&&Number.isFinite(value)&&value>=spec.minimum&&value<=spec.maximum))return 'A campaign control is outside the supported range.';
+    if(spec.integer===true&&!Number.isInteger(value))return 'A campaign control requires an integer value.';
+  }
+  return '';
 }
 
 export class BenchmarkLab {
@@ -156,6 +181,8 @@ export class BenchmarkLab {
     });
   }
   async submit(){
+    const validation=benchmarkDraftError(this.draft,this.capabilities?.limits);
+    if(validation){this.error=validation;this.onChange();return;}
     await this.operation(async({api,project,current})=>{
       if(!this.draft)throw Error('Capabilities unavailable');
       this.idempotencyKey??=crypto.randomUUID();

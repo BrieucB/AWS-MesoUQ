@@ -71,7 +71,13 @@ campaigns are admitted under the Karolina Slurm account/partition/QoS policy.
 
 The campaign view shows reported stage status, failure/incomplete evidence,
 server-computed accuracy/calibration metrics, posterior/reference plots and
-training histories. Missing data stay explicitly unavailable. The browser only
+training histories. Primary scores use the intersection of cases scored by both
+methods, with paired and requested denominators. Method-specific scores remain
+explicitly unpaired diagnostics with every failure count. Primary costs use
+Slurm allocated GPU seconds and CPU core-seconds, including failed/cancelled
+work; numerical-reference allocation is separate. Unknown accounting stays
+unknown. Other native stage accounting is labelled separately; summed stage
+elapsed times are not campaign makespan or process clocks. Missing data stay explicitly unavailable. The browser only
 draws returned plot series or displays the reviewed posterior-marginals and
 compute-comparison PNG artifacts generated on Karolina. PNG previews use the
 campaign owner-only artifact route and verify exact metadata, approved storage
