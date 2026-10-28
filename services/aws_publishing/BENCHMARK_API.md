@@ -171,3 +171,27 @@ instance ID. Scientific stage dependencies, receipts, checkpoints and allocation
 costs must bind that instance separately from the scientific and transport
 request hashes. Equal requests in different projects cannot reuse a checkpoint.
 This explicit binding remains valid when durable archives are relocated.
+
+
+Publication records per-object progress but treats it only as a local hint.
+A signed, owner-scoped single-object status probe verifies the reserved SHA256
+and byte size against private object storage before accepting a prior PUT.
+Existing mismatched bytes fail closed and are never overwritten.
+Lost acknowledgments and conditional-PUT 412 responses require that same
+backend verification. Retries replay the original reservation event and refresh
+signed URLs without creating duplicate object IDs or capacity reservations.
+Only one artifact body is buffered at a time; checkpoint/training products
+remain PROJECT-only. Older journals without the original reservation event ID
+can renew the same existing object through the signed status probe.
+
+Benchmark object keys use
+`projects/{project}/artifacts/benchmarks/{campaign}/{stage}/{artifact}`,
+within the existing private runtime object permission boundary. Their metadata
+remains in benchmark campaign records; legacy UUID artifact lifecycle processing
+does not enumerate or expire this namespace.
+
+Terminal campaigns that never submitted a native scientific stage expose
+`archive_capability.available=false` with reason
+`no_executed_scientific_stages`. An archive request returns an explicit
+`archive_unavailable` error; it never creates a pending or verified receipt
+for scientific outputs that do not exist.

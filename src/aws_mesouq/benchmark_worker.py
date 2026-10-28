@@ -17,6 +17,10 @@ from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_
 from .benchmark_client import BenchmarkClient, native_accounting
 from .connector.transport import absolute_path, safe_id, safe_relative
 
+class ArtifactIntegrityError(ValueError):
+    """A publication differs from its immutable local or cloud reservation."""
+
+
 NATIVE_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
 
 TREE_HELPER = r"""import hashlib,json,os,stat,sys
@@ -203,6 +207,7 @@ else:
             result = self.client.event(entry["claim"], pending["id"], pending["type"], **pending["fields"])
         if pending["type"] == "artifact_upload" and result.get("uploads") is not None:
             entry["upload_plan"] = result["uploads"]
+            entry["upload_reservation"] = copy.deepcopy(pending)
         entry.pop("pending_event", None)
         if result.get("lease_expires_at"):
             entry["claim"]["lease_expires_at"] = result["lease_expires_at"]
@@ -391,12 +396,27 @@ os.close(fd)
         blob = self._slow(entry, self.transport.read_beneath, entry["root"], relative)
         actual = {"sha256": hashlib.sha256(blob).hexdigest(), "size_bytes": len(blob)}
         if descriptor and any(actual[k] != descriptor[k] for k in actual):
-            raise ValueError("Scientific artifact differs from manifested checksum and size")
+            raise ArtifactIntegrityError("Scientific artifact differs from manifested checksum and size")
         return blob, actual
 
+    def _renew_upload_plan(self, entry):
+        reservation = entry.get("upload_reservation")
+        if not reservation:
+            # Older journals lack the reservation event ID. Signed single-object
+            # probes refresh existing reservations without creating new objects.
+            return
+        response = self._slow(entry, self.client.event, entry["claim"], reservation["id"], "artifact_upload", **reservation["fields"])
+        refreshed = response["uploads"]
+        old_refs = [upload["artifact"]["id"] for upload in entry["upload_plan"]]
+        if [upload["artifact"]["id"] for upload in refreshed] != old_refs:
+            raise ArtifactIntegrityError("Renewed upload plan changed immutable object identities")
+        entry["upload_plan"] = refreshed
+        self.save()
+
+    def _confirm_upload(self, entry, artifact_id):
+        return self._send(entry, "artifact_status", artifact_ids=[artifact_id])
+
     def publish(self, entry, receipt):
-        if entry.get("published_refs") is not None:
-            return entry["published_refs"]
         stage = entry["claim"]["stage"]["id"]
         selected = []
         if stage == "metrics":
@@ -404,34 +424,76 @@ os.close(fd)
                 name = safe_relative(ref["file"])
                 if name.endswith((".png", ".csv", ".json", ".npz")):
                     selected.append(("stages/" + stage + "/" + name, ref))
-        # Weight files, training banks, optimizer state and raw per-case posterior banks stay on PROJECT.
+        # Weights and training banks remain private PROJECT products.
         if not selected:
             portable = {k: receipt[k] for k in ("stage", "status", "factor", "updates", "best_update", "best_validation_nll", "termination_reason", "training_state", "history") if k in receipt}
             relative = "control/" + stage + "/public-stage.json"
-            self._slow(entry, self._immutable, entry["root"] + "/" + relative, canonical(portable))
-            selected.append((relative, None))
+            blob = canonical(portable)
+            self._slow(entry, self._immutable, entry["root"] + "/" + relative, blob)
+            selected.append((relative, {"sha256": hashlib.sha256(blob).hexdigest(), "size_bytes": len(blob)}))
+            del blob
         files = []
         for relative, descriptor in selected:
-            blob, actual = self._file(entry, relative, descriptor)
             name = stage + "-" + PurePosixPath(relative).name
             media = "image/png" if name.endswith(".png") else "text/csv" if name.endswith(".csv") else "application/octet-stream" if name.endswith(".npz") else "application/json"
-            files.append({"relative": relative, "blob": blob, "ref": {"name": name, "media_type": media, **actual}})
+            files.append({"relative": relative, "ref": {"name": name, "media_type": media, "sha256": descriptor["sha256"], "size_bytes": descriptor["size_bytes"]}})
+        if entry.get("upload_source") is not None and entry["upload_source"] != files:
+            raise ArtifactIntegrityError("Publication changed after immutable upload reservation")
         if not entry.get("upload_plan"):
-            entry["upload_source"] = [{"relative": item["relative"], "ref": item["ref"]} for item in files]
+            entry["upload_source"] = files
             response = self._send(entry, "artifact_upload", artifacts=[item["ref"] for item in files])
             entry["upload_plan"] = response["uploads"]
             self.save()
+        self._renew_upload_plan(entry)
+        progress = entry.setdefault("upload_progress", {})
         refs = []
         for item, upload in zip(files, entry["upload_plan"], strict=True):
-            target = urlsplit(upload["upload_url"])
-            origin = target.scheme + "://" + target.netloc
-            if origin not in self.operator["allowed_upload_origins"] or target.username or target.password:
-                raise ValueError("Artifact upload URL is outside operator-approved HTTPS origins")
-            self._slow(entry, self.api.transfer, upload["upload_url"], data=item["blob"], headers=upload["required_headers"])
             ref = upload["artifact"]
             if any(ref[k] != item["ref"][k] for k in ("name", "sha256", "size_bytes", "media_type")):
-                raise ValueError("Cloud upload reservation differs from scientific output")
-            refs.append({k: ref[k] for k in ("id", "name", "sha256", "size_bytes", "media_type")})
+                raise ArtifactIntegrityError("Cloud upload reservation differs from scientific output")
+            # At most one artifact body is resident. Completed local markers are
+            # hints only: every restart re-verifies the exact remote SHA and size.
+            blob, _ = self._file(entry, item["relative"], item["ref"])
+            try:
+                confirmed = False
+                for attempt in range(2):
+                    status = self._confirm_upload(entry, ref["id"])
+                    if status["uploaded"]:
+                        confirmed = True
+                        break
+                    target = urlsplit(status["upload_url"])
+                    origin = target.scheme + "://" + target.netloc
+                    if origin not in self.operator["allowed_upload_origins"] or target.username or target.password:
+                        raise ValueError("Artifact upload URL is outside operator-approved HTTPS origins")
+                    progress[ref["id"]] = {"status": "putting", "sha256": ref["sha256"], "size_bytes": ref["size_bytes"]}
+                    self.save()
+                    try:
+                        self._slow(entry, self.api.transfer, status["upload_url"], data=blob, headers=status["required_headers"])
+                    except Exception:
+                        # A 412, lost acknowledgment or expired signature is not
+                        # proof of success. Only the backend checksum/size probe is.
+                        status = self._confirm_upload(entry, ref["id"])
+                        if status["uploaded"]:
+                            confirmed = True
+                            break
+                        if attempt == 1:
+                            raise
+                        self._renew_upload_plan(entry)
+                    else:
+                        status = self._confirm_upload(entry, ref["id"])
+                        if status["uploaded"]:
+                            confirmed = True
+                            break
+                        if attempt == 1:
+                            raise RuntimeError("Upload acknowledgment could not be verified")
+                        self._renew_upload_plan(entry)
+                if not confirmed:
+                    raise RuntimeError("Private object upload remains unconfirmed")
+                progress[ref["id"]] = {"status": "confirmed", "sha256": ref["sha256"], "size_bytes": ref["size_bytes"], "confirmed_at": self.clock()}
+                self.save()
+                refs.append({k: ref[k] for k in ("id", "name", "sha256", "size_bytes", "media_type")})
+            finally:
+                del blob
         entry["published_refs"] = refs
         self.save()
         return refs
@@ -470,7 +532,17 @@ os.close(fd)
         if receipt["status"] in ("reference_unresolved", "budget_exhausted"):
             self._send(entry, "failed", failure={"code": receipt["status"], "message": str(receipt.get("termination_reason", receipt["status"]))[:1000]}, timing=timing, scheduler_accounting=accounting)
             return
-        refs = self.publish(entry, receipt)
+        try:
+            refs = self.publish(entry, receipt)
+        except Exception as error:
+            if not isinstance(error, ArtifactIntegrityError) and getattr(error, "code", None) != "artifact_integrity_mismatch":
+                raise
+            if entry.get("pending_event", {}).get("type") == "artifact_status":
+                entry.pop("pending_event", None)  # Definitively rejected read-only probe.
+            entry["upload_failure"] = {"code": "artifact_integrity_mismatch"}
+            self.save()
+            self._send(entry, "failed", failure={"code": "artifact_integrity_mismatch", "message": "Publication checksum or size differs from its immutable reservation"}, timing=timing, scheduler_accounting=accounting)
+            return
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         stored = self.state["campaigns"][campaign["id"]].get("receipts", {})
         cases = stored.get("cases")

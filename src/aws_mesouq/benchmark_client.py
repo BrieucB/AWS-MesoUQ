@@ -44,7 +44,7 @@ class BenchmarkClient:
         campaign, stage = claim["campaign"], claim["stage"]
         body = {"project_id": campaign["project_id"], "connector_id": self._identity()["connector_id"], "lease_token": claim["lease_token"], "event_id": event_id, "type": kind, **fields}
         body["signature"] = self._sign(stage_signing_bytes(campaign, stage, body))
-        action = "artifacts" if kind == "artifact_upload" else "events"
+        action = "artifacts" if kind in ("artifact_upload", "artifact_status") else "events"
         return self.api.request("POST", f"/v1/benchmark-connector/campaigns/{campaign['id']}/stages/{stage['id']}/{action}", body)
 
     def upload_artifacts(self, claim, event_id, artifacts):

@@ -39,7 +39,8 @@
         "succeeded",
         "failed",
         "cancelled",
-        "artifact_upload"
+        "artifact_upload",
+        "artifact_status"
       ],
       "title": "Type",
       "type": "string"
@@ -116,6 +117,24 @@
       ],
       "default": null,
       "title": "Artifacts"
+    },
+    "artifact_ids": {
+      "anyOf": [
+        {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifact Ids"
     },
     "scheduler_accounting": {
       "anyOf": [

@@ -220,3 +220,37 @@ def test_typed_wire_preserves_scientific_integer_budgets_and_strict_bounds():
         bad["controls"]["hnpe"][field] = value
         with pytest.raises(ValidationError):
             CreateCampaign.model_validate(bad)
+
+
+def test_single_object_status_requires_exact_owned_stage_and_live_signed_lease(lab):
+    campaign = create(lab)
+    owned = claim(lab, "cases")
+    data = b"immutable"
+    ref = {"name": "status.json", "sha256": __import__("hashlib").sha256(data).hexdigest(), "size_bytes": len(data), "media_type": "application/json"}
+    body = event_body(lab, owned, "reserve", "artifact_upload", artifacts=[ref])
+    route = f"/v1/benchmark-connector/campaigns/{campaign['id']}/stages/cases/artifacts"
+    artifact = request(lab, "POST", route, body)[1]["uploads"][0]["artifact"]
+    def status(event_id, sub="alice"):
+        payload = event_body(lab, owned, event_id, "artifact_status", artifact_ids=[artifact["id"]])
+        return request(lab, "POST", route, payload, sub)[1]
+    assert status("absent")["uploaded"] is False
+    saved = lab[1].state["benchmark_campaigns"][campaign["id"]]["artifacts"][artifact["id"]]
+    assert saved["storage_key"] == f"projects/p/artifacts/benchmarks/{campaign['id']}/cases/{artifact['id']}"
+    assert artifact["id"] not in lab[1].state["artifacts"]  # Metadata stays outside legacy lifecycle admissions.
+    lab[2].data[saved["storage_key"]] = data
+    assert status("present")["uploaded"] is True
+    assert saved["verified"] is False
+    assert_error("not_found", lambda: status("other-owner", "bob"))
+    lab[3][0] += 121
+    assert_error("invalid_lease", lambda: status("expired"))
+
+
+def test_budget_exhausted_before_submission_reports_archive_unavailable(lab):
+    campaign = create(lab, budget={"mode": "fixed", "method_gpu_seconds": 30})
+    owned = claim(lab, "too-small-native-window")
+    send(lab, owned, "no-native-stage", "failed", not_submitted=True, failure={"code": "budget_exhausted", "message": "Insufficient native Slurm window"})
+    detail = request(lab, "GET", f"/v1/projects/p/benchmarks/{campaign['id']}")[1]["campaign"]
+    assert detail["status"] == "failed"
+    assert detail["archive_capability"] == {"available": False, "reason": "no_executed_scientific_stages"}
+    assert_error("archive_unavailable", lambda: request(lab, "POST", f"/v1/projects/p/benchmarks/{campaign['id']}/archive", {}))
+    assert "archive" not in lab[1].state["benchmark_campaigns"][campaign["id"]]

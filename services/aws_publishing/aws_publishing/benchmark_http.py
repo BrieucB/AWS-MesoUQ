@@ -103,13 +103,14 @@ class StageEvent(WireModel):
     connector_id: Identifier
     lease_token: Annotated[str, Field(min_length=1, max_length=256)]
     event_id: Identifier
-    type: Literal["heartbeat", "submitting", "submitted", "queued", "running", "submission_unknown", "succeeded", "failed", "cancelled", "artifact_upload"]
+    type: Literal["heartbeat", "submitting", "submitted", "queued", "running", "submission_unknown", "succeeded", "failed", "cancelled", "artifact_upload", "artifact_status"]
     signature: Annotated[str, Field(max_length=128)]
     slurm_job_id: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,19}$")] | None = None
     result: dict | None = None
     failure: dict | None = None
     timing: dict | None = None
     artifacts: list[dict] | None = None
+    artifact_ids: list[Identifier] | None = None
     scheduler_accounting: dict | None = None
     not_submitted: bool | None = None
 

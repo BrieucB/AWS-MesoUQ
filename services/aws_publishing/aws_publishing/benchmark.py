@@ -41,6 +41,10 @@ def public_campaign(campaign):
     for stage in result["stages"]:
         stage.pop("lease", None)
     result["artifacts"] = [{k: v for k, v in ref.items() if k != "storage_key"} for ref in campaign.get("artifacts", {}).values()]
+    terminal = campaign["status"] in ("completed", "failed", "cancelled")
+    executed = any(stage.get("submission_started") for stage in campaign["stages"])
+    reason = "campaign_not_terminal" if not terminal else "no_executed_scientific_stages" if not executed else "archive_not_enrolled" if not campaign["approved_adapter"].get("archive_root") else None
+    result["archive_capability"] = {"available": reason is None, "reason": reason}
     return result
 
 
@@ -171,6 +175,8 @@ class BenchmarkRoutes:
                 require_keys(body, ())
                 if campaign["status"] not in ("completed", "failed", "cancelled"):
                     fail(409, "not_ready", "Archive request requires a terminal benchmark campaign")
+                if not any(stage.get("submission_started") for stage in campaign["stages"]):
+                    fail(409, "archive_unavailable", "No native scientific stage was submitted; there are no executed scientific outputs to archive")
                 if not campaign["approved_adapter"].get("archive_root"):
                     fail(409, "archive_not_enrolled", "An operator-approved durable Karolina archive root is required")
                 campaign.setdefault("archive", {"status": "requested", "requested_at": now})
@@ -300,7 +306,7 @@ class BenchmarkRoutes:
         return 200, {"campaign": None, "stage": None}
 
     def event(self, state, sub, identity, campaign_id, stage_id, action, body, now):
-        keys(body, ("project_id", "connector_id", "lease_token", "event_id", "type", "signature"), ("slurm_job_id", "result", "failure", "timing", "artifacts", "scheduler_accounting", "not_submitted"))
+        keys(body, ("project_id", "connector_id", "lease_token", "event_id", "type", "signature"), ("slurm_job_id", "result", "failure", "timing", "artifacts", "artifact_ids", "scheduler_accounting", "not_submitted"))
         campaign = self.owned(state, identity, sub, body["project_id"], campaign_id)
         stage = next((s for s in campaign["stages"] if s["id"] == stage_id), None)
         if stage is None:
@@ -308,6 +314,26 @@ class BenchmarkRoutes:
         token(body["event_id"])
         token(body["connector_id"])
         self.signature(identity, body["connector_id"], body["signature"], stage_signing_bytes(campaign, stage, body))
+        if body["type"] == "artifact_status":
+            self.lease(stage, body, now)
+            if action != "artifacts" or stage["status"] not in ACTIVE:
+                raise ValueError("Artifact status requires an active signed stage lease")
+            identifiers = body.get("artifact_ids")
+            if not isinstance(identifiers, list) or len(identifiers) != 1:
+                raise ValueError("Probe exactly one stage artifact at a time")
+            artifact = campaign["artifacts"].get(identifiers[0]) if isinstance(identifiers[0], str) else None
+            if not artifact or artifact["stage_id"] != stage_id:
+                fail(404, "not_found", "Stage artifact not found")
+            matched = self.app.objects.verify(artifact["storage_key"], artifact)
+            if not matched and not self.app.objects.absent(artifact["storage_key"]):
+                # A concurrent conditional PUT may have committed between HEADs.
+                matched = self.app.objects.verify(artifact["storage_key"], artifact)
+                if not matched:
+                    fail(409, "artifact_integrity_mismatch", "Existing private object checksum or size differs from its immutable reservation")
+            response = {"artifact": {k: v for k, v in artifact.items() if k != "storage_key"}, "uploaded": bool(matched)}
+            if not matched:
+                response["upload_url"], response["required_headers"] = self.app.objects.upload_url(artifact["storage_key"], artifact)
+            return 200, response
         event_id = checksum(["benchmark_event", campaign_id, stage_id, body["event_id"]])
         event_hash = checksum({k: v for k, v in body.items() if k != "lease_token"})
         previous = state["events"].get(event_id)
@@ -333,7 +359,7 @@ class BenchmarkRoutes:
             artifact_ids = []
             for ref in refs:
                 ident = uuid.uuid4().hex
-                campaign["artifacts"][ident] = {**copy.deepcopy(ref), "id": ident, "stage_id": stage_id, "owner_sub": sub, "project_id": campaign["project_id"], "verified": False, "storage_key": f"projects/{campaign['project_id']}/benchmarks/{campaign_id}/{stage_id}/{ident}"}
+                campaign["artifacts"][ident] = {**copy.deepcopy(ref), "id": ident, "stage_id": stage_id, "owner_sub": sub, "project_id": campaign["project_id"], "verified": False, "storage_key": f"projects/{campaign['project_id']}/artifacts/benchmarks/{campaign_id}/{stage_id}/{ident}"}
                 artifact_ids.append(ident)
             state["events"][event_id] = {"hash": event_hash, "artifact_ids": artifact_ids}
             return self.upload_response(campaign, artifact_ids)
