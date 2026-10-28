@@ -148,3 +148,16 @@ run "invalid_benchmark_pin_rejected" {
   }
   expect_failures = [var.projects]
 }
+
+run "noncanonical_archive_root_rejected" {
+  command = plan
+  variables {
+    projects = { fixture = { name = "Fixture", benchmark_policy = {
+      adapter_sha256    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      science_revision  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      scenario_families = ["baseline"]
+      archive_root      = "/bad path"
+    } } }
+  }
+  expect_failures = [var.projects]
+}

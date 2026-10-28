@@ -45,6 +45,17 @@ The first release defers population calibration, retraining, model promotion,
 native Windows support and extraction of an independent scientific engine.
 Both site interfaces are retained; live Vega validation is deferred.
 
+## Benchmark Lab
+
+The Benchmark Lab section compares analytical hierarchical TMCMC with seven
+fresh HNPE factors per campaign. Users select a bounded noise/prior scenario
+and method controls, then inspect matched-case accuracy, actual allocated
+resources, training histories and verified posterior figures/downloads.
+FastAPI in the existing Docker-packaged Lambda coordinates metadata; all real
+scientific calculations run on Karolina through the enrolled connector.
+See the [scientific and operating contract](docs/benchmark-lab.md). Live
+deployment and owner acceptance are separate release gates.
+
 ## Repository layout
 
 | Location | Responsibility |

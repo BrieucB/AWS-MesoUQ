@@ -7,10 +7,15 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 
 from publish_website import AwsCli, PublicationError, require, verify_identity
+
+# The exact same stdlib-only validator is shipped in the Lambda image.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from aws_mesouq.benchmark import validate_benchmark_policies
 
 OCI = "application/vnd.oci.image.manifest.v1+json"
 CONFIG_KEYS = ("FunctionArn", "FunctionName", "PackageType", "Role", "MemorySize",
@@ -24,31 +29,15 @@ def canonical(value):
 
 def validate_policies(value):
     require(isinstance(value, dict) and bool(value), "benchmark-policy-invalid")
-    for project, policy in value.items():
-        require(isinstance(project, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", project),
-                "benchmark-policy-invalid")
-        require(isinstance(policy, dict) and
-                set(policy) <= {"adapter_sha256", "science_revision", "scenario_families",
-                                "archive_root", "max_concurrent_stages"} and
-                {"adapter_sha256", "science_revision", "scenario_families", "archive_root"} <= set(policy),
-                "benchmark-policy-invalid")
-        require(isinstance(policy["adapter_sha256"], str) and
-                re.fullmatch(r"[a-f0-9]{64}", policy["adapter_sha256"]) and
-                isinstance(policy["science_revision"], str) and
-                re.fullmatch(r"[a-f0-9]{40}", policy["science_revision"]), "benchmark-policy-invalid")
-        families = policy["scenario_families"]
-        require(isinstance(families, list) and bool(families) and
-                len(set(families)) == len(families) and
-                all(item in ("baseline", "higher_noise", "broader_priors") for item in families),
-                "benchmark-policy-invalid")
-        root = policy["archive_root"]
-        require(isinstance(root, str) and root.startswith("/") and root != "/" and
-                all(part not in ("", ".", "..") for part in root.split("/")[1:]) and
-                not any(ord(char) < 32 for char in root), "benchmark-policy-invalid")
-        if "max_concurrent_stages" in policy:
-            require(type(policy["max_concurrent_stages"]) is int and
-                    1 <= policy["max_concurrent_stages"] <= 256, "benchmark-policy-invalid")
-    return canonical(value)
+    try:
+        validated = validate_benchmark_policies(value)
+    except (TypeError, ValueError):
+        raise PublicationError("benchmark-policy-invalid") from None
+    # Publication must pin custody even though the cloud contract allows an
+    # operator to leave archival unavailable in a non-production deployment.
+    require(all("archive_root" in policy for policy in validated.values()),
+            "benchmark-policy-invalid")
+    return canonical(validated)
 
 
 def verify_source(aws, repository_uri, sha, source, command=None):

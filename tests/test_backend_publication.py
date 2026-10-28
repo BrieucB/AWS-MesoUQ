@@ -146,7 +146,9 @@ class BackendPublicationTests(unittest.TestCase):
 
     def test_policy_binding_requires_pins_archive_and_known_families(self):
         for key, value in (("adapter_sha256", "wrong"), ("archive_root", "/tmp/../escape"),
-                           ("scenario_families", ["arbitrary"]), ("max_concurrent_stages", True)):
+                           ("scenario_families", ["arbitrary"]), ("max_concurrent_stages", True), ("max_concurrent_stages", 65),
+                           ("archive_root", "/bad path"), ("archive_root", "/a//b"),
+                           ("archive_root", "/a/./b"), ("archive_root", "/a/")):
             policies = copy.deepcopy(POLICIES)
             policies["fixture"][key] = value
             with self.subTest(key=key), self.assertRaises(backend.PublicationError):

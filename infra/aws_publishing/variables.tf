@@ -81,8 +81,9 @@ variable "projects" {
       can(regex("^[a-f0-9]{40}$", project.benchmark_policy.science_revision)) &&
       length(project.benchmark_policy.scenario_families) > 0 &&
       alltrue([for family in project.benchmark_policy.scenario_families : contains(["baseline", "higher_noise", "broader_priors"], family)]) &&
-      startswith(project.benchmark_policy.archive_root, "/") &&
-      !contains(split("/", project.benchmark_policy.archive_root), "..") &&
+      can(regex("^/[A-Za-z0-9_./-]+$", project.benchmark_policy.archive_root)) &&
+      length(project.benchmark_policy.archive_root) <= 2048 &&
+      alltrue([for part in slice(split("/", project.benchmark_policy.archive_root), 1, length(split("/", project.benchmark_policy.archive_root))) : !contains(["", ".", ".."], part)]) &&
       project.benchmark_policy.max_concurrent_stages >= 1 &&
       project.benchmark_policy.max_concurrent_stages <= 64 &&
       floor(project.benchmark_policy.max_concurrent_stages) == project.benchmark_policy.max_concurrent_stages
