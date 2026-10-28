@@ -63,8 +63,32 @@ variable "memberships" {
   }
 }
 variable "projects" {
-  type    = map(object({ name = string }))
-  default = {}
+  type = map(object({
+    name = string
+    benchmark_policy = optional(object({
+      adapter_sha256        = string
+      science_revision      = string
+      scenario_families     = set(string)
+      archive_root          = string
+      max_concurrent_stages = optional(number, 64)
+    }))
+  }))
+  default     = {}
+  description = "Private operator-approved projects; optional benchmark bindings never come from browser requests."
+  validation {
+    condition = alltrue([for project in values(var.projects) : project.benchmark_policy == null ? true : (
+      can(regex("^[a-f0-9]{64}$", project.benchmark_policy.adapter_sha256)) &&
+      can(regex("^[a-f0-9]{40}$", project.benchmark_policy.science_revision)) &&
+      length(project.benchmark_policy.scenario_families) > 0 &&
+      alltrue([for family in project.benchmark_policy.scenario_families : contains(["baseline", "higher_noise", "broader_priors"], family)]) &&
+      startswith(project.benchmark_policy.archive_root, "/") &&
+      !contains(split("/", project.benchmark_policy.archive_root), "..") &&
+      project.benchmark_policy.max_concurrent_stages >= 1 &&
+      project.benchmark_policy.max_concurrent_stages <= 64 &&
+      floor(project.benchmark_policy.max_concurrent_stages) == project.benchmark_policy.max_concurrent_stages
+    )])
+    error_message = "Benchmark projects require approved source/adapter hashes, supported scenarios, a durable absolute archive root and an integer stage limit."
+  }
 }
 variable "trusted_models" {
   type        = map(object({ project_id = string, version = string, sha256 = map(string), format = string, status = string, artifact_id = string, validation_artifact_id = string, provenance_json = optional(string), approved_adapter_sha256 = string }))

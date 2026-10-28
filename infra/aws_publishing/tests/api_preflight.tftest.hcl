@@ -100,3 +100,51 @@ run "preflight_preserves_authenticated_api_boundary" {
     error_message = "CORS must remain limited to the configured portal origin, allowed headers/methods and token-only requests."
   }
 }
+
+run "legacy_project_payload_preserved" {
+  command = plan
+  variables {
+    projects = { fixture = { name = "Fixture" } }
+  }
+  assert {
+    condition     = jsondecode(jsondecode(aws_dynamodb_table_item.projects["fixture"].item).payload.S) == { name = "Fixture" }
+    error_message = "An unconfigured legacy project must retain exactly its original payload."
+  }
+  assert {
+    condition     = aws_lambda_function.backend.environment[0].variables["BENCHMARK_POLICIES"] == "{}"
+    error_message = "No policy may be invented for a legacy project."
+  }
+}
+run "benchmark_operator_policy_binding" {
+  command = plan
+  variables {
+    projects = { fixture = {
+      name = "Fixture"
+      benchmark_policy = {
+        adapter_sha256    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        science_revision  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        scenario_families = ["baseline", "higher_noise", "broader_priors"]
+        archive_root      = "/project/fixture/benchmark"
+      }
+    } }
+  }
+  assert {
+    condition = (
+      jsondecode(aws_lambda_function.backend.environment[0].variables["BENCHMARK_POLICIES"]).fixture.science_revision == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" &&
+      jsondecode(jsondecode(aws_dynamodb_table_item.projects["fixture"].item).payload.S).benchmark_policy.archive_root == "/project/fixture/benchmark"
+    )
+    error_message = "Trusted policy bindings must reach the project record and environment fallback."
+  }
+}
+run "invalid_benchmark_pin_rejected" {
+  command = plan
+  variables {
+    projects = { fixture = { name = "Fixture", benchmark_policy = {
+      adapter_sha256    = "bad"
+      science_revision  = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      scenario_families = ["baseline"]
+      archive_root      = "/project/fixture"
+    } } }
+  }
+  expect_failures = [var.projects]
+}

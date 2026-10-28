@@ -216,3 +216,47 @@ from the actual checksum-bound bytes before upload verification. Headers are opt
 quoted/nonfinite/nondecimal data fails. Dense inputs are rejected intact rather than
 decimated. Fitted arrays also have a 1000-point cap, preserving the current HTTP and
 DynamoDB summary bounds without silently changing scientific data.
+
+## Benchmark Lab operator bindings
+
+Benchmark Lab reuses the existing private application and metadata table. A
+project may opt in through its private projects.<id>.benchmark_policy: the
+reviewed standalone adapter SHA256, scientific source commit, admitted scenario
+families, and the verified durable Karolina archive root. Browser requests
+cannot provide or replace these bindings. Projects without a benchmark binding
+retain their original serialized project record and calibration behavior.
+
+Keep all destination values in the existing private operator configuration.
+Prepare and review a plan that changes only the intended project metadata and
+reviewed backend image; do not broaden memberships, keys or runtime permissions.
+The stage concurrency setting is a per-campaign safety bound (at most the
+finite stage graph), not an application GPU-hour quota. Native Slurm remains the
+resource admission authority. Benchmark artifacts are retained until a
+benchmark-aware expiry policy is separately implemented; a successful receipt
+does not currently claim automatic 30-day deletion.
+
+Benchmark Lab uses the existing metadata Lambda through FastAPI/Mangum. Real
+scientific workloads remain on the enrolled Karolina connector. The generated
+BENCHMARK_POLICIES environment mapping is operator owned, is consulted only
+when a project has no explicit policy, and cannot grant project membership.
+
+The optional Benchmark Lab backend publication workflow uses the existing
+environment-protected OIDC role. It needs only the four Lambda read/update
+actions in this module, scoped to the existing backend function, plus ECR
+verification. It has no IAM mutation or project-database write permissions.
+Before using it, configure these private environment secrets:
+
+- AWS_BACKEND_FUNCTION_NAME: the existing unqualified function name.
+- AWS_BACKEND_BASELINE_IMAGE_URI: its verified current immutable ECR digest URI.
+- AWS_BENCHMARK_POLICIES: validated project-to-policy JSON with the final
+  science commit, adapter SHA256 and approved PROJECT archive root.
+
+Existing publication role, region and ECR URI secrets are reused. Run the image
+publication workflow first for the reviewed main commit, then the backend
+workflow for that same commit. The deployment helper independently verifies
+OCI source/platform labels, preserves every existing environment variable
+except the approved policy mapping, uses Lambda revision preconditions, and
+verifies code/configuration readback. The expected existing policy hash prevents
+silent policy replacement. After any uncertain update, reconcile the same
+release before retrying; do not choose a new baseline to bypass a mismatch.
+Static website publication follows backend verification.
