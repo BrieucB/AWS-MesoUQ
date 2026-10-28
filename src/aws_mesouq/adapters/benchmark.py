@@ -39,6 +39,12 @@ def execute(manifest_path):
                "--request", manifest["request"], "--campaign", manifest["campaign_root"],
                "--stage", manifest["stage"], "--reserved-seconds", str(manifest["internal_seconds"]),
                "--device", manifest["device"]]
+    if manifest["stage"] == "metrics":
+        if not manifest.get("allocation_costs") or digest(Path(manifest["allocation_costs"])) != manifest.get("allocation_costs_sha256"):
+            raise ValueError("Metrics requires a pinned authoritative allocation-cost snapshot")
+        command += ["--allocation-costs", manifest["allocation_costs"], "--allocation-costs-sha256", manifest["allocation_costs_sha256"]]
+    elif "allocation_costs" in manifest:
+        raise ValueError("Allocation-cost snapshots are metrics-only")
     if manifest["stage"] == "tmcmc":
         command = ["mpirun", "-np", "1", *command]
     return subprocess.run(command, cwd=repository, timeout=manifest["internal_seconds"] + 5).returncode

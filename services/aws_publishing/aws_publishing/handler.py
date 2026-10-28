@@ -42,6 +42,7 @@ def application():
             validate_configuration=validate_job_configuration,
             validate_result=validate_result,
             release_policy="v1",
+            benchmark_policies=json.loads(os.environ.get("BENCHMARK_POLICIES", "{}")),
             notifications=SQSNotifications(
                 boto3.client("sqs"), os.environ["EVENT_QUEUE_URL"]
             ),

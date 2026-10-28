@@ -12,6 +12,9 @@ from aws_mesouq.benchmark import (
     SCHEMA, FAMILIES, TERMINAL, canonical, checksum, claim_signing_bytes,
     stage_signing_bytes, stage_plan, token, validate_artifacts, validate_create, capabilities,
     validate_stage_result, keys, number, archive_signing_bytes,
+    validate_benchmark_policy, scientific_request_checksum, expected_artifact_bytes, project_artifact_charge,
+    campaign_artifact_charge, ARTIFACT_PROJECT_BYTES, ARTIFACT_CAMPAIGN_BYTES,
+    ARTIFACT_MAX_COUNT,
 )
 from .api import fail, require_keys
 
@@ -107,14 +110,19 @@ class BenchmarkRoutes:
                 if stage["status"] == "pending" and stage.get("dependency_policy") != "terminal" and any(stages[d]["status"] in ("failed", "cancelled", "blocked") for d in stage["depends_on"]):
                     stage.update(status="blocked", failure={"code": "dependency_failed", "message": "Required stage did not succeed"}, updated_at=now)
                     changed = True
+        if stages["cases"]["status"] in ("failed", "cancelled", "blocked") and not campaign.get("case_set_sha256") and stages["metrics"]["status"] == "pending":
+            stages["metrics"].update(status="blocked", failure={"code": "cases_unavailable", "message": "No valid frozen case bank is available for scientific comparison"}, updated_at=now)
         if campaign.get("cancel_requested_at") is not None:
             campaign["status"] = "cancelled" if all(s["status"] in TERMINAL for s in stages.values()) else "cancelling"
-        elif stages["metrics"]["status"] == "succeeded":
+        elif stages["metrics"]["status"] == "succeeded" and all(s["status"] in TERMINAL for s in stages.values()):
             campaign["status"] = "completed"
         elif stages["metrics"]["status"] in ("failed", "blocked"):
             campaign["status"] = "failed"
         elif any(s["status"] != "pending" for s in stages.values()):
             campaign["status"] = "running"
+        reservation = campaign.get("artifact_reservation")
+        if reservation and reservation["status"] == "active" and all(s["status"] in TERMINAL for s in stages.values()):
+            reservation.update(status="settled", settled_at=now, actual_bytes=sum(ref["size_bytes"] for ref in campaign["artifacts"].values()))
         campaign["updated_at"] = now
 
     def route(self, method, path, sub, identity, body, state):
@@ -132,7 +140,9 @@ class BenchmarkRoutes:
             capability = re.fullmatch(r"/v1/projects/([^/]+)/benchmarks/capabilities", path)
             if capability and method == "GET":
                 self.app.member(state, identity, capability[1])
-                return 200, capabilities()
+                information = capabilities()
+                information["artifact_budget"]["project_available_bytes"] = max(0, ARTIFACT_PROJECT_BYTES - project_artifact_charge(state, capability[1]))
+                return 200, information
             match = re.fullmatch(r"/v1/projects/([^/]+)/benchmarks(?:/([^/]+))?(?:/(cancel|results|artifacts|archive)(?:/([^/]+))?)?", path)
             if not match:
                 fail(404, "not_found", "Benchmark route not found")
@@ -186,19 +196,26 @@ class BenchmarkRoutes:
             if previous["hash"] != checksum(configuration):
                 fail(409, "idempotency_conflict", "Benchmark idempotency key was used with different content")
             return 202, {"campaign": public_campaign(state["benchmark_campaigns"][previous["campaign_id"]])}
-        policy = state["projects"][project].get("benchmark_policy", {})
-        if not policy:
+        project_record = state["projects"][project]
+        policy = project_record["benchmark_policy"] if "benchmark_policy" in project_record else self.app.benchmark_policies.get(project)
+        if policy is None:
             fail(403, "benchmark_not_enrolled", "Project requires an operator-approved benchmark adapter")
-        keys(policy, ("adapter_sha256", "science_revision", "scenario_families"), ("max_concurrent_stages", "archive_root"))
-        if not re.fullmatch("[0-9a-f]{64}", policy["adapter_sha256"]) or not re.fullmatch("[0-9a-f]{40}", policy["science_revision"]) or body["scenario"]["family"] not in policy["scenario_families"]:
-            fail(403, "benchmark_not_enrolled", "Project requires an operator-approved benchmark adapter and scenario family")
+        policy = validate_benchmark_policy(policy)
+        if body["scenario"]["family"] not in policy["scenario_families"]:
+            fail(403, "benchmark_not_enrolled", "Scenario family is outside the operator-approved benchmark policy")
+        expected_bytes = expected_artifact_bytes(configuration)
+        available = ARTIFACT_PROJECT_BYTES - project_artifact_charge(state, project)
+        if expected_bytes > ARTIFACT_CAMPAIGN_BYTES or expected_bytes > available:
+            fail(429, "benchmark_storage_quota_exceeded", f"Expected full posterior artifacts require {expected_bytes} bytes; project has {max(0, available)} bytes available within its 1 GiB cloud quota. Choose fewer cases or posterior draws, or wait for active campaign reservations to settle")
         ident = uuid.uuid4().hex
         campaign = {
             "schema": SCHEMA, "id": ident, "project_id": project, "owner_sub": sub,
             "configuration": configuration, "configuration_hash": checksum(configuration),
+            "scientific_request_hash": scientific_request_checksum(configuration),
             "approved_adapter": copy.deepcopy(policy), "status": "pending",
             "created_at": now, "updated_at": now, "revision": 1,
             "stages": stage_plan(), "artifacts": {},
+            "artifact_reservation": {"status": "active", "expected_bytes": expected_bytes, "created_at": now},
             "budget_ledger": {method: {"limit_gpu_seconds": configuration["budget"]["method_gpu_seconds"], "settled_gpu_seconds": 0, "reservations": {}} for method in ("hnpe", "tmcmc")},
         }
         state["benchmark_campaigns"][ident] = campaign
@@ -243,6 +260,8 @@ class BenchmarkRoutes:
                     if campaign.get("cancel_requested_at") is not None:
                         continue
                     dependencies = [stages[d]["status"] for d in stage["depends_on"]]
+                    if stage["id"] == "metrics" and not all(s["status"] in TERMINAL for s in campaign["stages"] if s["id"] != "metrics"):
+                        continue
                     if not all(s in TERMINAL if stage.get("dependency_policy") == "terminal" else s == "succeeded" for s in dependencies):
                         continue
                     concurrency = 64
@@ -303,8 +322,14 @@ class BenchmarkRoutes:
             if body["type"] != "artifact_upload" or stage["status"] not in ACTIVE:
                 raise ValueError("An active stage must request its own artifacts")
             refs = validate_artifacts(body.get("artifacts"))
-            if len(campaign["artifacts"]) + len(refs) > 100 or sum(r["size_bytes"] for r in campaign["artifacts"].values()) + sum(r["size_bytes"] for r in refs) > 100000000:
-                fail(413, "artifact_quota_exceeded", "Benchmark private result artifact quota exceeded")
+            actual_bytes = sum(r["size_bytes"] for r in campaign["artifacts"].values())
+            after_bytes = actual_bytes + sum(r["size_bytes"] for r in refs)
+            if len(campaign["artifacts"]) + len(refs) > ARTIFACT_MAX_COUNT or after_bytes > ARTIFACT_CAMPAIGN_BYTES:
+                fail(413, "artifact_quota_exceeded", "Benchmark campaign cloud artifacts exceed 1 GiB or 100 files")
+            reservation = campaign.get("artifact_reservation", {})
+            after_charge = max(after_bytes, reservation.get("expected_bytes", 0)) if reservation.get("status") == "active" else after_bytes
+            if project_artifact_charge(state, campaign["project_id"]) - campaign_artifact_charge(campaign) + after_charge > ARTIFACT_PROJECT_BYTES:
+                fail(429, "artifact_quota_exceeded", "Project cloud storage exceeds its 1 GiB quota; choose fewer cases or posterior draws")
             artifact_ids = []
             for ref in refs:
                 ident = uuid.uuid4().hex
@@ -332,6 +357,21 @@ class BenchmarkRoutes:
                 stage["submission_started"] = True
             if kind in ("succeeded", "failed", "cancelled") and stage.get("method_group"):
                 self.settle_budget(campaign, stage, body, kind)
+            if kind in ("succeeded", "failed", "cancelled") and not stage.get("method_group") and body.get("scheduler_accounting") is not None:
+                accounting = body["scheduler_accounting"]
+                keys(accounting, ("source", "site", "slurm_job_id", "state", "elapsed_seconds", "allocated_gpus", "cpu_seconds"))
+                if accounting["source"] != "sacct" or accounting["site"] != "karolina" or accounting["slurm_job_id"] != stage.get("slurm_job_id") or accounting["state"] not in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"):
+                    raise ValueError("Separate-cost stages require matching native terminal accounting")
+                if kind == "succeeded" and accounting["state"] != "COMPLETED":
+                    raise ValueError("Successful stage requires COMPLETED Slurm accounting")
+                number(accounting["elapsed_seconds"], "allocated elapsed seconds", 0, 10000000)
+                number(accounting["cpu_seconds"], "allocated CPU seconds", 0, 1e12)
+                if type(accounting["allocated_gpus"]) is not int or accounting["allocated_gpus"] != 1:
+                    raise ValueError("Separate-cost stage must account for its allocated GPU")
+                reported = body.get("result", {}).get("timing") if kind == "succeeded" else body.get("timing")
+                if not isinstance(reported, dict) or reported.get("wall_seconds") != accounting["elapsed_seconds"] or reported.get("gpu_seconds") != accounting["elapsed_seconds"] or reported.get("cpu_seconds") != accounting["cpu_seconds"]:
+                    raise ValueError("Separate stage timing must match native allocation accounting")
+                stage["scheduler_accounting"] = copy.deepcopy(accounting)
             if kind == "succeeded":
                 result = validate_stage_result(body.get("result"), campaign, stage)
                 for ref in result["artifacts"]:
@@ -392,7 +432,7 @@ class BenchmarkRoutes:
             fail(403, "invalid_connector", "Archive signer must be an enrolled connector used by this campaign")
         self.signature(identity, body["connector_id"], body["signature"], archive_signing_bytes(campaign, body))
         receipt = body["receipt"]
-        keys(receipt, ("site", "path", "artifacts", "retained_outputs", "manifest_sha256"))
+        keys(receipt, ("site", "path", "artifacts", "retained_outputs", "manifest_sha256"), ("attested_original_file_count", "attested_original_files_sha256"))
         root_text = campaign["approved_adapter"].get("archive_root")
         path_text = receipt["path"]
         if not isinstance(root_text, str) or not isinstance(path_text, str) or receipt["site"] != "karolina":
@@ -402,7 +442,7 @@ class BenchmarkRoutes:
             raise ValueError("Archive path is outside the operator-approved durable root")
         if not isinstance(receipt["manifest_sha256"], str) or not re.fullmatch("[a-f0-9]{64}", receipt["manifest_sha256"]):
             raise ValueError("Archive requires a verified immutable manifest SHA256")
-        expected = {ref["id"]: ref for ref in campaign["artifacts"].values()}
+        expected = {ref["id"]: ref for ref in campaign["artifacts"].values() if ref.get("verified")}
         refs = receipt["artifacts"]
         if not isinstance(refs, list) or len(refs) != len(expected) or {r.get("id") for r in refs if isinstance(r, dict)} != set(expected):
             raise ValueError("Archive receipt must include every retained cloud artifact exactly once")
@@ -424,12 +464,22 @@ class BenchmarkRoutes:
             if not isinstance(output["sha256"], str) or not re.fullmatch("[a-f0-9]{64}", output["sha256"]):
                 raise ValueError("Invalid retained output SHA256")
             number(output["size_bytes"], "retained output size", 0, 1e15, True)
+        if "attested_original_file_count" in receipt or "attested_original_files_sha256" in receipt:
+            number(receipt.get("attested_original_file_count"), "attested original file count", 1, 1000000, True)
+            if not isinstance(receipt.get("attested_original_files_sha256"), str) or not re.fullmatch("[a-f0-9]{64}", receipt["attested_original_files_sha256"]):
+                raise ValueError("Compact archive receipt requires its connector-attested original-file snapshot hash")
+            if len(outputs) != 1 or outputs[0]["path"] != "archive-manifest.json" or outputs[0]["sha256"] != receipt["manifest_sha256"]:
+                raise ValueError("Compact archive evidence must commit to the immutable full internal manifest")
+        quarantined = [ref["id"] for ref in campaign["artifacts"].values() if not ref.get("verified")]
         accepted = campaign.get("archive", {})
         if accepted.get("status") == "verified":
             if checksum(accepted["receipt"]) != checksum(receipt):
                 fail(409, "archive_conflict", "Accepted archive receipts are immutable")
         else:
-            campaign["archive"] = {**accepted, "status": "verified", "verified_at": self.app.clock(), "connector_id": body["connector_id"], "receipt": copy.deepcopy(receipt), "cloud_retention": {"automatic_expiry": False, "mode": "retain_until_benchmark_maintenance_supported"}}
+            for artifact_id in quarantined:
+                campaign["artifacts"][artifact_id].setdefault("retention_status", "quarantined_unverified")
+                campaign["artifacts"][artifact_id].setdefault("quarantined_at", self.app.clock())
+            campaign["archive"] = {**accepted, "status": "verified", "verified_at": self.app.clock(), "connector_id": body["connector_id"], "receipt": copy.deepcopy(receipt), "cloud_retention": {"automatic_expiry": False, "mode": "retain_until_benchmark_maintenance_supported"}, "quarantined_unverified_artifact_ids": quarantined, "evidence": "connector_attested_project_copy_with_immutable_manifest"}
         return 200, {"campaign": public_campaign(campaign)}
 
     def settle_budget(self, campaign, stage, body, kind):

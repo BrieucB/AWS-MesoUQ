@@ -28,8 +28,8 @@ class HNPE(WireModel):
     depth: Literal[1, 2, 3]
     learning_rate: Literal[0.0001, 0.0003]
     batch_size: Literal[256, 512, 1024, 2048]
-    max_updates: Annotated[int, Field(ge=1, le=10000000)]
-    training_budget: Annotated[float, Field(ge=90, le=14400)]
+    max_updates: Annotated[int, Field(ge=1, le=1000000)]
+    training_budget: Annotated[int, Field(ge=120, le=14400)]
 
 
 class TMCMC(WireModel):
@@ -53,14 +53,14 @@ class Evaluation(WireModel):
 
 class Budget(WireModel):
     mode: Literal["fixed"]
-    method_gpu_seconds: Annotated[float, Field(ge=90, le=10000000)]
+    method_gpu_seconds: Annotated[int, Field(ge=1, le=2147483647)]
 
 
 class Reference(WireModel):
-    initial_power: Annotated[int, Field(ge=8, le=24)]
-    maximum_power: Annotated[int, Field(ge=8, le=24)]
-    scrambles: Annotated[int, Field(ge=2, le=16)]
-    relative_tolerance: Annotated[float, Field(ge=0.0001, le=0.25)]
+    initial_power: Annotated[int, Field(ge=4, le=20)]
+    maximum_power: Annotated[int, Field(ge=5, le=22)]
+    scrambles: Annotated[int, Field(ge=4, le=16)]
+    relative_tolerance: Annotated[float, Field(gt=0, le=0.1)]
 
 
 class CreateCampaign(WireModel):
@@ -139,7 +139,12 @@ def create_app(application):
         if not claims:
             raise APIError(401, "unauthenticated", "Verified access token required")
         service = application() if callable(application) else application
-        status, result = service.handle(request.method, request.url.path, claims, body or {})
+        context = request.scope.get("aws.context")
+        remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
+        if remaining_ms is None:
+            status, result = service.handle(request.method, request.url.path, claims, body or {})
+        else:
+            status, result = service.handle(request.method, request.url.path, claims, body or {}, remaining_ms=remaining_ms)
         return JSONResponse(result, status_code=status, headers=headers)
 
     @app.get("/v1/benchmark-scenarios")

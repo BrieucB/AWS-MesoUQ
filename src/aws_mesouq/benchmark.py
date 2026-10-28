@@ -10,6 +10,11 @@ SCHEMA = "aws_mesouq.benchmark_lab.v1"
 FAMILIES = ("baseline", "higher_noise", "broader_priors")
 FACTORS = ("global", "mechanical_1", "mechanical_2", "mechanical_3", "acoustic_1", "acoustic_2", "acoustic_3")
 TERMINAL = frozenset(("succeeded", "failed", "cancelled", "blocked"))
+ARTIFACT_PROJECT_BYTES = 1073741824
+ARTIFACT_CAMPAIGN_BYTES = 1073741824
+ARTIFACT_SINGLE_BYTES = 100000000
+ARTIFACT_MAX_COUNT = 100
+ARTIFACT_OVERHEAD_BYTES = 8 * 1024 * 1024
 
 
 def canonical(value):
@@ -60,8 +65,8 @@ def validate_create(value):
     for name in ("width", "depth", "batch_size"):
         if type(hnpe[name]) is not int:
             raise ValueError(f"HNPE {name} must be an integer")
-    number(hnpe["max_updates"], "HNPE max updates", 1, 10000000, True)
-    number(hnpe["training_budget"], "HNPE per-factor training seconds", 90, 14400)
+    number(hnpe["max_updates"], "HNPE max updates", 1, 1000000, True)
+    number(hnpe["training_budget"], "HNPE per-factor training seconds", 120, 14400, True)
     tmcmc = controls["tmcmc"]
     keys(tmcmc, ("population_size", "target_cov", "proposal_scale", "burn_in", "max_generations"))
     for name, allowed in (("population_size", (2048, 4096, 8192)), ("target_cov", (0.4, 0.6, 0.8)), ("proposal_scale", (0.25, 0.5, 1.0)), ("burn_in", (1, 7, 10))):
@@ -81,16 +86,26 @@ def validate_create(value):
     keys(budget, ("mode", "method_gpu_seconds"))
     if budget["mode"] != "fixed":
         raise ValueError("Benchmark comparison uses a fixed total method budget")
-    number(budget["method_gpu_seconds"], "total method GPU seconds", 90, 10000000)
+    number(budget["method_gpu_seconds"], "total method GPU seconds", 1, 2147483647, True)
     reference = value["reference"]
     keys(reference, ("initial_power", "maximum_power", "scrambles", "relative_tolerance"))
-    number(reference["initial_power"], "reference initial power", 8, 24, True)
-    number(reference["maximum_power"], "reference maximum power", 8, 24, True)
-    if reference["maximum_power"] < reference["initial_power"]:
+    number(reference["initial_power"], "reference initial power", 4, 20, True)
+    number(reference["maximum_power"], "reference maximum power", 5, 22, True)
+    if reference["maximum_power"] <= reference["initial_power"]:
         raise ValueError("Reference maximum power cannot precede initial power")
-    number(reference["scrambles"], "reference scrambles", 2, 16, True)
-    number(reference["relative_tolerance"], "reference relative tolerance", 0.0001, 0.25)
-    return json.loads(canonical(value))
+    number(reference["scrambles"], "reference scrambles", 4, 16, True)
+    number(reference["relative_tolerance"], "reference relative tolerance", 0.0, 0.1)
+    if reference["relative_tolerance"] == 0:
+        raise ValueError("Reference relative tolerance must be positive")
+    normalized = json.loads(canonical(value))
+    normalized["scenario"]["scale"] = round(float(scenario["scale"]) * 4) / 4
+    return normalized
+
+
+def scientific_request_checksum(value):
+    """Science identity excludes transport idempotency; full campaign identity retains it."""
+    normalized = validate_create(value)
+    return checksum({k: v for k, v in normalized.items() if k != "idempotency_key"})
 
 
 DEFAULT_CONFIGURATION = {
@@ -110,11 +125,12 @@ def capabilities():
         "schema": SCHEMA, "families": list(FAMILIES), "compute_site": "karolina",
         "scale": {"minimum": 1, "maximum": 3, "step": 0.25, "baseline": 1, "nonbaseline_default": 2},
         "defaults": json.loads(canonical(DEFAULT_CONFIGURATION)),
-        "controls": {"hnpe": {"width": [64, 128, 256], "depth": [1, 2, 3], "learning_rate": [0.0001, 0.0003], "batch_size": [256, 512, 1024, 2048], "training_budget": {"minimum": 90, "maximum": 14400, "unit": "seconds_per_factor"}, "max_updates": {"minimum": 1, "maximum": 10000000}, "flow_blocks": 6, "bins": 8}, "tmcmc": {"population_size": [2048, 4096, 8192], "target_cov": [0.4, 0.6, 0.8], "proposal_scale": [0.25, 0.5, 1.0], "burn_in": [1, 7, 10], "max_generations": {"minimum": 100, "maximum": 10000}}},
+        "controls": {"hnpe": {"width": [64, 128, 256], "depth": [1, 2, 3], "learning_rate": [0.0001, 0.0003], "batch_size": [256, 512, 1024, 2048], "training_budget": {"minimum": 120, "maximum": 14400, "unit": "seconds_per_factor"}, "max_updates": {"minimum": 1, "maximum": 1000000}, "flow_blocks": 6, "bins": 8}, "tmcmc": {"population_size": [2048, 4096, 8192], "target_cov": [0.4, 0.6, 0.8], "proposal_scale": [0.25, 0.5, 1.0], "burn_in": [1, 7, 10], "max_generations": {"minimum": 100, "maximum": 10000}}},
         "evaluation": {"case_count": {"minimum": 1, "maximum": 256}, "posterior_draws": {"minimum": 256, "maximum": 8192}, "cohort": ["central_90"]},
         "primary_cost": "training_plus_inference", "reference_cost": "reported_separately",
         "budget_semantics": "per_method_total_gpu_seconds_including_preparation_training_and_inference",
         "factor_ids": list(FACTORS), "fresh_training_required": True,
+        "artifact_budget": {"campaign_bytes": ARTIFACT_CAMPAIGN_BYTES, "project_bytes": ARTIFACT_PROJECT_BYTES, "artifact_bytes": ARTIFACT_SINGLE_BYTES, "artifact_count": ARTIFACT_MAX_COUNT, "posterior_methods": 3, "posterior_parameters": 21, "float64_bytes": 8, "overhead_bytes": ARTIFACT_OVERHEAD_BYTES, "reservation": "expected_bytes_reserved_at_creation_including_later_uploads"},
         "actions": {"cancel": True, "archive": True},
         "limits": {
             "scenario.scale": {"minimum": 1, "maximum": 3, "step": 0.25},
@@ -122,8 +138,8 @@ def capabilities():
             "controls.hnpe.depth": {"choices": [1, 2, 3]},
             "controls.hnpe.learning_rate": {"choices": [0.0001, 0.0003]},
             "controls.hnpe.batch_size": {"choices": [256, 512, 1024, 2048]},
-            "controls.hnpe.max_updates": {"minimum": 1, "maximum": 10000000},
-            "controls.hnpe.training_budget": {"minimum": 90, "maximum": 14400},
+            "controls.hnpe.max_updates": {"minimum": 1, "maximum": 1000000},
+            "controls.hnpe.training_budget": {"minimum": 120, "maximum": 14400},
             "controls.tmcmc.population_size": {"choices": [2048, 4096, 8192]},
             "controls.tmcmc.target_cov": {"choices": [0.4, 0.6, 0.8]},
             "controls.tmcmc.proposal_scale": {"choices": [0.25, 0.5, 1.0]},
@@ -131,7 +147,11 @@ def capabilities():
             "controls.tmcmc.max_generations": {"minimum": 100, "maximum": 10000},
             "evaluation.case_count": {"minimum": 1, "maximum": 256},
             "evaluation.posterior_draws": {"minimum": 256, "maximum": 8192},
-            "budget.method_gpu_seconds": {"minimum": 90, "maximum": 10000000},
+            "budget.method_gpu_seconds": {"minimum": 1, "maximum": 2147483647},
+            "reference.initial_power": {"minimum": 4, "maximum": 20},
+            "reference.maximum_power": {"minimum": 5, "maximum": 22},
+            "reference.scrambles": {"minimum": 4, "maximum": 16},
+            "reference.relative_tolerance": {"exclusiveMinimum": 0, "maximum": 0.1},
         },
     }
 
@@ -174,7 +194,7 @@ def validate_artifacts(refs):
         seen.add(ref["name"])
         if not isinstance(ref["sha256"], str) or not re.fullmatch("[0-9a-f]{64}", ref["sha256"]):
             raise ValueError("Invalid artifact SHA256")
-        number(ref["size_bytes"], "artifact size", 1, 100000000, True)
+        number(ref["size_bytes"], "artifact size", 1, ARTIFACT_SINGLE_BYTES, True)
         if ref["media_type"] not in ("application/json", "text/csv", "image/png", "image/svg+xml", "application/octet-stream"):
             raise ValueError("Unsupported benchmark artifact media type")
     return refs
@@ -211,3 +231,53 @@ def archive_signing_bytes(campaign, body):
         "approved_adapter": campaign["approved_adapter"],
         "event": {k: v for k, v in body.items() if k != "signature"},
     })
+
+
+def validate_benchmark_policy(policy):
+    """Operator-only policy; never accepted from campaign request fields."""
+    from pathlib import PurePosixPath
+    keys(policy, ("adapter_sha256", "science_revision", "scenario_families"), ("max_concurrent_stages", "archive_root"))
+    for name, length in (("adapter_sha256", 64), ("science_revision", 40)):
+        if not isinstance(policy[name], str) or not re.fullmatch("[0-9a-f]{" + str(length) + "}", policy[name]):
+            raise ValueError("Invalid operator benchmark source pin")
+    families = policy["scenario_families"]
+    if not isinstance(families, list) or not families or any(not isinstance(f, str) or f not in FAMILIES for f in families) or len(set(families)) != len(families):
+        raise ValueError("Operator benchmark scenario families must be a unique supported list")
+    if "max_concurrent_stages" in policy:
+        number(policy["max_concurrent_stages"], "operator stage concurrency", 1, 64, True)
+    if "archive_root" in policy:
+        root = policy["archive_root"]
+        if not isinstance(root, str) or len(root) > 2048 or not re.fullmatch(r"/[A-Za-z0-9_./-]+", root):
+            raise ValueError("Invalid operator durable archive root")
+        path = PurePosixPath(root)
+        if not path.is_absolute() or str(path) != root or root == "/" or ".." in path.parts:
+            raise ValueError("Operator archive root must be a canonical absolute private directory")
+    return json.loads(canonical(policy))
+
+
+def validate_benchmark_policies(policies):
+    if policies is None:
+        return {}
+    if not isinstance(policies, dict):
+        raise ValueError("Trusted benchmark deployment policies must be a project mapping")
+    validated = {}
+    for project, policy in policies.items():
+        token(project, "operator project identifier")
+        validated[project] = validate_benchmark_policy(policy)
+    return validated
+
+
+def expected_artifact_bytes(configuration):
+    evaluation = configuration["evaluation"]
+    return 3 * evaluation["case_count"] * evaluation["posterior_draws"] * 21 * 8 + ARTIFACT_OVERHEAD_BYTES
+
+
+def campaign_artifact_charge(campaign):
+    actual = sum(ref["size_bytes"] for ref in campaign.get("artifacts", {}).values())
+    reservation = campaign.get("artifact_reservation", {})
+    return max(actual, reservation.get("expected_bytes", 0)) if reservation.get("status") == "active" else actual
+
+
+def project_artifact_charge(state, project):
+    legacy = sum(ref["size_bytes"] for ref in state["artifacts"].values() if ref.get("project_id") == project and not ref.get("reservation_released"))
+    return legacy + sum(campaign_artifact_charge(campaign) for campaign in state["benchmark_campaigns"].values() if campaign["project_id"] == project)

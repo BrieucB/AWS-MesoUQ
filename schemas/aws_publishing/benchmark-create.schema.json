@@ -9,10 +9,10 @@
           "type": "string"
         },
         "method_gpu_seconds": {
-          "maximum": 10000000,
-          "minimum": 90,
+          "maximum": 2147483647,
+          "minimum": 1,
           "title": "Method Gpu Seconds",
-          "type": "number"
+          "type": "integer"
         }
       },
       "required": [
@@ -108,16 +108,16 @@
           "type": "integer"
         },
         "max_updates": {
-          "maximum": 10000000,
+          "maximum": 1000000,
           "minimum": 1,
           "title": "Max Updates",
           "type": "integer"
         },
         "training_budget": {
           "maximum": 14400,
-          "minimum": 90,
+          "minimum": 120,
           "title": "Training Budget",
-          "type": "number"
+          "type": "integer"
         }
       },
       "required": [
@@ -135,26 +135,26 @@
       "additionalProperties": false,
       "properties": {
         "initial_power": {
-          "maximum": 24,
-          "minimum": 8,
+          "maximum": 20,
+          "minimum": 4,
           "title": "Initial Power",
           "type": "integer"
         },
         "maximum_power": {
-          "maximum": 24,
-          "minimum": 8,
+          "maximum": 22,
+          "minimum": 5,
           "title": "Maximum Power",
           "type": "integer"
         },
         "scrambles": {
           "maximum": 16,
-          "minimum": 2,
+          "minimum": 4,
           "title": "Scrambles",
           "type": "integer"
         },
         "relative_tolerance": {
-          "maximum": 0.25,
-          "minimum": 0.0001,
+          "exclusiveMinimum": 0,
+          "maximum": 0.1,
           "title": "Relative Tolerance",
           "type": "number"
         }

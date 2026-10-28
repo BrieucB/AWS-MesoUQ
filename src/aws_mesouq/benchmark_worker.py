@@ -13,7 +13,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_create
+from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_create, scientific_request_checksum
 from .benchmark_client import BenchmarkClient, native_accounting
 from .connector.transport import absolute_path, safe_id, safe_relative
 
@@ -281,6 +281,7 @@ for name in ('stdout.log','stderr.log'):
 os.close(fd)
 """
         self._slow(entry, self.transport.run, [getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", mkdir_code, self.operator["run_root"], campaign["id"] + "/control/" + stage["id"]])
+        entry["root"] = root
         request_path = root + "/request.json"
         self._slow(entry, self._immutable, request_path, canonical(campaign["configuration"]))
         adapter = Path(__file__).with_name("adapters").joinpath("benchmark.py").read_bytes()
@@ -288,12 +289,53 @@ os.close(fd)
             raise ValueError("Installed benchmark adapter differs from operator pin")
         window = scheduler_window(stage.get("reserved_seconds", self.operator["stage_seconds"].get(stage["id"], 0)), self.operator["scheduler"]["partition"])
         manifest = {**{k: self.operator[k] for k in ("repository", "science_revision", "python_bin", "environment_script", "environment_sha256", "adapter_sha256")}, "request": request_path, "campaign_root": root, "configuration_hash": campaign["configuration_hash"], "stage": stage["id"], "internal_seconds": window["internal_seconds"], "device": "cpu" if stage["id"] in ("cases", "reference", "metrics") else "cuda"}
+        if stage["id"] == "metrics":
+            costs = self.allocation_snapshot(entry)
+            costs_blob = canonical(costs)
+            costs_path = control + "/allocation-costs.json"
+            self._slow(entry, self._immutable, costs_path, costs_blob)
+            manifest["allocation_costs"] = costs_path
+            manifest["allocation_costs_sha256"] = hashlib.sha256(costs_blob).hexdigest()
         self._slow(entry, self._immutable, control + "/adapter.py", adapter)
         self._slow(entry, self._immutable, control + "/manifest.json", canonical(manifest))
         script = self.script(entry, control, window)
         self._slow(entry, self._immutable, control + "/submit.sh", script.encode())
         entry.update(root=root, control=control, script=control + "/submit.sh", window=window)
         self.save()
+
+    def allocation_snapshot(self, entry):
+        campaign = self.client.get(self.project, entry["claim"]["campaign"]["id"])["campaign"]
+        stages = [s for s in campaign["stages"] if s["id"] != "metrics"]
+        if not all(s["status"] in TERMINAL for s in stages):
+            raise ValueError("Authoritative metrics require all scientific stages to be terminal")
+        raw = self._slow(entry, self.transport.read_beneath, entry["root"], "stages/cases/receipt.json")
+        cases = json.loads(raw)
+        scientific_hash = campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"]))
+        if cases.get("request_fingerprint") != scientific_hash or cases.get("transport_request_fingerprint") != campaign["configuration_hash"]:
+            raise ValueError("Allocation-cost snapshot differs from frozen case request")
+        binding = cases.get("source_binding", {})
+        if binding.get("sha256") != checksum(binding.get("files", {})):
+            raise ValueError("Allocation-cost source snapshot is inconsistent")
+        case_bank = cases["case_bank"]
+        self._file(entry, "stages/cases/" + safe_relative(case_bank["file"]), case_bank)
+
+        def totals(selected):
+            gpu, cpu, missing = 0, 0, []
+            for stage in selected:
+                accounting = stage.get("scheduler_accounting")
+                if accounting is not None:
+                    gpu += accounting["elapsed_seconds"] * accounting["allocated_gpus"]
+                    cpu += accounting["cpu_seconds"]
+                elif stage["status"] in ("blocked", "failed", "cancelled") and not stage.get("slurm_job_id") and not stage.get("submission_started"):
+                    pass  # Known unsubmitted stage has no native allocation.
+                else:
+                    missing.append(stage["id"])
+            return {"allocated_gpu_seconds": None if missing else gpu, "allocated_cpu_seconds": None if missing else cpu, "status": "unknown" if missing else "complete", "missing_stage_ids": missing, "stage_ids": [s["id"] for s in selected]}
+
+        hnpe = [s for s in stages if s["kind"] in ("cases", "hnpe_train", "hnpe_infer")]
+        tmcmc = [s for s in stages if s["id"] == "tmcmc"]
+        reference = [s for s in stages if s["id"] == "reference"]
+        return {"schema": "aws_mesouq.benchmark_allocation_costs.v1", "campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": scientific_hash, "case_set_sha256": case_bank["sha256"], "science_revision": self.operator["science_revision"], "adapter_sha256": self.operator["adapter_sha256"], "source_binding_sha256": binding["sha256"], "stages": [{k: copy.deepcopy(s[k]) for k in ("id", "kind", "status", "slurm_job_id", "scheduler_accounting", "timing", "failure") if k in s} for s in stages], "costs": {"methods": {"hnpe": totals(hnpe), "tmcmc": totals(tmcmc)}, "reference": totals(reference)}}
 
     def script(self, entry, control, window):
         scheduler = {**self.operator["scheduler"], "gres": "gpu:1", "time": window["time"]}
@@ -327,11 +369,18 @@ os.close(fd)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         blob = self._slow(entry, self.transport.read_beneath, entry["root"], "stages/" + stage["id"] + "/receipt.json")
         receipt = json.loads(blob)
-        if receipt.get("stage") != stage["id"] or receipt.get("request_fingerprint") != campaign["configuration_hash"] or str(receipt.get("slurm_job_id")) != entry["job_id"]:
+        if receipt.get("stage") != stage["id"] or receipt.get("request_fingerprint") != campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])) or str(receipt.get("slurm_job_id")) != entry["job_id"]:
             raise ValueError("Scientific receipt is not bound to this frozen request and native stage")
+        if receipt.get("transport_request_fingerprint") != campaign["configuration_hash"]:
+            raise ValueError("Scientific receipt transport request differs from this campaign")
         binding = receipt.get("source_binding", {})
         if binding.get("sha256") != checksum(binding.get("files", {})):
             raise ValueError("Scientific source receipt hash is inconsistent")
+        if stage["id"] == "metrics":
+            costs_path = entry["control"] + "/allocation-costs.json"
+            costs_blob = self._slow(entry, self.transport.read, costs_path)
+            if receipt.get("allocation_costs_sha256") != hashlib.sha256(costs_blob).hexdigest():
+                raise ValueError("Scientific metrics did not bind the authoritative allocation-cost snapshot")
         entry["receipt"] = receipt
         self.state["campaigns"][campaign["id"]].setdefault("receipts", {})[stage["id"]] = receipt
         self.save()
@@ -398,7 +447,7 @@ os.close(fd)
                 kept.append(history[-1])
             if kept:
                 histories.append({"title": factor + " validation history", "x_label": "Training updates", "y_label": "Validation NLL", "series": [{"name": factor, "x": [row["update"] for row in kept], "y": [row["validation_nll"] for row in kept]}], "history": history[::max(1, math.ceil(len(history) / 50))], "metadata_sampling": "Bounded measured checkpoints; full histories are retained in scientific artifacts"})
-        return {"scientific_status": scientific.get("scientific_status"), "metrics": {method: payload.get("summary") for method, payload in scientific.get("methods", {}).items()}, "case_results": {method: [{"world_index": row.get("world_index"), "status": row.get("status"), "metrics": {"score": row.get("metrics", {}).get("score")}, "termination_reason": row.get("termination_reason")} for row in payload.get("cases", [])] for method, payload in scientific.get("methods", {}).items()}, "plots": [], "training_histories": histories, "artifacts": refs, "limitations": scientific.get("limitations", [])}
+        return {"scientific_status": scientific.get("scientific_status"), "paired_comparison": scientific.get("paired_comparison"), "allocation_costs": scientific.get("allocation_costs"), "allocation_costs_binding": scientific.get("allocation_costs_binding"), "allocation_costs_sha256": scientific.get("allocation_costs_sha256"), "metrics": {method: payload.get("summary") for method, payload in scientific.get("methods", {}).items()}, "case_results": {method: [{"world_index": row.get("world_index"), "status": row.get("status"), "metrics": {"score": row.get("metrics", {}).get("score")}, "termination_reason": row.get("termination_reason")} for row in payload.get("cases", [])] for method, payload in scientific.get("methods", {}).items()}, "plots": [], "training_histories": histories, "artifacts": refs, "limitations": scientific.get("limitations", [])}
 
     def complete(self, entry, accounting):
         timing = {"wall_seconds": accounting["elapsed_seconds"], "cpu_seconds": accounting["cpu_seconds"], "gpu_seconds": accounting["elapsed_seconds"] * accounting["allocated_gpus"]}
@@ -443,7 +492,7 @@ os.close(fd)
             return
         self._before_slow(entry)
         stage = entry["claim"]["stage"]
-        if "root" not in entry:
+        if "script" not in entry:
             if stage.get("reserved_seconds", 60) < 60:
                 self._send(entry, "failed", not_submitted=True, failure={"code": "budget_exhausted", "message": "Remaining method budget cannot fund one native Slurm minute"})
                 return
@@ -516,7 +565,7 @@ os.close(fd)
         if files is None:
             output = self.transport.run([getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", TREE_HELPER, root])
             files = json.loads(output)
-            manifest = canonical({"campaign_id": ident, "configuration_hash": campaign["configuration_hash"], "approved_adapter": campaign["approved_adapter"], "retained_outputs": files})
+            manifest = canonical({"campaign_id": ident, "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])), "approved_adapter": campaign["approved_adapter"], "original_file_count": len(files), "original_files_sha256": checksum(files), "retained_outputs": files})
             record["archive_manifest"] = manifest.decode()
             files.append({"path": "archive-manifest.json", "sha256": hashlib.sha256(manifest).hexdigest(), "size_bytes": len(manifest)})
             record["archive_files"] = files
@@ -528,8 +577,9 @@ os.close(fd)
             self.transport.archive_copy(self.operator["archive_root"], ident, transfer)
             self.transport.archive_verify(self.operator["archive_root"], ident, transfer)
         manifest = next(item for item in files if item["path"] == "archive-manifest.json")
-        refs = [{k: artifact[k] for k in ("id", "sha256", "size_bytes")} for artifact in campaign.get("artifacts", [])]
-        receipt = {"site": "karolina", "path": self.operator["archive_root"] + "/" + ident, "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": files}
+        refs = [{k: artifact[k] for k in ("id", "sha256", "size_bytes")} for artifact in campaign.get("artifacts", []) if artifact.get("verified")]
+        originals = [item for item in files if item["path"] != "archive-manifest.json"]
+        receipt = {"site": "karolina", "path": self.operator["archive_root"] + "/" + ident, "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": [manifest], "attested_original_file_count": len(originals), "attested_original_files_sha256": checksum(originals)}
         event_id = record.setdefault("archive_event_id", uuid.uuid4().hex)
         self.save()
         self.client.archive(campaign, event_id, receipt)

@@ -39,6 +39,8 @@ scientific code revisions.
 - `POST .../stages/{stage}/artifacts`: signed private upload reservation.
 - `POST /v1/benchmark-connector/archive`: signed durable archive verification.
 
+Operator deployment fallback policies may be supplied through the trusted Lambda `BENCHMARK_POLICIES` JSON environment mapping. Existing project-state policy takes precedence whenever that field exists; user request fields cannot select source pins or policies. An absent fallback preserves the existing enrollment denial.
+
 Request JSON schemas live in `schemas/aws_publishing/benchmark-*.schema.json`.
 The portable client and canonical signing envelopes are in
 `aws_mesouq.benchmark_client` and `aws_mesouq.benchmark`.
@@ -129,3 +131,37 @@ metadata are uploaded. Checkpoints, training banks and other retained products
 are copied and independently checksum-verified under the approved durable
 archive root before the signed archive receipt is sent. The executor reports
 bounded error class names and stage counts without logging credentials.
+
+
+## Reserved cloud storage
+
+Each benchmark campaign and its project have a one-GiB cloud artifact ceiling,
+with at most 100 artifacts per campaign and 100,000,000 bytes per artifact.
+Creation atomically reserves the conservative expected output size:
+three methods times cases times posterior draws times 21 float64 parameters,
+plus eight MiB of overhead. Admissions include retained legacy artifacts and
+all benchmark campaigns in the project. Uploads consume the existing expected
+reservation without counting those same bytes twice. Larger actual output may
+grow the charge only while project and campaign capacity remain available.
+Terminal campaigns release unused expected space only after every stage is
+terminal; actual object/upload reservations remain charged. Existing v1 owner
+limits remain in force.
+
+Scientific request identity normalizes the declared scenario multiplier and
+excludes only the transport idempotency key. Full campaign transport identity
+retains that key. Integer budgets and scientific reference limits are preserved
+across the typed HTTP interface and the scientific CLI.
+
+Metrics receives a pinned allocation-cost snapshot only after every other
+stage is terminal. Its native allocated GPU/CPU totals carry explicit unknown
+status when accounting is missing. The scientific receipt must bind the same
+cost-file checksum; process wall clocks remain diagnostic rather than primary
+method cost.
+
+Archival commits a compact cloud receipt to a full immutable internal manifest.
+The connector still copies and independently verifies every original file
+against that manifest, including model weights and native diagnostics. The
+signed original-file count and snapshot hash are connector attestations;
+the cloud service cannot inspect PROJECT files independently. Unverified
+partial cloud uploads are explicitly quarantined and remain storage-charged;
+they are not falsely described as committed archived results.

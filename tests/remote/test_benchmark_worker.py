@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from aws_mesouq.benchmark import DEFAULT_CONFIGURATION, canonical, checksum
+from aws_mesouq.benchmark import DEFAULT_CONFIGURATION, canonical, checksum, scientific_request_checksum
 from aws_mesouq.benchmark_worker import BenchmarkWorker, existing_identity, marker, scheduler_window, validate_operator
 from aws_mesouq.connector.journal import Journal
 from aws_mesouq.connector.signing import device_identity
@@ -70,7 +70,7 @@ def session(tmp_path):
         "repository": str(repository), "science_revision": "a" * 40, "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
         "python_bin": "/usr/bin/python3.11", "environment_script": str(environment), "environment_sha256": hashlib.sha256(environment.read_bytes()).hexdigest(),
         "run_root": str(run), "archive_root": str(archive), "expected_user": "fixtureuser", "expected_host": "fixture.cluster",
-        "scheduler": {"account": "eu-26-17", "partition": "qgpu_exp", "qos": "3516_6237", "cpus-per-task": 4, "mem": "16G"},
+        "scheduler": {"account": "fixture-account", "partition": "qgpu_exp", "qos": "fixture-qos", "cpus-per-task": 4, "mem": "16G"},
         "stage_seconds": {"reference": 300, "metrics": 300}, "allowed_upload_origins": ["https://uploads.example.invalid"],
     }
     journal = Journal(tmp_path / "journal")
@@ -140,7 +140,7 @@ def write_fixture_receipt(session, entry, status="completed"):
     target.mkdir(parents=True, mode=0o700)
     os.chmod(root / "stages", 0o700)
     source_files = {"fixture.py": "f" * 64}
-    receipt = {"stage": stage, "status": status, "request_fingerprint": entry["claim"]["campaign"]["configuration_hash"], "source_binding": {"files": source_files, "sha256": checksum(source_files)}, "slurm_job_id": entry["job_id"], "wall_seconds": 5}
+    receipt = {"stage": stage, "status": status, "request_fingerprint": entry["claim"]["campaign"]["scientific_request_hash"], "transport_request_fingerprint": entry["claim"]["campaign"]["configuration_hash"], "source_binding": {"files": source_files, "sha256": checksum(source_files)}, "slurm_job_id": entry["job_id"], "wall_seconds": 5}
     if stage == "cases":
         case_blob = b"fixture-only-case-data"
         case_path = target / "cases.npz"
@@ -159,6 +159,7 @@ def write_fixture_receipt(session, entry, status="completed"):
         blob = canonical(comparison)
         (target / "comparison.json").write_bytes(blob)
         os.chmod(target / "comparison.json", 0o600)
+        receipt["allocation_costs_sha256"] = hashlib.sha256((Path(entry["control"]) / "allocation-costs.json").read_bytes()).hexdigest()
         receipt.update(result=comparison, artifacts=[{"file": "comparison.json", "sha256": hashlib.sha256(blob).hexdigest(), "size_bytes": len(blob)}])
         posterior = b"fixture-only-coherent-float64-posterior-chunk"
         (target / "posterior-hnpe-000.npz").write_bytes(posterior)
@@ -323,6 +324,11 @@ def test_fixture_full_dag_honest_failure_and_verified_private_archive(session):
         write_fixture_receipt(session, entry, "budget_exhausted" if entry["claim"]["stage"]["id"] == "train_global" else "completed")
     session.worker.sweep()
     metrics = next(e for e in entries(session) if e["claim"]["stage"]["id"] == "metrics")
+    costs_snapshot = json.loads((Path(metrics["control"]) / "allocation-costs.json").read_text())
+    assert costs_snapshot["costs"]["methods"]["hnpe"]["allocated_gpu_seconds"] == 80
+    assert costs_snapshot["costs"]["methods"]["hnpe"]["allocated_cpu_seconds"] == 1280
+    assert costs_snapshot["costs"]["reference"]["allocated_gpu_seconds"] == 10
+    assert costs_snapshot["source_binding_sha256"] == checksum({"fixture.py": "f" * 64})
     write_fixture_receipt(session, metrics)
     session.worker.sweep()
     campaign = session.store.state["benchmark_campaigns"][session.campaign["id"]]
@@ -338,17 +344,22 @@ def test_fixture_full_dag_honest_failure_and_verified_private_archive(session):
     assert not result["errors"]
     archived = session.store.state["benchmark_campaigns"][campaign["id"]]["archive"]
     assert archived["status"] == "verified"
-    assert any(item["path"].endswith("selected.keras") for item in archived["receipt"]["retained_outputs"])
+    assert archived["receipt"]["retained_outputs"][0]["path"] == "archive-manifest.json"
+    archive_manifest = json.loads((Path(session.operator["archive_root"]) / campaign["id"] / "archive-manifest.json").read_text())
+    assert any(item["path"].endswith("selected.keras") for item in archive_manifest["retained_outputs"])
+    assert archived["receipt"]["attested_original_file_count"] == len(archive_manifest["retained_outputs"])
     assert (Path(session.operator["archive_root"]) / campaign["id"] / "archive-manifest.json").is_file()
 
 
 
-@pytest.mark.parametrize("stage,uses_mpi", [("tmcmc", True), ("cases", False)])
+@pytest.mark.parametrize("stage,uses_mpi", [("tmcmc", True), ("cases", False), ("metrics", False)])
 def test_standalone_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, monkeypatch, stage, uses_mpi):
     from aws_mesouq.adapters import benchmark
     request_path = tmp_path / "request.json"
     request_path.write_bytes(canonical({"fixture": True}))
     manifest = {"adapter_sha256": "a" * 64, "environment_script": "/trusted/runtime.sh", "environment_sha256": "a" * 64, "repository": "/trusted/science", "science_revision": "b" * 40, "request": str(request_path), "configuration_hash": checksum({"fixture": True}), "python_bin": "/trusted/bin/python", "campaign_root": "/private/fixture", "stage": stage, "internal_seconds": 50, "device": "cpu" if stage == "cases" else "cuda"}
+    if stage == "metrics":
+        manifest.update(allocation_costs="/trusted/allocation-costs.json", allocation_costs_sha256="a" * 64)
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setenv("SLURM_JOB_ID", "123")
@@ -359,6 +370,8 @@ def test_standalone_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, mo
     assert benchmark.execute(manifest_path) == 0
     assert (commands[0][:3] == ["mpirun", "-np", "1"]) == uses_mpi
     assert "meso_uq.benchmark_lab.cli" in commands[0] and "--request" in commands[0]
+    if stage == "metrics":
+        assert "--allocation-costs" in commands[0] and "--allocation-costs-sha256" in commands[0]
     request_path.write_text('{"fixture": false}')
     with pytest.raises(ValueError, match="Frozen scientific request"):
         benchmark.execute(manifest_path)
@@ -382,3 +395,45 @@ def test_other_authenticated_owner_cannot_reuse_enrolled_journal(session):
     with pytest.raises(ValueError, match="Authenticated application identity"):
         BenchmarkWorker(OtherAPI(), session.slurm, session.journal, project="p", operator=session.operator)
     assert session.journal.data == original
+
+
+def test_compact_archive_verifies_every_original_beyond_two_thousand_files(session, monkeypatch):
+    import shutil
+    session.worker.sweep()
+    first = entries(session)[0]
+    session.app.handle("POST", f"/v1/projects/p/benchmarks/{session.campaign['id']}/cancel", {"sub": "alice"}, {})
+    session.worker.sweep()
+    session.worker.sweep()
+    extra = Path(first["root"]) / "retained"
+    extra.mkdir(mode=0o700)
+    for index in range(2001):
+        path = extra / f"native-{index:04d}.json"
+        path.write_bytes(b"{}")
+        os.chmod(path, 0o600)
+    copied, verified = set(), set()
+    def verify(root, token, item):
+        path = Path(root) / token / item["destination"]
+        blob = path.read_bytes()
+        assert len(blob) == item["size_bytes"] and hashlib.sha256(blob).hexdigest() == item["sha256"]
+        verified.add(item["destination"])
+    def copy_file(root, token, item):
+        source = Path(item["source_root"]) / item["source"]
+        target = Path(root) / token / item["destination"]
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(source, target)
+        os.chmod(target, 0o400)
+        copied.add(item["destination"])
+        verify(root, token, item)
+    monkeypatch.setattr(session.cluster, "archive_copy", copy_file)
+    monkeypatch.setattr(session.cluster, "archive_verify", verify)
+    session.worker.client.request_archive("p", session.campaign["id"])
+    report = session.worker.sweep()
+    assert not report["errors"]
+    archived = session.store.state["benchmark_campaigns"][session.campaign["id"]]["archive"]
+    receipt = archived["receipt"]
+    assert receipt["attested_original_file_count"] > 2000
+    assert len(receipt["retained_outputs"]) == 1
+    assert len(canonical(receipt)) < 2000
+    assert copied == verified
+    assert len(copied) == receipt["attested_original_file_count"] + 1
+    assert (Path(session.operator["archive_root"]) / session.campaign["id"] / "retained/native-2000.json").read_bytes() == b"{}"
