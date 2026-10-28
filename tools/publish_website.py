@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish the reviewed inline posterior static delta using a scoped AWS role."""
+"""Publish a reviewed, bounded static website delta using a scoped AWS role."""
 import argparse
 import base64
 import hashlib
@@ -16,6 +16,13 @@ BASE_KEYS = (
 )
 ORDER = ("src/posterior.js", "src/style.css", "src/app.js")
 CONFIG = "runtime-config.json"
+BENCHMARK_NEW_KEYS = ("src/benchmark-figures.js", "src/benchmark-lab.js", "src/benchmark-lab.css")
+BENCHMARK_BASE_KEYS = (*BASE_KEYS, "src/posterior.js")
+BENCHMARK_ORDER = (*BENCHMARK_NEW_KEYS, "src/app.js", "index.html")
+PROFILES = {
+    "posterior": (BASE_KEYS, (ORDER[0],), ORDER),
+    "benchmark": (BENCHMARK_BASE_KEYS, BENCHMARK_NEW_KEYS, BENCHMARK_ORDER),
+}
 
 
 class PublicationError(RuntimeError):
@@ -103,17 +110,19 @@ def verify_metadata(head, raw, key):
             not head.get("WebsiteRedirectLocation"), "object-metadata-invalid")
 
 
-def publish(dist, baseline_dist, bucket, expected_role_arn, aws=None):
-    """Verify scoped identity, preflight all objects, publish only ORDER, read back."""
+def publish(dist, baseline_dist, bucket, expected_role_arn, aws=None, profile="posterior"):
+    """Verify scoped identity, preflight exact profile objects, conditionally write/read back."""
     aws = aws or AwsCli()
-    baseline = read_build(baseline_dist, BASE_KEYS)
-    target = read_build(dist, (*BASE_KEYS, ORDER[0]))
+    require(profile in PROFILES, "publication-profile-invalid")
+    base_keys, new_keys, order = PROFILES[profile]
+    baseline = read_build(baseline_dist, base_keys)
+    target = read_build(dist, (*base_keys, *new_keys))
     require(isinstance(bucket, str) and re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket),
             "bucket-invalid")
-    for key in BASE_KEYS:
-        if key not in ORDER and key != CONFIG:
+    for key in base_keys:
+        if key not in order and key != CONFIG:
             require(target[key] == baseline[key], "unexpected-build-delta")
-    require(all(target[key] != baseline[key] for key in ORDER[1:]), "expected-build-delta-missing")
+    require(all(target[key] != baseline[key] for key in order if key not in new_keys), "expected-build-delta-missing")
     verify_identity(aws, expected_role_arn)
     with tempfile.TemporaryDirectory(prefix="mesouq-static-") as temporary:
         scratch = Path(temporary)
@@ -146,12 +155,12 @@ def publish(dist, baseline_dist, bucket, expected_role_arn, aws=None):
         before = {}
         for key in target:
             allowed = None if key == CONFIG else (baseline.get(key), target[key])
-            before[key] = inspect(key, allowed, absent=key == ORDER[0])
+            before[key] = inspect(key, allowed, absent=key in new_keys)
         runtime = before[CONFIG][1]
         require(runtime is not None, "runtime-config-missing")
         writes = 0
         expected_etags = {}
-        for key in ORDER:
+        for key in order:
             head, raw = before[key]
             if raw == target[key]:
                 expected_etags[key] = head["ETag"]
@@ -190,9 +199,10 @@ def main():
     parser.add_argument("--baseline-dist", required=True)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--expected-role-arn", required=True)
+    parser.add_argument("--profile", choices=tuple(PROFILES), default="posterior")
     args = parser.parse_args()
     try:
-        summary = publish(args.dist, args.baseline_dist, args.bucket, args.expected_role_arn)
+        summary = publish(args.dist, args.baseline_dist, args.bucket, args.expected_role_arn, profile=args.profile)
     except PublicationError as error:
         print(json.dumps({"status": "failed", "category": str(error)}))
         return 1
