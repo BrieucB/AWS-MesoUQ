@@ -1,5 +1,6 @@
 import {escapeHtml as h} from './plots.js';
 import {formatTimestamp} from './client.js';
+import {benchmarkFigureArtifacts,loadBenchmarkFigure} from './benchmark-figures.js';
 
 // These helpers only format server-authored values and draw returned plot series.
 const colours=['#17695a','#b5773d','#6673ad','#a34e65'];
@@ -24,6 +25,32 @@ function metricTable(rows){
   const entries=Array.isArray(rows)?rows.map(r=>[r.name||r.metric,r.value]):Object.entries(rows);
   return `<div class="lab-table-wrap"><table><thead><tr><th>Reported metric</th><th>Value</th></tr></thead><tbody>${entries.map(([key,value])=>`<tr><td>${h(key)}</td><td>${h(typeof value==='number'?fmt(value):text(value))}</td></tr>`).join('')}</tbody></table></div>`;
 }
+
+function reportedMetrics(metrics){
+  const methods=['hnpe','tmcmc'].filter(method=>metrics?.[method]&&typeof metrics[method]==='object');
+  if(!methods.length)return metricTable(metrics);
+  return methods.map(method=>{
+    const summary=metrics[method].summary||metrics[method],counts=summary.counts||{};
+    const rows={
+      'Cases in campaign':counts.total,'Cases scored':counts.scored,
+      'Method failures':counts.method_failed,'Unresolved references':counts.reference_unresolved,
+      'Budget-exhausted cases':counts.budget_exhausted,
+      'Mean score on scored cases only':summary.mean_score_on_scored_cases,
+      'Median score on scored cases only':summary.median_score_on_scored_cases,
+    };
+    return `<h4>${h(method.toUpperCase())}</h4>${metricTable(rows)}`;
+  }).join('')+'<p class="lab-note">Missing scores are unreported, not zero. A completed comparison may include method failures, unresolved references or budget-limited candidates.</p>';
+}
+function historyPlots(histories){
+  if(!Array.isArray(histories))return [];
+  return histories.map(item=>{
+    if(item?.series)return item;
+    if(!Array.isArray(item?.history))return null;
+    const rows=item.history.filter(row=>Number.isFinite(row.update)&&Number.isFinite(row.validation_nll));
+    return {title:item.title||String(item.factor||'Factor')+' validation history',x_label:'Training updates',y_label:'Validation NLL',series:[{name:item.factor||'Validation',x:rows.map(row=>row.update),y:rows.map(row=>row.validation_nll)}]};
+  }).filter(Boolean);
+}
+
 export function benchmarkResults(result){
   if(!result)return '<p class="lab-note">Results become available after the campaign publishes verified evidence.</p>';
   const costs=result.costs||{};
@@ -31,20 +58,21 @@ export function benchmarkResults(result){
   const costRows=methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.preparation_seconds))}</td><td>${h(fmt(m.training_seconds))}</td><td>${h(fmt(m.inference_seconds))}</td><td><strong>${h(fmt(m.total_seconds))}</strong></td></tr>`).join('');
   const plots=Array.isArray(result.plots)?result.plots:[];
   const failures=Array.isArray(result.failures)?result.failures:[];
-  return `<section class="card"><h2>Accuracy and total method cost</h2><p class="lab-note">HNPE preparation, training and inference belong to the method cost. Numerical-reference generation is reported separately. Compare methods on the same cases and declared budgets.</p>${costRows?`<div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Preparation (s)</th><th>Training (s)</th><th>Inference (s)</th><th>Total (s)</th></tr></thead><tbody>${costRows}</tbody></table></div>`:'<p>Total method timing not reported.</p>'}<p class="lab-note">Numerical-reference cost: ${h(fmt(costs.reference_seconds))} seconds. Allocation and elapsed times have different scopes; see the evidence manifests.</p><details><summary>Reported CPU, GPU and wall-clock accounting</summary><div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Wall (s)</th><th>CPU (s)</th><th>GPU (s)</th></tr></thead><tbody>${methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.resource_cost?.wall_seconds))}</td><td>${h(fmt(m.resource_cost?.cpu_seconds))}</td><td>${h(fmt(m.resource_cost?.gpu_seconds))}</td></tr>`).join('')}<tr><td>Numerical reference</td><td>${h(fmt(costs.reference_resource_cost?.wall_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.cpu_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.gpu_seconds))}</td></tr></tbody></table></div><p class="lab-note">Concurrent process clocks, allocated GPU seconds and wall-clock duration are distinct; unreported accounting is not zero.</p></details><h3>Posterior accuracy, tails and calibration</h3>${metricTable(result.metrics)}<div class="lab-plot-grid">${plots.map(benchmarkPlot).join('')}</div><h3>Training histories</h3>${Array.isArray(result.training_histories)&&result.training_histories.length?result.training_histories.map(benchmarkPlot).join(''):'<p class="lab-note">Training history not reported.</p>'}<h3>Failures and incomplete stages</h3>${failures.length?failures.map(f=>`<div class="lab-failure"><strong>${h(f.stage||'Campaign stage')}</strong><p>${h(f.message||f.code||'Failed or incomplete; inspect the evidence.')}</p></div>`).join(''):'<p class="lab-note">No failures reported in this result.</p>'}</section>`;
+  const histories=historyPlots(result.training_histories),limitations=Array.isArray(result.limitations)?result.limitations:result.limitations?[result.limitations]:[];
+  return `<section class="card"><h2>Accuracy and total method cost</h2><p class="lab-note">HNPE preparation, training and inference belong to the method cost. Numerical-reference generation is reported separately. Compare methods on the same cases and declared budgets.</p>${costRows?`<div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Preparation (s)</th><th>Training (s)</th><th>Inference (s)</th><th>Total (s)</th></tr></thead><tbody>${costRows}</tbody></table></div>`:'<p>Total method timing not reported.</p>'}<p class="lab-note">Numerical-reference cost: ${h(fmt(costs.reference_seconds))} seconds. Allocation and elapsed times have different scopes; see the evidence manifests.</p><details><summary>Reported CPU, GPU and wall-clock accounting</summary><div class="lab-table-wrap"><table><thead><tr><th>Method</th><th>Wall (s)</th><th>CPU (s)</th><th>GPU (s)</th></tr></thead><tbody>${methods.map(m=>`<tr><td>${h(m.method)}</td><td>${h(fmt(m.resource_cost?.wall_seconds))}</td><td>${h(fmt(m.resource_cost?.cpu_seconds))}</td><td>${h(fmt(m.resource_cost?.gpu_seconds))}</td></tr>`).join('')}<tr><td>Numerical reference</td><td>${h(fmt(costs.reference_resource_cost?.wall_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.cpu_seconds))}</td><td>${h(fmt(costs.reference_resource_cost?.gpu_seconds))}</td></tr></tbody></table></div><p class="lab-note">Concurrent process clocks, allocated GPU seconds and wall-clock duration are distinct; unreported accounting is not zero.</p></details><h3>Posterior accuracy, tails and calibration</h3>${reportedMetrics(result.metrics)}<div class="lab-plot-grid">${plots.map(benchmarkPlot).join('')}</div><h3>Training histories</h3>${histories.length?histories.map(benchmarkPlot).join(''):'<p class="lab-note">Training history not reported.</p>'}<p class="lab-note">Inspect training_candidate and budget_limited labels in the evidence. Stage completion alone does not certify convergence.</p><h3>Limitations</h3>${limitations.length?`<ul>${limitations.map(value=>`<li>${h(text(value))}</li>`).join('')}</ul>`:'<p class="lab-note">No limitations were supplied.</p>'}<h3>Failures and incomplete stages</h3>${failures.length?failures.map(f=>`<div class="lab-failure"><strong>${h(f.stage||'Campaign stage')}</strong><p>${h(f.message||f.code||'Failed or incomplete; inspect the evidence.')}</p></div>`).join(''):'<p class="lab-note">No failures reported in this result.</p>'}</section>`;
 }
 
 const controlFields=[
   ['controls.hnpe.width','Hidden width','Units per hidden layer.'],
-  ['controls.hnpe.depth','Hidden depth','Number of hidden layers.'],
+  ['controls.hnpe.depth','Hidden depth','Hidden layers per flow subnetwork; six flow blocks and eight bins stay fixed.'],
   ['controls.hnpe.learning_rate','Learning rate','Optimizer step size.'],
   ['controls.hnpe.batch_size','Batch size','Training examples per optimizer update.'],
   ['controls.hnpe.max_updates','Maximum optimizer updates','Fixed update limit for each fresh factor fit.'],
-  ['controls.hnpe.training_budget','Maximum fit time per factor (s)','The fit stops at this declared method budget; unfinished fits remain explicit.'],
+  ['controls.hnpe.training_budget','Maximum fit time per factor (s)','Maximum seconds for each of seven fresh factors. Budget-limited fits remain explicit.'],
   ['controls.tmcmc.population_size','Particle population','Particles in each TMCMC population.'],
   ['controls.tmcmc.target_cov','Target coefficient of variation','Tempering control; reported with the method configuration.'],
   ['controls.tmcmc.proposal_scale','Proposal scale','Proposal-width multiplier.'],
-  ['controls.tmcmc.burn_in','Burn-in exploration','Declared exploration length.'],
+  ['controls.tmcmc.burn_in','Phase 1 burn-in','Exploration length for six Phase 1 samplers; later phases retain burn-in 1.'],
   ['controls.tmcmc.max_generations','Maximum generations','Declared TMCMC generation limit.'],
 ];
 const get=(object,path)=>path.split('.').reduce((value,key)=>value?.[key],object);
@@ -56,8 +84,9 @@ function numericField(path,label,note,draft,limits,disabled){
   const rawSpec=get(limits,path)||limits?.[path]||{};
   const spec={...rawSpec,min:rawSpec.minimum??rawSpec.min,max:rawSpec.maximum??rawSpec.max};
   const value=get(draft,path);
-  if(Array.isArray(spec.choices))return `<label>${h(label)}<select data-lab-field="${h(path)}" ${disabled?'disabled':''}>${spec.choices.map(choice=>`<option value="${h(choice)}" ${choice===value?'selected':''}>${h(choice)}</option>`).join('')}</select><small>${h(note)}</small></label>`;
-  return `<label>${h(label)}<input type="number" data-lab-field="${h(path)}" value="${h(value??'')}" ${spec.min!==undefined?`min="${h(spec.min)}"`:''} ${spec.max!==undefined?`max="${h(spec.max)}"`:''} step="${h(spec.step??(path.includes('learning_rate')||path.includes('target_cov')||path.includes('proposal_scale')?'any':1))}" required ${disabled?'disabled':''}><small>${h(note)}</small></label>`;
+  const unitNote=path==='budget.method_gpu_seconds'?` <output data-lab-budget-hours>${h(fmt(value/3600))} GPU hours per method</output>`:'';
+  if(Array.isArray(spec.choices))return `<label>${h(label)}<select data-lab-field="${h(path)}" ${disabled?'disabled':''}>${spec.choices.map(choice=>`<option value="${h(choice)}" ${choice===value?'selected':''}>${h(choice)}</option>`).join('')}</select><small>${h(note)}${unitNote}</small></label>`;
+  return `<label>${h(label)}<input type="number" data-lab-field="${h(path)}" value="${h(value??'')}" ${spec.min!==undefined?`min="${h(spec.min)}"`:''} ${spec.max!==undefined?`max="${h(spec.max)}"`:''} step="${h(spec.step??(path.includes('learning_rate')||path.includes('target_cov')||path.includes('proposal_scale')?'any':1))}" required ${disabled?'disabled':''}><small>${h(note)}${unitNote}</small></label>`;
 }
 
 export class BenchmarkLab {
@@ -65,14 +94,14 @@ export class BenchmarkLab {
     this.context=context;this.onChange=onChange;this.download=download;this.fetcher=fetcher;
     this.revision=0;this.active=false;this.api=null;this.project='';this.resetData();
   }
-  resetData(){this.transferController?.abort();this.transferController=null;this.capabilities=null;this.draft=null;this.campaigns=[];this.detail=null;this.result=null;this.error='';this.notice='';this.busy=false;this.initialized=false;this.idempotencyKey=null;this.archiveView=false;}
+  resetData(){this.clearFigures();this.transferController?.abort();this.transferController=null;this.capabilities=null;this.draft=null;this.campaigns=[];this.detail=null;this.result=null;this.error='';this.notice='';this.busy=false;this.initialized=false;this.idempotencyKey=null;this.archiveView=false;}
   reset(){this.revision++;this.active=false;this.api=null;this.project='';this.resetData();}
-  leave(){this.transferController?.abort();this.revision++;this.active=false;this.busy=false;}
+  leave(){this.clearFigures();this.transferController?.abort();this.revision++;this.active=false;this.busy=false;}
   sync(){
     const {api,project}=this.context();
     if(api!==this.api||project!==this.project){this.revision++;this.api=api;this.project=project;this.resetData();}
   }
-  async enter(){this.sync();this.active=true;if(!this.initialized)await this.refresh();}
+  async enter(){this.sync();this.active=true;if(!this.initialized)await this.refresh();else if(this.result)void this.loadFigures();}
   current(revision,api,project){
     const context=this.context();
     return this.active&&revision===this.revision&&api===context.api&&project===context.project&&context.valid(api);
@@ -84,7 +113,7 @@ export class BenchmarkLab {
     this.busy=true;this.error='';this.notice='';this.onChange();
     const current=()=>this.current(revision,api,project);
     try{await callback({api,project,current});}
-    catch(error){if(current())this.error='BenchmarkLab could not complete the request. Refresh the campaign to check its state before retrying.';}
+    catch(error){if(current())this.error='Benchmark Lab could not complete the request. Refresh the campaign to check its state before retrying.';}
     finally{if(current()){this.busy=false;this.onChange();}}
   }
   async refresh(){
@@ -112,16 +141,18 @@ export class BenchmarkLab {
     }catch{if(this.current(revision,api,project)){this.error='Campaign status refresh failed. Use Refresh campaigns to retry.';this.onChange();}}
   }
   async open(id){
+    this.clearFigures();this.result=null;
     await this.operation(async({api,project,current})=>{
       const data=await api.request(api.project(project,'/benchmarks/'+encodeURIComponent(id)));
       if(!current())return;this.detail=data.campaign;this.result=null;
     });
   }
   async loadResults(){
+    this.clearFigures();
     const id=this.detail?.id;if(!id)return;
     await this.operation(async({api,project,current})=>{
       const data=await api.request(api.project(project,'/benchmarks/'+encodeURIComponent(id)+'/results'));
-      if(!current()||this.detail?.id!==id)return;this.result=data.result;
+      if(!current()||this.detail?.id!==id)return;this.result=data.result;void this.loadFigures();
     });
   }
   async submit(){
@@ -136,6 +167,32 @@ export class BenchmarkLab {
       this.campaigns=[data.campaign,...this.campaigns.filter(item=>item.id!==data.campaign.id)];
     });
   }
+
+  clearFigures(){
+    this.figureRevision=(this.figureRevision||0)+1;
+    for(const controller of this.figureControllers||[])controller.abort();
+    this.figureControllers=[];this.figures=[];this.figureError='';
+  }
+  async loadFigures(){
+    this.clearFigures();
+    const revision=this.figureRevision,api=this.api,project=this.project,campaign=this.detail?.id,result=this.result;
+    const current=()=>this.active&&revision===this.figureRevision&&api===this.context().api&&project===this.context().project&&campaign===this.detail?.id&&result===this.result&&this.context().valid(api);
+    if(!result||!campaign||!current())return;
+    try{this.figures=benchmarkFigureArtifacts(result).map(entry=>({...entry,status:'loading',src:''}));}
+    catch{this.figureError='Scientific figure references could not be verified.';this.onChange();return;}
+    this.onChange();
+    await Promise.all(this.figures.map(async entry=>{
+      const controller=new AbortController();this.figureControllers.push(controller);
+      try{
+        const src=await loadBenchmarkFigure({api,project,campaign,artifact:entry.artifact,fetcher:this.fetcher,signal:controller.signal});
+        if(!current())return;entry.src=src;entry.status='ready';this.onChange();
+      }catch(error){if(!current()||error.name==='AbortError')return;entry.src='';entry.status='error';this.onChange();}
+    }));
+  }
+  figuresPanel(){
+    return `<section class="card"><h2>Scientific figures</h2><p class="lab-note">Generated on Karolina from this campaign's returned evidence. Image bytes are checked against their immutable references before display.</p>${this.figureError?`<p role="alert" class="lab-failure">${h(this.figureError)}</p>`:''}${this.figures.map(entry=>`<figure><figcaption>${h(entry.title)}</figcaption>${entry.status==='ready'?`<div class="lab-figure-scroll" role="region" tabindex="0" aria-label="${h(entry.title)}; scroll horizontally to inspect the figure"><img data-lab-figure="${h(entry.artifact.id)}" src="${h(entry.src)}" alt="${h(entry.title)} generated from this campaign's scientific outputs."></div>`:entry.status==='loading'?'<p role="status" class="lab-note">Loading verified figure…</p>':'<p role="alert" class="lab-failure">The figure could not be displayed. Retry the figure or download the evidence.</p>'}</figure>`).join('')}${this.figures.some(entry=>entry.status==='error')||this.figureError?button('retry-figures','Retry figures'):''}${!this.figures.length&&!this.figureError?'<p class="lab-note">No reviewed scientific PNG figures reported.</p>':''}</section>`;
+  }
+
   async changeCampaign(action){
     if(action==='archive'&&this.capabilities?.actions?.archive!==true)return;
     const id=this.detail?.id;if(!id)return;
@@ -178,24 +235,24 @@ export class BenchmarkLab {
   }
   form(){
     const disabled=this.busy||!this.draft,limits=this.capabilities?.limits||{};
-    if(!this.draft)return `<p class="lab-empty">Campaign controls are unavailable until the project returns BenchmarkLab capabilities.</p>${button('refresh','Load campaign controls','',this.busy)}`;
+    if(!this.draft)return `<p class="lab-empty">Campaign controls are unavailable until the project returns Benchmark Lab capabilities.</p>${button('refresh','Load campaign controls','',this.busy)}`;
     const family=this.draft.scenario?.family||'baseline';
     const families=[['baseline','Baseline'],['higher_noise','Higher measurement noise'],['broader_priors','Broader population priors']];
     const rawScaleSpec=get(limits,'scenario.scale')||limits['scenario.scale']||{};
     const scaleSpec={...rawScaleSpec,min:rawScaleSpec.minimum??rawScaleSpec.min,max:rawScaleSpec.maximum??rawScaleSpec.max};
     const scale=this.draft.scenario?.scale??1;
     const options=families.map(([value,label])=>`<option value="${value}" ${family===value?'selected':''}>${label}</option>`).join('');
-    return `<form data-lab-form><div class="lab-scenario"><label>Scenario family<select data-lab-field="scenario.family" ${disabled?'disabled':''}>${options}</select></label><p class="lab-note">Change one family at a time; all methods share the resulting cases and numerical reference.</p><div class="lab-scale-row"><label for="lab-scenario-scale">Scenario multiplier</label><output id="lab-scale-value" aria-live="polite" for="lab-scenario-scale">${h(fmt(scale))}×</output></div><input id="lab-scenario-scale" type="range" data-lab-field="scenario.scale" aria-describedby="lab-scenario-note" min="${h(scaleSpec.min??1)}" max="${h(scaleSpec.max??3)}" step="${h(scaleSpec.step??.25)}" value="${h(scale)}" ${disabled||family==='baseline'?'disabled':''}><p id="lab-scenario-note" class="lab-note">${family==='baseline'?'1× retains the sealed baseline.':family==='higher_noise'?'Scale the complete measurement-noise SD distribution; retain its declared shape.':'Scale joint prior widths around the declared centres; retain the registered joint prior semantics.'}</p></div><h3>Fresh HNPE training</h3><p class="lab-note">A new seven-factor HNPE bundle is trained for every campaign. Changing these controls creates a new comparison.</p><div class="lab-form-grid">${controlFields.filter(([p])=>p.includes('.hnpe.')).map(([p,label,note])=>numericField(p,label,note,this.draft,limits,disabled)).join('')}</div><h3>TMCMC budget</h3><div class="lab-form-grid">${controlFields.filter(([p])=>p.includes('.tmcmc.')).map(([p,label,note])=>numericField(p,label,note,this.draft,limits,disabled)).join('')}</div><h3>Matched evaluation and method budget</h3><div class="lab-form-grid">${numericField('evaluation.case_count','Shared test cases','HNPE, TMCMC and numerical reference use the same cases.',this.draft,limits,disabled)}${numericField('evaluation.posterior_draws','Posterior draws','Matched retained sample count per case.',this.draft,limits,disabled)}${numericField('seed','Campaign seed','Shared case generation is versioned and reproducible.',this.draft,limits,disabled)}${numericField('budget.method_gpu_seconds','Total method budget (GPU s)','Training plus inference for each method; numerical-reference cost is separate.',this.draft,limits,disabled)}</div><details><summary>Reference and immutable benchmark profile</summary><pre>${h(JSON.stringify({cohort:this.draft.evaluation?.cohort,reference:this.draft.reference,profile:this.capabilities?.profile||'sealed_21d'},null,2))}</pre></details><p class="lab-budget-note">First compare accuracy at declared method budgets. Accuracy-target stopping is a separate follow-on mode.</p><p class="lab-rule">Campaigns may run concurrently. Slurm account, partition and QoS rules admit compute work; BenchmarkLab adds no global GPU-hour quota.</p><button class="primary" type="submit" ${disabled?'disabled':''}>Start benchmark campaign</button></form>`;
+    return `<form data-lab-form><div class="lab-scenario"><label>Scenario family<select data-lab-field="scenario.family" ${disabled?'disabled':''}>${options}</select></label><p class="lab-note">Change one family at a time; all methods share the resulting cases and numerical reference.</p><div class="lab-scale-row"><label for="lab-scenario-scale">Scenario multiplier</label><output id="lab-scale-value" aria-live="polite" for="lab-scenario-scale">${h(fmt(scale))}×</output></div><input id="lab-scenario-scale" type="range" data-lab-field="scenario.scale" aria-describedby="lab-scenario-note" min="${h(scaleSpec.min??1)}" max="${h(scaleSpec.max??3)}" step="${h(scaleSpec.step??.25)}" value="${h(scale)}" ${disabled||family==='baseline'?'disabled':''}><p id="lab-scenario-note" class="lab-note">${family==='baseline'?'1× retains the sealed baseline.':family==='higher_noise'?'Scale the complete measurement-noise SD distribution; retain its declared shape.':'Scale joint prior widths around the declared centres; retain the registered joint prior semantics.'}</p></div><h3>Fresh HNPE training</h3><p class="lab-note">A new seven-factor HNPE bundle is trained for every campaign. Changing these controls creates a new comparison.</p><div class="lab-form-grid">${controlFields.filter(([p])=>p.includes('.hnpe.')).map(([p,label,note])=>numericField(p,label,note,this.draft,limits,disabled)).join('')}</div><h3>TMCMC sampler</h3><div class="lab-form-grid">${controlFields.filter(([p])=>p.includes('.tmcmc.')).map(([p,label,note])=>numericField(p,label,note,this.draft,limits,disabled)).join('')}</div><h3>Matched evaluation and method budget</h3><div class="lab-form-grid">${numericField('evaluation.case_count','Shared test cases','HNPE, TMCMC and numerical reference use the same cases.',this.draft,limits,disabled)}${numericField('evaluation.posterior_draws','Posterior draws','Matched retained sample count per case.',this.draft,limits,disabled)}${numericField('seed','Campaign seed','Shared case generation is versioned and reproducible.',this.draft,limits,disabled)}${numericField('budget.method_gpu_seconds','Total method budget (GPU s)','Training plus inference for each method; numerical-reference cost is separate.',this.draft,limits,disabled)}</div><details><summary>Reference and immutable benchmark profile</summary><pre>${h(JSON.stringify({cohort:this.draft.evaluation?.cohort,reference:this.draft.reference,profile:this.capabilities?.profile||'sealed_21d'},null,2))}</pre></details><p class="lab-budget-note">First compare accuracy at declared method budgets. Accuracy-target stopping is a separate follow-on mode.</p><p class="lab-rule">Campaigns may run concurrently. Slurm account, partition and QoS rules admit compute work; Benchmark Lab adds no global GPU-hour quota.</p><button class="primary" type="submit" ${disabled?'disabled':''}>Start benchmark campaign</button></form>`;
   }
   detailView(){
     const c=this.detail,s=campaignStatus(c),stages=Array.isArray(c.stages)?c.stages:Object.entries(c.stages||{}).map(([id,value])=>({id,...value}));
     const artifacts=this.artifactRefs();
-    return `<div class="lab-toolbar">${button('back','All campaigns')}${button('refresh-detail','Refresh campaign','',this.busy)}</div><section class="card"><div class="lab-detail-head"><div><p class="lab-kicker">Campaign</p><h2>${h(campaignName(c))}</h2><span class="lab-status lab-status-${h(s)}">${h(s.replaceAll('_',' '))}</span></div><div class="lab-toolbar">${!terminal.has(s)?button('cancel','Request cancellation','',this.busy):''}${this.capabilities?.actions?.archive===true&&terminal.has(s)&&archiveStatus(c)!=='verified'?button('archive',archiveStatus(c)==='failed'?'Retry archival':'Request archival','',this.busy||['pending','running','requested'].includes(archiveStatus(c))):''}</div></div><p class="lab-note">Family: ${h(c.scenario?.family||c.configuration?.scenario?.family||'Not reported')} · Execution: Karolina</p><p class="lab-note">PROJECT archive: <strong>${h(archiveStatus(c).replaceAll('_',' '))}</strong>. Archival is complete only after the connector verifies the copy.</p>${s==='failed'?'<p class="lab-failure" role="alert">The campaign did not complete. Inspect the reported stages and evidence for the failure or budget limit.</p>':''}<h3>Stages</h3>${stages.length?`<ol class="lab-stage-list">${stages.map(stage=>`<li><strong>${h(stage.name||stage.id)}</strong> · ${h(stage.status||'Not reported')}</li>`).join('')}</ol>`:'<p class="lab-note">Stage progress not yet reported.</p>'}<div class="lab-toolbar">${button('results','Load comparison results','',this.busy||!['completed','succeeded'].includes(s))}${button('configuration','Download campaign JSON')}</div><details><summary>Declared scenario and method budgets</summary><pre>${h(JSON.stringify(c.configuration||c.controls||c,null,2))}</pre></details></section>${this.result?benchmarkResults(this.result):''}<section class="card"><h2>Evidence downloads</h2><p class="lab-note">Numerical results, plots, histories and manifests remain attached to the campaign when archived.</p>${artifacts.length?`<ul class="lab-downloads">${artifacts.map(a=>`<li><span>${h(a.name)}</span>${button('artifact','Download',`data-lab-id="${h(a.id)}"`,this.busy)}</li>`).join('')}</ul>`:'<p class="lab-note">No evidence artifacts reported yet.</p>'}</section>`;
+    return `<div class="lab-toolbar">${button('back','All campaigns')}${button('refresh-detail','Refresh campaign','',this.busy)}</div><section class="card"><div class="lab-detail-head"><div><p class="lab-kicker">Campaign</p><h2>${h(campaignName(c))}</h2><span class="lab-status lab-status-${h(s)}">${h(s.replaceAll('_',' '))}</span></div><div class="lab-toolbar">${!terminal.has(s)?button('cancel','Request cancellation','',this.busy):''}${this.capabilities?.actions?.archive===true&&terminal.has(s)&&archiveStatus(c)!=='verified'?button('archive',archiveStatus(c)==='failed'?'Retry archival':'Request archival','',this.busy||['pending','running','requested'].includes(archiveStatus(c))):''}</div></div><p class="lab-note">Family: ${h(c.scenario?.family||c.configuration?.scenario?.family||'Not reported')} · Execution: Karolina</p><p class="lab-note">PROJECT archive: <strong>${h(archiveStatus(c).replaceAll('_',' '))}</strong>. Archival is complete only after the connector verifies the copy.</p>${s==='failed'?'<p class="lab-failure" role="alert">The campaign did not complete. Inspect the reported stages and evidence for the failure or budget limit.</p>':''}<h3>Stages</h3>${stages.length?`<ol class="lab-stage-list">${stages.map(stage=>`<li><strong>${h(stage.name||stage.id)}</strong> · ${h(stage.status||'Not reported')}</li>`).join('')}</ol>`:'<p class="lab-note">Stage progress not yet reported.</p>'}<div class="lab-toolbar">${button('results','Load comparison results','',this.busy||!['completed','succeeded'].includes(s))}${button('configuration','Download campaign JSON')}</div><details><summary>Declared scenario and method budgets</summary><pre>${h(JSON.stringify(c.configuration||c.controls||c,null,2))}</pre></details></section>${this.result?benchmarkResults(this.result)+this.figuresPanel():''}<section class="card"><h2>Evidence downloads</h2><p class="lab-note">Numerical results, plots, histories and manifests remain attached to the campaign when archived.</p>${artifacts.length?`<ul class="lab-downloads">${artifacts.map(a=>`<li><span>${h(a.name)}</span>${button('artifact','Download',`data-lab-id="${h(a.id)}"`,this.busy)}</li>`).join('')}</ul>`:'<p class="lab-note">No evidence artifacts reported yet.</p>'}</section>`;
   }
   view(){
     this.sync();
     const list=this.campaigns.filter(c=>this.archiveView?archiveStatus(c)==='verified':archiveStatus(c)!=='verified');
-    return `<div class="benchmark-lab" data-benchmark-lab><div class="lab-heading"><div><p class="lab-kicker">Research methods · Analytical hierarchy</p><h1>BenchmarkLab</h1><p class="lab-intro">Compare fresh HNPE training with TMCMC against the same numerical reference. Explore noise and prior assumptions while keeping every campaign reproducible.</p></div>${button('refresh','Refresh campaigns','',this.busy)}</div>${this.error?`<div class="alert error lab-error" role="alert">${h(this.error)}</div>`:''}${this.notice?`<p class="alert" role="status">${h(this.notice)}</p>`:''}${this.busy?'<p class="lab-spinner" role="status">Loading BenchmarkLab…</p>':''}${this.detail?this.detailView():`<div class="lab-columns"><section class="card"><h2>Design a comparison</h2>${this.form()}</section><section class="card"><div class="lab-section-title"><h2>${this.archiveView?'Archived campaigns':'Campaigns'}</h2>${this.capabilities?.actions?.archive===true?button('toggle-archive',this.archiveView?'Show current':'Show archive'):''}</div><p class="lab-note">Each row is an independent scenario, training run and matched comparison.</p>${list.length?list.map(c=>`<article class="lab-campaign"><div><strong>${h(campaignName(c))}</strong><p>${h(c.scenario?.family||c.configuration?.scenario?.family||'Scenario')} · ${h(formatTimestamp(c.created_at))}</p><span class="lab-status lab-status-${h(campaignStatus(c))}">${h(campaignStatus(c).replaceAll('_',' '))}</span></div>${button('open','View campaign',`data-lab-id="${h(c.id)}"`,this.busy)}</article>`).join(''):'<p class="lab-empty">No campaigns in this view.</p>'}<p class="lab-rule">Scientific execution stays on Karolina. AWS coordinates campaign state and stores approved evidence.</p></section></div>`}</div>`;
+    return `<div class="benchmark-lab" data-benchmark-lab><div class="lab-heading"><div><p class="lab-kicker">Research methods · Analytical hierarchy</p><h1>Benchmark Lab</h1><p class="lab-intro">Compare fresh HNPE training with TMCMC against the same numerical reference. Explore noise and prior assumptions while keeping every campaign reproducible.</p></div>${button('refresh','Refresh campaigns','',this.busy)}</div>${this.error?`<div class="alert error lab-error" role="alert">${h(this.error)}</div>`:''}${this.notice?`<p class="alert" role="status">${h(this.notice)}</p>`:''}${this.busy?'<p class="lab-spinner" role="status">Loading Benchmark Lab…</p>':''}${this.detail?this.detailView():`<div class="lab-columns"><section class="card"><h2>Design a comparison</h2>${this.form()}</section><section class="card"><div class="lab-section-title"><h2>${this.archiveView?'Archived campaigns':'Campaigns'}</h2>${this.capabilities?.actions?.archive===true?button('toggle-archive',this.archiveView?'Show current':'Show archive'):''}</div><p class="lab-note">Each row is an independent scenario, training run and matched comparison.</p>${list.length?list.map(c=>`<article class="lab-campaign"><div><strong>${h(campaignName(c))}</strong><p>${h(c.scenario?.family||c.configuration?.scenario?.family||'Scenario')} · ${h(formatTimestamp(c.created_at))}</p><span class="lab-status lab-status-${h(campaignStatus(c))}">${h(campaignStatus(c).replaceAll('_',' '))}</span></div>${button('open','View campaign',`data-lab-id="${h(c.id)}"`,this.busy)}</article>`).join(''):'<p class="lab-empty">No campaigns in this view.</p>'}<p class="lab-rule">Scientific execution stays on Karolina. AWS coordinates campaign state and stores approved evidence.</p></section></div>`}</div>`;
   }
   captureFocus(){
     const element=globalThis.document?.activeElement;
@@ -210,10 +267,20 @@ export class BenchmarkLab {
       field?.focus?.({preventScroll:true});
       if(typeof focus.start==='number')try{field?.setSelectionRange?.(focus.start,focus.end);}catch{}
     }
+
+    for(const image of root.querySelectorAll?.('[data-lab-figure]')||[]){
+      const revision=this.figureRevision,src=image.getAttribute('src'),id=image.dataset.labFigure;
+      image.addEventListener('error',()=>{
+        const entry=this.figures.find(value=>value.artifact.id===id);
+        if(!this.active||revision!==this.figureRevision||!entry||entry.src!==src||entry.status!=='ready'||!this.context().valid(this.api))return;
+        entry.src='';entry.status='error';this.onChange();
+      },{once:true});
+    }
     root.addEventListener('input',event=>{
       const path=event.target.dataset?.labField;if(!path||!this.draft||this.busy)return;
       const value=path==='scenario.family'?event.target.value:Number(event.target.value);
       put(this.draft,path,value);this.idempotencyKey=null;
+      if(path==='budget.method_gpu_seconds'){const output=root.querySelector('[data-lab-budget-hours]');if(output)output.textContent=fmt(value/3600)+' GPU hours per method';}
       if(path==='scenario.scale'){const output=root.querySelector('#lab-scale-value');if(output)output.textContent=fmt(value)+'×';}
     });
     root.addEventListener('change',event=>{
@@ -229,9 +296,10 @@ export class BenchmarkLab {
       if(action==='open')void this.open(id);
       if(action==='refresh-detail')void this.open(this.detail.id);
       if(action==='results')void this.loadResults();
+      if(action==='retry-figures')void this.loadFigures();
       if(action==='cancel'||action==='archive')void this.changeCampaign(action);
       if(action==='artifact')void this.downloadArtifact(id);
-      if(action==='back'){this.revision++;this.detail=null;this.result=null;this.busy=false;this.onChange();void this.refresh();}
+      if(action==='back'){this.clearFigures();this.revision++;this.detail=null;this.result=null;this.busy=false;this.onChange();void this.refresh();}
       if(action==='toggle-archive'){this.archiveView=!this.archiveView;this.onChange();}
       if(action==='configuration')this.download('benchmark-'+this.detail.id+'.json',this.detail);
     });

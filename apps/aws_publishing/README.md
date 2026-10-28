@@ -51,9 +51,9 @@ Changing metadata, project or selected file clears the drawing and selected
 input; editing drawn points also clears any prior preview/upload selection.
 All drawing controls are locked during uploads and other pending operations.
 
-## BenchmarkLab interface
+## Benchmark Lab interface
 
-Open **BenchmarkLab** in the workspace navigation and select a project.
+Open **Benchmark Lab** in the workspace navigation and select a project.
 The interface loads that project's versioned capabilities before enabling
 campaign creation. It supports one scenario family per campaign: the baseline
 at 1×, a multiplier of the complete measurement-noise SD distribution, or a
@@ -72,8 +72,15 @@ campaigns are admitted under the Karolina Slurm account/partition/QoS policy.
 The campaign view shows reported stage status, failure/incomplete evidence,
 server-computed accuracy/calibration metrics, posterior/reference plots and
 training histories. Missing data stay explicitly unavailable. The browser only
-draws returned plot series; it does not calculate density estimates or scientific
-scores. Numerical-reference controls and immutable benchmark profile are shown
+draws returned plot series or displays the reviewed posterior-marginals and
+compute-comparison PNG artifacts generated on Karolina. PNG previews use the
+campaign owner-only artifact route and verify exact metadata, approved storage
+origin, PNG MIME/signature, byte length and SHA256 before display, with a 10 MiB
+limit per image. The previews use data URLs under the existing CSP. Navigation,
+project/session changes and replacement results abort loads and clear prior
+bytes; decode failures offer an image-only retry. The browser does not calculate
+density estimates or scientific scores. Missing scores remain unreported, and
+failed, unresolved and budget-exhausted case counts are shown separately. Numerical-reference controls and immutable benchmark profile are shown
 for reproducibility. Accuracy-target stopping is identified as a follow-on mode.
 
 Campaign cancellation uses the API's cancellation hook. Archive controls appear
