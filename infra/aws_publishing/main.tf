@@ -36,7 +36,7 @@ resource "aws_dynamodb_table_item" "projects" {
   table_name = aws_dynamodb_table.state.name
   hash_key   = "pk"
   range_key  = "sk"
-  item       = jsonencode({ pk = { S = "STATE" }, sk = { S = "projects:${each.key}" }, payload = { S = jsonencode(each.value) } })
+  item       = jsonencode({ pk = { S = "STATE" }, sk = { S = "projects:${each.key}" }, payload = { S = jsonencode(merge({ name = each.value.name }, each.value.benchmark_policy == null ? {} : { benchmark_policy = each.value.benchmark_policy })) } })
 }
 resource "aws_dynamodb_table_item" "memberships" {
   for_each   = toset(nonsensitive(keys(var.memberships)))
@@ -211,6 +211,7 @@ resource "aws_lambda_function" "backend" {
   # to allocate reserved concurrency. API throttles and job admission still apply.
   environment {
     variables = {
+      BENCHMARK_POLICIES           = jsonencode({ for id, project in var.projects : id => project.benchmark_policy if project.benchmark_policy != null })
       STATE_TABLE                  = aws_dynamodb_table.state.name
       DATA_BUCKET                  = aws_s3_bucket.data.id
       EVENT_QUEUE_URL              = aws_sqs_queue.events.url

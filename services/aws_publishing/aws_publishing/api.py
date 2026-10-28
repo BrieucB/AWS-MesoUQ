@@ -135,12 +135,15 @@ class Application:
         validate_result=None,
         notifications=None,
         release_policy="v1",
+        benchmark_policies=None,
     ):
         if release_policy not in ("v1", "nonproduction_legacy"):
             raise ValueError("Unknown release policy")
         # Constructor-only compatibility for internal lifecycle tests. The HTTP
         # handler always selects v1; no request field or environment can opt out.
         self.release_policy = release_policy
+        from aws_mesouq.benchmark import validate_benchmark_policies
+        self.benchmark_policies = validate_benchmark_policies(benchmark_policies)
         self.store, self.objects, self.clock = store, objects, clock
         self.lease_seconds = lease_seconds
         self.notifications = notifications
@@ -342,6 +345,10 @@ class Application:
         } | ({"lease_expires_at": job["lease"]["expires_at"]} if "lease" in job else {})
 
     def route(self, method, path, sub, identity, body, state):
+        from .benchmark import BenchmarkRoutes, is_benchmark_path
+
+        if is_benchmark_path(path):
+            return BenchmarkRoutes(self).route(method, path, sub, identity, body, state)
         now = int(self.clock())
         if path in ("/v1/me", "/v1/projects") and method == "GET":
             projects = [
@@ -642,6 +649,9 @@ class Application:
                 or sum(a["size_bytes"] for a in owned) + body["size_bytes"] > ARTIFACT_USER_MAX_BYTES
             ):
                 fail(429, "artifact_quota_exceeded", "Retained upload reservations exceed the release quota")
+        from aws_mesouq.benchmark import ARTIFACT_PROJECT_BYTES, project_artifact_charge
+        if project_artifact_charge(state, project) + body["size_bytes"] > ARTIFACT_PROJECT_BYTES:
+            fail(429, "artifact_quota_exceeded", "Project cloud storage is reserved by retained artifacts or benchmark campaigns; archive policy and existing owner limits still apply")
         ident = uuid.uuid4().hex
         artifact = {
             **body,

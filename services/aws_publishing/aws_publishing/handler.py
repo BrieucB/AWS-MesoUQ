@@ -10,6 +10,7 @@ from .storage import DynamoStore, S3Objects, SQSNotifications
 LOG = logging.getLogger(__name__)
 _application = None
 _site_auth = None
+_benchmark_adapter = None
 
 
 def application():
@@ -41,6 +42,7 @@ def application():
             validate_configuration=validate_job_configuration,
             validate_result=validate_result,
             release_policy="v1",
+            benchmark_policies=json.loads(os.environ.get("BENCHMARK_POLICIES", "{}")),
             notifications=SQSNotifications(
                 boto3.client("sqs"), os.environ["EVENT_QUEUE_URL"]
             ),
@@ -180,6 +182,14 @@ def handler(event, context):
                 ValueError("Nonfinite number")
             ),
         )
+        from .benchmark import is_benchmark_path
+
+        if is_benchmark_path(path):
+            global _benchmark_adapter
+            if _benchmark_adapter is None:
+                from .benchmark_http import lambda_adapter
+                _benchmark_adapter = lambda_adapter(application)
+            return _benchmark_adapter(event, context)
         remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
         if remaining_ms is None:
             status, response = application().handle(method, path, claims, body)

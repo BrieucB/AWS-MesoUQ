@@ -3,15 +3,17 @@ import {escapeHtml as h,curvePlot,intervalPlot} from './plots.js';
 import {configurationFor,approvedModel,outputArtifacts} from './defaults.js';
 import {posteriorArtifact,loadPosteriorImage} from './posterior.js';
 import {CurveEditor,editorMarkup,mountEditor} from './curve-editor.js';
+import {BenchmarkLab} from './benchmark-lab.js';
 const app=document.querySelector('#app');
 const state={config:null,preset:null,api:null,me:null,projects:[],project:'',model:'',jobs:[],artifacts:[],preview:null,result:null,posterior:{status:'idle',src:'',error:''},detail:null,loading:false,error:'',notice:'',tab:'workspace',diameter:'3.2',forceUnit:'uN',displacementUnit:'um',order:'force-displacement',submitKey:null,logoutFailed:false};
 const drawing=new CurveEditor();
+const benchmarkLab=new BenchmarkLab({context:()=>({api:state.api,project:state.project,valid:currentSession}),onChange:()=>{if(state.tab==='benchmarks'&&state.me)render();},download});
 let expiryTimer,pollTimer,editorController,inputRevision=0;
 let posteriorController,posteriorRevision=0,viewRevision=0;
 const option=(value,label,selected)=>`<option value="${h(value)}" ${String(value)===String(selected)?'selected':''}>${h(label)}</option>`;
 function status(value){return `<span class="status ${h(value)}">${h(String(value).replaceAll('_',' '))}</span>`;}
 function download(name,value,type='application/json'){const url=URL.createObjectURL(new Blob([value instanceof Blob||typeof value==='string'?value:JSON.stringify(value,null,2)],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-function shell(content){return `<div class="layout"><aside><a class="brand" href="./"><span class="mark">μ</span><span>MesoUQ<small>INDENTATION</small></span></a><nav aria-label="Workspace"><button data-action="tab" data-tab="workspace">New analysis</button><button data-action="tab" data-tab="jobs">Calculations</button></nav><div class="side-bottom"><p>Private project · Invited MFA accounts</p><div class="account">${h(state.me?.email||'')}</div>${state.me?'<button class="quiet" data-action="logout">Sign out</button>':''}</div></aside><div class="main"><header>MesoUQ / Indentation analysis</header><main>${state.error?`<div role="alert" class="alert error" data-app-message>${h(state.error)}</div>`:''}${state.notice?`<div role="status" class="alert" data-app-message>${h(state.notice)}</div>`:''}${content}</main><footer>Approved indentation model · Own-account HPC session</footer></div></div>`;}
+function shell(content){return `<div class="layout"><aside><a class="brand" href="./"><span class="mark">μ</span><span>MesoUQ<small>INDENTATION</small></span></a><nav aria-label="Workspace"><button data-action="tab" data-tab="workspace">New analysis</button><button data-action="tab" data-tab="jobs">Calculations</button><button data-action="tab" data-tab="benchmarks">Benchmark Lab</button></nav><div class="side-bottom"><p>Private project · Invited MFA accounts</p><div class="account">${h(state.me?.email||'')}</div>${state.me?'<button class="quiet" data-action="logout">Sign out</button>':''}</div></aside><div class="main"><header>MesoUQ / ${state.tab==='benchmarks'?'Benchmark Lab':'Indentation analysis'}</header><main>${state.error?`<div role="alert" class="alert error" data-app-message>${h(state.error)}</div>`:''}${state.notice?`<div role="status" class="alert" data-app-message>${h(state.notice)}</div>`:''}${content}</main><footer>Approved indentation model · Own-account HPC session</footer></div></div>`;}
 function intro(title,subtitle){return `<div class="page-heading"><div><h1>${h(title)}</h1><p>${h(subtitle)}</p></div></div>`;}
 function loginView(){return shell(`${intro('Private research workspace','Sign in with your invited account. The hosted identity flow requires MFA.')}<button class="primary" data-action="login">Sign in securely</button>${state.logoutFailed?'<button class="secondary" data-action="logout">Retry sign-out</button>':''}`);}
 function projectSelect(){return `<label>Project<select id="project" ${state.loading?'disabled':''}>${state.projects.map(p=>option(p.id,p.name,state.project)).join('')}</select></label>`;}
@@ -82,8 +84,10 @@ async function prepareCurve(file,source='csv'){
   state.preview={file,rows,metadata,source};
 }
 function render(){
+  const benchmarkFocus=state.tab==='benchmarks'?benchmarkLab.captureFocus():null;
   editorController?.destroy();editorController=null;
-  app.innerHTML=state.me?shell(!state.project?intro('Your projects','No project membership was returned. Ask the operator for access.'):state.detail?detailPanel():state.tab==='jobs'?projectSelect()+jobsPanel():workspace()):loginView();
+  app.innerHTML=state.me?shell(!state.project?intro('Your projects','No project membership was returned. Ask the operator for access.'):state.detail?detailPanel():state.tab==='benchmarks'?projectSelect()+benchmarkLab.view():state.tab==='jobs'?projectSelect()+jobsPanel():workspace()):loginView();
+  if(state.tab==='benchmarks'&&state.me)benchmarkLab.mount(app,benchmarkFocus);
   const image=app.querySelector?.('[data-posterior-image]');
   if(image?.addEventListener){
     const src=state.posterior.src,revision=posteriorRevision,api=state.api;
@@ -109,12 +113,12 @@ async function loadDetail(id){
   if(revision!==viewRevision||project!==state.project||!currentSession(api))return;
   state.detail=detail;
 }
-function resetProject(){leaveResult();clearInput();drawing.reset();state.detail=null;state.result=null;state.jobs=[];state.model='';}
-app.addEventListener('change',event=>{const {id,value,files}=event.target;if(id==='project'){busy(async()=>{state.project=value;resetProject();await loadProject();});return;}if(['diameter','forceUnit','displacementUnit','order'].includes(id)){if(state.loading)return;state[id]=value;clearInput();drawing.reset();render();return;}if(id==='file'&&files?.[0])busy(()=>prepareCurve(files[0]));});
+function resetProject(){benchmarkLab.reset();leaveResult();clearInput();drawing.reset();state.detail=null;state.result=null;state.jobs=[];state.model='';}
+app.addEventListener('change',event=>{const {id,value,files}=event.target;if(id==='project'){busy(async()=>{state.project=value;resetProject();await loadProject();if(state.tab==='benchmarks')void benchmarkLab.enter();});return;}if(['diameter','forceUnit','displacementUnit','order'].includes(id)){if(state.loading)return;state[id]=value;clearInput();drawing.reset();render();return;}if(id==='file'&&files?.[0])busy(()=>prepareCurve(files[0]));});
 app.addEventListener('click',event=>{const button=event.target.closest('[data-action]');if(!button||button.disabled)return;const action=button.dataset.action;
 if(action==='login'){location.assign('/auth/login');return;}
 if(action==='logout'){const config=state.config;clearSiteMemory();state.loading=true;render();endSiteSession(config).then(url=>location.assign(url)).catch(error=>{state.logoutFailed=true;state.error=`Site cookies could not be cleared. Retry sign-out. ${error.message}`;}).finally(()=>{state.loading=false;render();});return;}
-if(action==='tab'){leaveResult();state.tab=button.dataset.tab;state.detail=null;state.result=null;render();return;}
+if(action==='tab'){benchmarkLab.leave();leaveResult();state.tab=button.dataset.tab;state.detail=null;state.result=null;render();if(state.tab==='benchmarks')void benchmarkLab.enter();return;}
 if(action==='back'){leaveResult();state.detail=null;state.result=null;state.tab='jobs';render();return;}
 if(action==='retry-posterior'){void showPosterior();return;}
 if(action==='remove'){if(state.loading)return;state.artifacts=[];state.submitKey=null;render();return;}
@@ -156,6 +160,7 @@ async function boot(){
     pollTimer=setInterval(async()=>{
       if(state.loading||document.hidden||!state.project||!state.api)return;
       try{
+        if(state.tab==='benchmarks'){await benchmarkLab.poll();return;}
         const project=state.project;
         const response=await state.api.request(state.api.project(project,'/jobs'));
         if(project!==state.project)return;
