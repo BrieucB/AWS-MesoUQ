@@ -18,6 +18,7 @@ test = ["pytest>=8,<10"]
 [project.scripts]
 aws-mesouq-connect = "aws_mesouq.connector.cli:main"
 aws-mesouq-connector = "aws_mesouq.connector.cli:main"
+aws-mesouq-benchmark = "aws_mesouq.benchmark_worker:main"
 
 [project.urls]
 Repository = "https://github.com/BrieucB/AWS-MesoUQ"

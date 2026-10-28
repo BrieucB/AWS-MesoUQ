@@ -89,3 +89,43 @@ Benchmark artifacts are retained indefinitely by the current service. Existing
 indentation archive maintenance does not delete benchmark objects. An accepted
 benchmark receipt explicitly records `automatic_expiry=false`; no 30-day expiry
 is promised until benchmark-aware maintenance exists.
+
+
+## Own-account executor
+
+The separately installed `aws-mesouq-benchmark` CLI uses the existing normal
+connector journal. It requires its previously enrolled `connector_id` and
+`archive_device`; it never generates replacement device keys. An existing
+owner binding must match `GET /v1/me`. If that binding is absent, only the
+authenticated API subject may initialize it. The normal calibration journal
+entries remain in their original namespace.
+
+An operator supplies a trusted JSON configuration with:
+`repository`, `science_revision`, `adapter_sha256`, `python_bin`,
+`environment_script`, `environment_sha256`, separate private `run_root`
+and `archive_root`, `expected_user`, `expected_host`, `scheduler`,
+`stage_seconds`, and exact HTTPS `allowed_upload_origins`.
+The scheduler requires an explicitly approved `qgpu_exp` or `qgpu` profile,
+account, QOS, CPU count and memory; every stage requests one GPU.
+Reference and metrics have separate finite operator stage limits.
+
+The executor snapshots the approved standalone adapter beside the immutable
+request and stage manifest. Native Slurm walltime rounds down to complete
+minutes within the reserved budget; the scientific process receives a shorter
+window with termination grace. The adapter verifies its own hash, the runtime
+script hash, a clean pinned scientific Git revision, the full request hash,
+and the native allocation before invoking the scientific CLI. TMCMC uses
+`mpirun -np 1` inside the allocation to respect the installed MPI stack.
+
+Claims, submission intents, job IDs, upload reservations and event IDs are
+journaled durably. Lost acknowledgments replay their original event IDs.
+Unknown submission acknowledgment triggers exact-marker, own-user lookup only.
+The executor polls all active stages; it cancels only an exact verified own
+native job. Missing or invalid scientific receipts produce explicit failures
+with actual scheduler cost, while unknown execution retains its reservation.
+
+Only bounded comparison JSON, score CSV, generated PNG and portable stage
+metadata are uploaded. Checkpoints, training banks and other retained products
+are copied and independently checksum-verified under the approved durable
+archive root before the signed archive receipt is sent. The executor reports
+bounded error class names and stage counts without logging credentials.

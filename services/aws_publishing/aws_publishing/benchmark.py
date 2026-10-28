@@ -375,7 +375,7 @@ class BenchmarkRoutes:
         campaign["revision"] += 1
         self.refresh(campaign, now)
         state["events"][event_id] = {"hash": event_hash}
-        return 200, {"campaign": public_campaign(campaign)}
+        return 200, {"campaign": public_campaign(campaign), "lease_expires_at": stage["lease"]["expires_at"]}
 
     def archive_verified(self, state, sub, identity, body, now):
         from pathlib import PurePosixPath
@@ -423,7 +423,7 @@ class BenchmarkRoutes:
             seen.add(relative)
             if not isinstance(output["sha256"], str) or not re.fullmatch("[a-f0-9]{64}", output["sha256"]):
                 raise ValueError("Invalid retained output SHA256")
-            number(output["size_bytes"], "retained output size", 1, 1e15, True)
+            number(output["size_bytes"], "retained output size", 0, 1e15, True)
         accepted = campaign.get("archive", {})
         if accepted.get("status") == "verified":
             if checksum(accepted["receipt"]) != checksum(receipt):
