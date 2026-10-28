@@ -342,6 +342,10 @@ class Application:
         } | ({"lease_expires_at": job["lease"]["expires_at"]} if "lease" in job else {})
 
     def route(self, method, path, sub, identity, body, state):
+        from .benchmark import BenchmarkRoutes, is_benchmark_path
+
+        if is_benchmark_path(path):
+            return BenchmarkRoutes(self).route(method, path, sub, identity, body, state)
         now = int(self.clock())
         if path in ("/v1/me", "/v1/projects") and method == "GET":
             projects = [

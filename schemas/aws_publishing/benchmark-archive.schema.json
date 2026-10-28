@@ -1,0 +1,61 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "campaign_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Campaign Id",
+      "type": "string"
+    },
+    "connector_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Connector Id",
+      "type": "string"
+    },
+    "event_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "const": "archive_verified",
+      "title": "Type",
+      "type": "string"
+    },
+    "receipt": {
+      "additionalProperties": true,
+      "title": "Receipt",
+      "type": "object"
+    },
+    "signature": {
+      "maxLength": 128,
+      "title": "Signature",
+      "type": "string"
+    }
+  },
+  "required": [
+    "project_id",
+    "campaign_id",
+    "connector_id",
+    "event_id",
+    "type",
+    "receipt",
+    "signature"
+  ],
+  "title": "ArchiveEvent",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesouq.invalid/schemas/benchmark-archive.schema.json"
+}

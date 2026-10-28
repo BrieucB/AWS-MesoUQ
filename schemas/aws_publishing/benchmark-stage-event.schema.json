@@ -1,0 +1,158 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "connector_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Connector Id",
+      "type": "string"
+    },
+    "lease_token": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Lease Token",
+      "type": "string"
+    },
+    "event_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "heartbeat",
+        "submitting",
+        "submitted",
+        "queued",
+        "running",
+        "submission_unknown",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "artifact_upload"
+      ],
+      "title": "Type",
+      "type": "string"
+    },
+    "signature": {
+      "maxLength": 128,
+      "title": "Signature",
+      "type": "string"
+    },
+    "slurm_job_id": {
+      "anyOf": [
+        {
+          "pattern": "^[1-9][0-9]{0,19}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Slurm Job Id"
+    },
+    "result": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Result"
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Failure"
+    },
+    "timing": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Timing"
+    },
+    "artifacts": {
+      "anyOf": [
+        {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Artifacts"
+    },
+    "scheduler_accounting": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Scheduler Accounting"
+    },
+    "not_submitted": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Not Submitted"
+    }
+  },
+  "required": [
+    "project_id",
+    "connector_id",
+    "lease_token",
+    "event_id",
+    "type",
+    "signature"
+  ],
+  "title": "StageEvent",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesouq.invalid/schemas/benchmark-stage-event.schema.json"
+}

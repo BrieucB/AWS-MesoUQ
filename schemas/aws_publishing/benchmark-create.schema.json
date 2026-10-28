@@ -1,0 +1,304 @@
+{
+  "$defs": {
+    "Budget": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "const": "fixed",
+          "title": "Mode",
+          "type": "string"
+        },
+        "method_gpu_seconds": {
+          "maximum": 10000000,
+          "minimum": 90,
+          "title": "Method Gpu Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "mode",
+        "method_gpu_seconds"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "Controls": {
+      "additionalProperties": false,
+      "properties": {
+        "hnpe": {
+          "$ref": "#/$defs/HNPE"
+        },
+        "tmcmc": {
+          "$ref": "#/$defs/TMCMC"
+        }
+      },
+      "required": [
+        "hnpe",
+        "tmcmc"
+      ],
+      "title": "Controls",
+      "type": "object"
+    },
+    "Evaluation": {
+      "additionalProperties": false,
+      "properties": {
+        "case_count": {
+          "maximum": 256,
+          "minimum": 1,
+          "title": "Case Count",
+          "type": "integer"
+        },
+        "posterior_draws": {
+          "maximum": 8192,
+          "minimum": 256,
+          "title": "Posterior Draws",
+          "type": "integer"
+        },
+        "cohort": {
+          "const": "central_90",
+          "title": "Cohort",
+          "type": "string"
+        }
+      },
+      "required": [
+        "case_count",
+        "posterior_draws",
+        "cohort"
+      ],
+      "title": "Evaluation",
+      "type": "object"
+    },
+    "HNPE": {
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "enum": [
+            64,
+            128,
+            256
+          ],
+          "title": "Width",
+          "type": "integer"
+        },
+        "depth": {
+          "enum": [
+            1,
+            2,
+            3
+          ],
+          "title": "Depth",
+          "type": "integer"
+        },
+        "learning_rate": {
+          "enum": [
+            0.0001,
+            0.0003
+          ],
+          "title": "Learning Rate",
+          "type": "number"
+        },
+        "batch_size": {
+          "enum": [
+            256,
+            512,
+            1024,
+            2048
+          ],
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_updates": {
+          "maximum": 10000000,
+          "minimum": 1,
+          "title": "Max Updates",
+          "type": "integer"
+        },
+        "training_budget": {
+          "maximum": 14400,
+          "minimum": 90,
+          "title": "Training Budget",
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "depth",
+        "learning_rate",
+        "batch_size",
+        "max_updates",
+        "training_budget"
+      ],
+      "title": "HNPE",
+      "type": "object"
+    },
+    "Reference": {
+      "additionalProperties": false,
+      "properties": {
+        "initial_power": {
+          "maximum": 24,
+          "minimum": 8,
+          "title": "Initial Power",
+          "type": "integer"
+        },
+        "maximum_power": {
+          "maximum": 24,
+          "minimum": 8,
+          "title": "Maximum Power",
+          "type": "integer"
+        },
+        "scrambles": {
+          "maximum": 16,
+          "minimum": 2,
+          "title": "Scrambles",
+          "type": "integer"
+        },
+        "relative_tolerance": {
+          "maximum": 0.25,
+          "minimum": 0.0001,
+          "title": "Relative Tolerance",
+          "type": "number"
+        }
+      },
+      "required": [
+        "initial_power",
+        "maximum_power",
+        "scrambles",
+        "relative_tolerance"
+      ],
+      "title": "Reference",
+      "type": "object"
+    },
+    "Scenario": {
+      "additionalProperties": false,
+      "properties": {
+        "family": {
+          "enum": [
+            "baseline",
+            "higher_noise",
+            "broader_priors"
+          ],
+          "title": "Family",
+          "type": "string"
+        },
+        "scale": {
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Scale",
+          "type": "number"
+        }
+      },
+      "required": [
+        "family",
+        "scale"
+      ],
+      "title": "Scenario",
+      "type": "object"
+    },
+    "TMCMC": {
+      "additionalProperties": false,
+      "properties": {
+        "population_size": {
+          "enum": [
+            2048,
+            4096,
+            8192
+          ],
+          "title": "Population Size",
+          "type": "integer"
+        },
+        "target_cov": {
+          "enum": [
+            0.4,
+            0.6,
+            0.8
+          ],
+          "title": "Target Cov",
+          "type": "number"
+        },
+        "proposal_scale": {
+          "enum": [
+            0.25,
+            0.5,
+            1.0
+          ],
+          "title": "Proposal Scale",
+          "type": "number"
+        },
+        "burn_in": {
+          "enum": [
+            1,
+            7,
+            10
+          ],
+          "title": "Burn In",
+          "type": "integer"
+        },
+        "max_generations": {
+          "maximum": 10000,
+          "minimum": 100,
+          "title": "Max Generations",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "population_size",
+        "target_cov",
+        "proposal_scale",
+        "burn_in",
+        "max_generations"
+      ],
+      "title": "TMCMC",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "idempotency_key": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "scenario": {
+      "$ref": "#/$defs/Scenario"
+    },
+    "seed": {
+      "maximum": 2147483647,
+      "minimum": 0,
+      "title": "Seed",
+      "type": "integer"
+    },
+    "controls": {
+      "$ref": "#/$defs/Controls"
+    },
+    "evaluation": {
+      "$ref": "#/$defs/Evaluation"
+    },
+    "budget": {
+      "$ref": "#/$defs/Budget"
+    },
+    "reference": {
+      "$ref": "#/$defs/Reference"
+    }
+  },
+  "required": [
+    "schema_version",
+    "idempotency_key",
+    "scenario",
+    "seed",
+    "controls",
+    "evaluation",
+    "budget",
+    "reference"
+  ],
+  "title": "CreateCampaign",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mesouq.invalid/schemas/benchmark-create.schema.json"
+}

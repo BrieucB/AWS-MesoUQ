@@ -14,6 +14,7 @@ BUCKETS = (
     "models",
     "requests",
     "events",
+    "benchmark_campaigns",
 )
 
 
