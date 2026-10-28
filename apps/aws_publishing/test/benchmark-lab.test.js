@@ -157,3 +157,24 @@ test('invalid draft is rejected before API create without rounding or minting an
   await f.lab.submit();assert.match(f.lab.error,/integer/);
   assert.equal(f.calls.filter(call=>call.body).length,0);assert.equal(f.lab.idempotencyKey,null);
 });
+
+test('archive admission disables no-execution campaigns and blocks direct requests without affecting eligible terminals',async()=>{
+  const f=setup(async path=>path.endsWith('/capabilities')?{defaults,actions:{archive:true}}:{campaigns:[]});
+  await f.lab.enter();
+  f.lab.detail={id:'never-executed',status:'cancelled',archive_capability:{available:false,reason:'no_executed_scientific_stages'}};
+  let markup=f.lab.view();
+  assert.match(markup,/<button[^>]*data-lab-action="archive"[^>]*disabled/);
+  assert.match(markup,/Archival is unavailable because no scientific stages executed and no scientific outputs were produced/);
+  const before=f.calls.length;await f.lab.changeCampaign('archive');assert.equal(f.calls.length,before);
+  f.lab.detail.archive_capability={available:false,reason:'<unknown reason>'};
+  markup=f.lab.view();assert.match(markup,/Archival is unavailable for this campaign/);assert.doesNotMatch(markup,/<unknown reason>/);
+  for(const capability of [undefined,{available:true}]){
+    f.lab.detail.archive_capability=capability;
+    markup=f.lab.view();
+    const archiveButton=markup.match(/<button[^>]*data-lab-action="archive"[^>]*>/)?.[0];
+    assert.ok(archiveButton);assert.doesNotMatch(archiveButton,/disabled/);
+    assert.doesNotMatch(markup,/Archival is unavailable/);
+  }
+  f.lab.detail.archive={status:'verified'};
+  assert.doesNotMatch(f.lab.view(),/data-lab-action="archive"/);
+});
