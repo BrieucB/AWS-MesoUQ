@@ -51,6 +51,44 @@ Changing metadata, project or selected file clears the drawing and selected
 input; editing drawn points also clears any prior preview/upload selection.
 All drawing controls are locked during uploads and other pending operations.
 
+## BenchmarkLab interface
+
+Open **BenchmarkLab** in the workspace navigation and select a project.
+The interface loads that project's versioned capabilities before enabling
+campaign creation. It supports one scenario family per campaign: the baseline
+at 1×, a multiplier of the complete measurement-noise SD distribution, or a
+multiplier of the joint prior widths. The server owns the scientific
+transformation; the browser does not simulate or estimate posteriors.
+
+Every campaign requests a fresh seven-factor HNPE bundle. HNPE width, hidden
+depth, optimizer learning rate, batch size, update limit and per-factor fit time
+are recorded alongside TMCMC population, tempering, proposal and exploration
+controls. The evaluation case count, retained posterior draw count and seed
+apply to the matched comparison. The declared total method budget covers HNPE
+training plus inference; reference-generation cost is reported separately.
+These experiment budgets are not an application-wide GPU-hour quota. Concurrent
+campaigns are admitted under the Karolina Slurm account/partition/QoS policy.
+
+The campaign view shows reported stage status, failure/incomplete evidence,
+server-computed accuracy/calibration metrics, posterior/reference plots and
+training histories. Missing data stay explicitly unavailable. The browser only
+draws returned plot series; it does not calculate density estimates or scientific
+scores. Numerical-reference controls and immutable benchmark profile are shown
+for reproducibility. Accuracy-target stopping is identified as a follow-on mode.
+
+Campaign cancellation uses the API's cancellation hook. Archive controls appear
+only when capabilities advertise an implemented archive action. Request or retry
+archival without recomputing results; the interface keeps archival pending until
+the connector verifies its PROJECT copy. Verified archives retain evidence. API-authorized evidence downloads verify the selected immutable
+reference, length and SHA256, and fetch approved private storage URLs without
+bearer credentials. UI requests are isolated from calibration operations and
+discard late responses after project changes, navigation or session expiry.
+
+The automated interface tests use explicitly synthetic data. They verify request
+mapping, retry idempotency, stale-response rejection, display escaping and
+artifact integrity. They do not establish AWS deployment, live Slurm execution,
+scientific accuracy or completed fresh training.
+
 ## Local checks
 
 Use Node 20 or newer. There are no npm dependencies to install.
