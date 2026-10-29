@@ -13,6 +13,7 @@ import sys
 
 import pytest
 
+from aws_mesouq.benchmark import FACTORS
 from aws_mesouq.benchmark_worker import BenchmarkWorker
 
 
@@ -22,7 +23,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def shell_fixture(tmp_path, profile_pythonpath, *, unusual_paths=False):
+def shell_fixture(tmp_path, profile_pythonpath, *, unusual_paths=False, stage="cases",
+                  profile_backend=None, python_bin=None):
     folder = "runtime's $(touch SHELL_INJECTION) directory" if unusual_paths else "runtime"
     root = tmp_path / folder
     repository = root / "science"
@@ -30,10 +32,13 @@ def shell_fixture(tmp_path, profile_pythonpath, *, unusual_paths=False):
     for path in (repository / "src", control):
         path.mkdir(parents=True)
     environment = root / "environment.sh"
-    environment.write_text(
+    environment_body = (
         "unset PYTHONPATH\n" if profile_pythonpath is None
         else "export PYTHONPATH=" + shlex.quote(profile_pythonpath) + "\n"
     )
+    if profile_backend is not None:
+        environment_body += "export KERAS_BACKEND=" + shlex.quote(profile_backend) + "\n"
+    environment.write_text(environment_body)
     adapter = control / "adapter.py"
     adapter.write_text(
         "import json, os, sys\n"
@@ -41,7 +46,7 @@ def shell_fixture(tmp_path, profile_pythonpath, *, unusual_paths=False):
         "'site': os.environ['MESOUQ_SITE'], 'argv': sys.argv[1:]}))\n"
     )
     operator = {
-        "repository": str(repository), "python_bin": sys.executable,
+        "repository": str(repository), "python_bin": python_bin or sys.executable,
         "environment_script": str(environment),
         "environment_sha256": hashlib.sha256(environment.read_bytes()).hexdigest(),
         "scheduler": {"partition": "qgpu_exp", "account": "synthetic", "qos": "synthetic",
@@ -51,7 +56,8 @@ def shell_fixture(tmp_path, profile_pythonpath, *, unusual_paths=False):
     worker = object.__new__(BenchmarkWorker)
     worker.operator = operator
     script = root / "submit.sh"
-    script.write_text(worker.script({"marker": "synthetic-runtime"}, str(control), {"time": "00:01:00"}))
+    script.write_text(worker.script({"marker": "synthetic-runtime", "claim": {"stage": {"id": stage}}},
+                                   str(control), {"time": "00:01:00"}))
     return script, repository, control, environment
 
 
@@ -117,3 +123,38 @@ def test_changed_profile_is_rejected_before_it_or_the_adapter_executes(tmp_path)
     assert result.returncode != 0
     assert not (tmp_path / "PROFILE_EXECUTED").exists()
     assert not (tmp_path / "ADAPTER_EXECUTED").exists()
+
+
+@pytest.mark.parametrize("profile_backend", [None, "tensorflow"])
+@pytest.mark.parametrize("stage,selected_backend", [
+    *(("train_" + factor, "jax") for factor in FACTORS),
+    ("hnpe_infer", "torch"), ("cases", None), ("reference", None),
+    ("tmcmc", None), ("metrics", None),
+])
+def test_stage_backend_is_selected_before_python_and_backend_import(
+        tmp_path, stage, selected_backend, profile_backend):
+    expected = selected_backend if selected_backend is not None else profile_backend
+    before_python = tmp_path / "backend-before-python.txt"
+    interpreter = tmp_path / "python-wrapper"
+    variable = chr(36) + "{KERAS_BACKEND-UNSET}"
+    interpreter.write_text(
+        "#!/bin/bash\nprintf '%s' \"" + variable + "\" > " + shlex.quote(str(before_python))
+        + "\nexec " + shlex.quote(sys.executable) + " \"" + chr(36) + "@\"\n"
+    )
+    interpreter.chmod(0o700)
+    script, repository, control, _ = shell_fixture(
+        tmp_path, "/trusted/runtime/overlay", stage=stage,
+        profile_backend=profile_backend, python_bin=str(interpreter),
+    )
+    (repository / "src" / "backend_import_probe.py").write_text(
+        "import os\nOBSERVED = os.environ.get('KERAS_BACKEND')\n"
+        "assert OBSERVED == " + repr(expected) + ", 'Backend selection happened after import'\n"
+    )
+    (control / "adapter.py").write_text(
+        "from backend_import_probe import OBSERVED\nimport json\n"
+        "print(json.dumps({'backend_seen_by_import': OBSERVED}))\n"
+    )
+    result = execute_shell(script, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert before_python.read_text() == ("UNSET" if expected is None else expected)
+    assert json.loads(result.stdout) == {"backend_seen_by_import": expected}

@@ -349,7 +349,14 @@ os.close(fd)
         lines += ["set -euo pipefail", "umask 077"]
         environment = shlex.quote(self.operator["environment_script"])
         digest = shlex.quote(self.operator["environment_sha256"])
-        lines += ["test \"$(sha256sum " + environment + " | cut -d' ' -f1)\" = " + digest, "source " + environment, "export MESOUQ_SITE=karolina", "export PYTHONPATH=" + shlex.quote(self.operator["repository"] + "/src") + '${PYTHONPATH:+:"$PYTHONPATH"}', "exec " + shlex.quote(self.operator["python_bin"]) + " " + shlex.quote(control + "/adapter.py") + " --manifest " + shlex.quote(control + "/manifest.json")]
+        lines += ["test \"$(sha256sum " + environment + " | cut -d' ' -f1)\" = " + digest, "source " + environment, "export MESOUQ_SITE=karolina", "export PYTHONPATH=" + shlex.quote(self.operator["repository"] + "/src") + '${PYTHONPATH:+:"$PYTHONPATH"}']
+        stage = entry["claim"]["stage"]["id"]
+        # Select Keras before the isolated interpreter imports a native backend.
+        if stage in {"train_" + factor for factor in FACTORS}:
+            lines.append("export KERAS_BACKEND=jax")
+        elif stage == "hnpe_infer":
+            lines.append("export KERAS_BACKEND=torch")
+        lines += ["exec " + shlex.quote(self.operator["python_bin"]) + " " + shlex.quote(control + "/adapter.py") + " --manifest " + shlex.quote(control + "/manifest.json")]
         return "\n".join(lines) + "\n"
 
     def accounting(self, entry):
@@ -503,7 +510,11 @@ os.close(fd)
         histories = []
         for factor in FACTORS:
             trained = self.state["campaigns"][entry["claim"]["campaign"]["id"]].get("receipts", {}).get("train_" + factor, {})
-            history = trained.get("history", scientific.get("hnpe_training", {}).get(factor, {}).get("history", []))
+            history = trained.get("history")
+            if history is None:
+                history = scientific.get("hnpe_training", {}).get(factor, {}).get("history")
+            if history is None:
+                history = []
             kept = history[::max(1, math.ceil(len(history) / 200))]
             if history and (not kept or kept[-1] != history[-1]):
                 kept.append(history[-1])
