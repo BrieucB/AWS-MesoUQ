@@ -510,7 +510,11 @@ os.close(fd)
         histories = []
         for factor in FACTORS:
             trained = self.state["campaigns"][entry["claim"]["campaign"]["id"]].get("receipts", {}).get("train_" + factor, {})
-            history = trained.get("history", scientific.get("hnpe_training", {}).get(factor, {}).get("history", []))
+            history = trained.get("history")
+            if history is None:
+                history = scientific.get("hnpe_training", {}).get(factor, {}).get("history")
+            if history is None:
+                history = []
             kept = history[::max(1, math.ceil(len(history) / 200))]
             if history and (not kept or kept[-1] != history[-1]):
                 kept.append(history[-1])
