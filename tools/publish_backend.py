@@ -97,7 +97,7 @@ def verify_source(aws, repository_uri, sha, source, command=None):
 
 def publish(function, repository_uri, source_sha, source_repository, baseline_image,
             policies, expected_policy_sha256, expected_role_arn, aws=None,
-            image_verifier=None, sleep=time.sleep):
+            image_verifier=None, sleep=time.sleep, previous_source_sha=None):
     aws = aws or AwsCli()
     require(isinstance(function, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", function),
             "function-input-invalid")
@@ -107,11 +107,25 @@ def publish(function, repository_uri, source_sha, source_repository, baseline_im
             "source-input-invalid")
     uri = re.fullmatch(role[1] + r"\.dkr\.ecr\.([a-z]{2}-[a-z]+-[0-9]+)\.amazonaws\.com/([a-z0-9][a-z0-9._/-]*)",
                        repository_uri)
-    require(uri is not None and re.fullmatch(re.escape(repository_uri) + r"@sha256:[a-f0-9]{64}", baseline_image)
-            and re.fullmatch(r"[a-f0-9]{64}", expected_policy_sha256), "source-input-invalid")
+    require(uri is not None and re.fullmatch(r"[a-f0-9]{64}", expected_policy_sha256),
+            "source-input-invalid")
+    image_pattern = re.escape(repository_uri) + r"@sha256:[a-f0-9]{64}"
+    if previous_source_sha is None:
+        # Preserve the original helper API for existing callers.
+        require(isinstance(baseline_image, str) and re.fullmatch(image_pattern, baseline_image),
+                "source-input-invalid")
+    else:
+        require(isinstance(previous_source_sha, str) and
+                re.fullmatch(r"[a-f0-9]{40}", previous_source_sha), "source-input-invalid")
     policy_json = validate_policies(policies)
     verify_identity(aws, expected_role_arn)
-    immutable = (image_verifier or verify_source)(aws, repository_uri, source_sha, source_repository)
+    verifier = image_verifier or verify_source
+    if previous_source_sha is not None:
+        # An explicit reviewed source always supersedes a stale legacy URI.
+        baseline_image = verifier(aws, repository_uri, previous_source_sha, source_repository)
+        require(isinstance(baseline_image, str) and re.fullmatch(image_pattern, baseline_image),
+                "source-image-invalid")
+    immutable = verifier(aws, repository_uri, source_sha, source_repository)
     require(re.fullmatch(re.escape(repository_uri) + r"@sha256:[a-f0-9]{64}", immutable),
             "source-image-invalid")
     expected_arn = "arn:aws:lambda:" + uri[1] + ":" + role[1] + ":function:" + function
@@ -169,9 +183,12 @@ def publish(function, repository_uri, source_sha, source_repository, baseline_im
             cfg.get("Environment", {}).get("Variables", {}) == target_environment and
             {key: cfg.get(key) for key in CONFIG_KEYS} == stable,
             "function-readback-mismatch")
-    return {"status": "verified", "source_commit": source_sha,
-            "configuration_updates": configuration_updates, "code_updates": code_updates,
-            "benchmark_policy_sha256": hashlib.sha256(policy_json.encode()).hexdigest()}
+    result = {"status": "verified", "source_commit": source_sha,
+              "configuration_updates": configuration_updates, "code_updates": code_updates,
+              "benchmark_policy_sha256": hashlib.sha256(policy_json.encode()).hexdigest()}
+    if previous_source_sha is not None:
+        result["previous_source_commit"] = previous_source_sha
+    return result
 
 
 def main():
@@ -182,8 +199,9 @@ def main():
         result = publish(
             os.environ["BACKEND_FUNCTION_NAME"], os.environ["AWS_ECR_REPOSITORY_URL"],
             args.source_commit, "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
-            os.environ["BACKEND_BASELINE_IMAGE_URI"], json.loads(os.environ["BENCHMARK_POLICIES"]),
-            os.environ["EXPECTED_POLICY_SHA256"], os.environ["PUBLICATION_ROLE_ARN"])
+            os.environ.get("BACKEND_BASELINE_IMAGE_URI"), json.loads(os.environ["BENCHMARK_POLICIES"]),
+            os.environ["EXPECTED_POLICY_SHA256"], os.environ["PUBLICATION_ROLE_ARN"],
+            previous_source_sha=os.environ.get("EXPECTED_PREVIOUS_SOURCE_COMMIT"))
         print(json.dumps(result, sort_keys=True))
         return 0
     except Exception as exc:

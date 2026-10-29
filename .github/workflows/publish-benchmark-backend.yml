@@ -6,6 +6,10 @@ on:
         description: Exact reviewed main commit whose immutable image was published
         type: string
         required: true
+      expected_previous_source_commit:
+        description: Exact reviewed source commit matching the currently deployed immutable image
+        type: string
+        required: true
       expected_existing_policy_sha256:
         description: SHA256 of the expected existing policy environment value (empty if absent)
         type: string
@@ -31,7 +35,6 @@ jobs:
           REGION_INPUT: ${{ secrets.AWS_REGION }}
           FUNCTION_INPUT: ${{ secrets.AWS_BACKEND_FUNCTION_NAME }}
           REPOSITORY_INPUT: ${{ secrets.AWS_ECR_REPOSITORY_URL }}
-          BASELINE_INPUT: ${{ secrets.AWS_BACKEND_BASELINE_IMAGE_URI }}
           POLICIES_INPUT: ${{ secrets.AWS_BENCHMARK_POLICIES }}
         run: |
           python3 - <<'PY'
@@ -41,15 +44,17 @@ jobs:
                   inputs = json.load(event_file)['inputs']
               sha = inputs['expected_source_commit']
               policy_sha = inputs['expected_existing_policy_sha256']
+              previous_sha = inputs['expected_previous_source_commit']
               if (os.environ['GITHUB_REF'] != 'refs/heads/main' or
                       os.environ['GITHUB_EVENT_NAME'] != 'workflow_dispatch' or
                       sha != os.environ['GITHUB_SHA'] or
                       not re.fullmatch(r'[a-f0-9]{40}', sha) or
+                      not re.fullmatch(r'[a-f0-9]{40}', previous_sha) or
                       not re.fullmatch(r'[a-f0-9]{64}', policy_sha)):
                   raise ValueError()
-              role, region, function, repository, baseline, policies = [
+              role, region, function, repository, policies = [
                   os.environ[name] for name in ('ROLE_INPUT', 'REGION_INPUT', 'FUNCTION_INPUT',
-                                               'REPOSITORY_INPUT', 'BASELINE_INPUT', 'POLICIES_INPUT')]
+                                               'REPOSITORY_INPUT', 'POLICIES_INPUT')]
               match = re.fullmatch(r'arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9_+=,.@/-]+', role)
               if (match is None or not re.fullmatch(r'[a-z]{2}-[a-z]+-[0-9]+', region) or
                       not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', function)):
@@ -57,10 +62,9 @@ jobs:
               prefix = match[1] + '.dkr.ecr.' + region + '.amazonaws.com/'
               if (not repository.startswith(prefix) or
                       not re.fullmatch(r'[a-z0-9][a-z0-9._/-]*', repository[len(prefix):]) or
-                      not re.fullmatch(re.escape(repository) + r'@sha256:[a-f0-9]{64}', baseline) or
                       not isinstance(json.loads(policies), dict)):
                   raise ValueError()
-              for value in (role, match[1], function, repository, baseline, policies):
+              for value in (role, match[1], function, repository, policies):
                   print('::add-mask::' + value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'), flush=True)
               function_arn = 'arn:aws:lambda:' + region + ':' + match[1] + ':function:' + function
               repository_arn = 'arn:aws:ecr:' + region + ':' + match[1] + ':repository/' + repository[len(prefix):]
@@ -72,7 +76,7 @@ jobs:
                        'lambda:UpdateFunctionCode','lambda:UpdateFunctionConfiguration'], 'Resource':function_arn}]}
               values = [('PUBLICATION_ROLE_ARN',role), ('PUBLICATION_REGION',region),
                         ('BACKEND_FUNCTION_NAME',function), ('AWS_ECR_REPOSITORY_URL',repository),
-                        ('BACKEND_BASELINE_IMAGE_URI',baseline), ('EXPECTED_POLICY_SHA256',policy_sha),
+                        ('EXPECTED_PREVIOUS_SOURCE_COMMIT',previous_sha), ('EXPECTED_POLICY_SHA256',policy_sha),
                         ('PUBLICATION_SESSION_POLICY',json.dumps(session,separators=(',',':'))),
                         ('BENCHMARK_POLICIES',json.dumps(json.loads(policies),separators=(',',':')))]
               with open(os.environ['GITHUB_ENV'],'a') as environment:
