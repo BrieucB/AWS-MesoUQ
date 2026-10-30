@@ -268,3 +268,63 @@ def test_referenced_context_cannot_be_rewritten(session, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="retain exact"):
         restart(session)
     assert session.journal.data == before
+
+
+@pytest.mark.parametrize("change", [
+    "malformed", "duplicate", "oversized", "extra", "legacy_operator",
+    "unknown_adapter", "too_many",
+])
+def test_registry_content_is_bounded_and_trusted_before_migration(
+        session, tmp_path, monkeypatch, change):
+    _, document, path = registry_fixture(session, tmp_path, monkeypatch)
+    if change == "malformed":
+        blob = "{"
+    elif change == "duplicate":
+        blob = '{"schema": "' + REGISTRY_SCHEMA + '",' + json.dumps(document)[1:]
+    elif change == "oversized":
+        blob = " " * (256 * 1024 + 1)
+    else:
+        if change == "extra":
+            document["unexpected"] = "not allowed"
+        elif change == "legacy_operator":
+            document["legacy_operator"]["python_bin"] = "/other-python"
+        elif change == "unknown_adapter":
+            document["contexts"][0]["operator"]["adapter_sha256"] = "f" * 64
+        else:
+            document["contexts"] *= 16
+        blob = json.dumps(document)
+    path.write_text(blob)
+    before = copy.deepcopy(session.journal.data)
+    with pytest.raises(ValueError):
+        restart(session)
+    assert session.journal.data == before
+
+
+def test_actual_previous_sdk_rejects_migrated_namespace_before_claim(
+        session, tmp_path, monkeypatch):
+    source_path = os.environ.get("AWS_MESOUQ_TEST_LEGACY_WORKER_SOURCE")
+    if source_path is None:
+        pytest.skip("Exact previous public source snapshot is supplied by allocated compatibility QA")
+    import types
+    source = Path(source_path).read_bytes()
+    assert hashlib.sha256(source).hexdigest() == "a278cf65f3ebe258576937c5b82c80e97d5c1f7f7b0716ca8f6df54f2ce12c87"
+    registry_fixture(session, tmp_path, monkeypatch)
+    restart(session)
+    before = copy.deepcopy(session.journal.data)
+    module = types.ModuleType("aws_mesouq._previous_benchmark_worker")
+    module.__package__ = "aws_mesouq"
+    exec(compile(source, source_path, "exec"), module.__dict__)
+    calls = []
+    original = session.api.request
+
+    def observed(method, path, payload=None):
+        calls.append((method, path))
+        return original(method, path, payload)
+
+    monkeypatch.setattr(session.api, "request", observed)
+    with pytest.raises(ValueError, match="immutable operator/session context"):
+        module.BenchmarkWorker(session.api, session.slurm, session.journal, project="p",
+                               operator=session.operator, clock=lambda: session.clock[0])
+    assert not any(method == "POST" for method, _ in calls)
+    assert session.cluster.submit_count == 0
+    assert session.journal.data == before
