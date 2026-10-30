@@ -98,6 +98,34 @@ banks remain on Karolina. The durable archive retains all original files under
 a complete checksum manifest; the cloud receipt binds its manifest and snapshot
 rather than truncating the file list.
 
+## Native aliases and archival recovery
+
+The source inventory covers every retained private regular file and its exact
+logical path. Native checkpoint hardlinks are accepted only when a fresh,
+descriptor-checked inventory proves that every kernel alias is contained within
+the owned source root. Symlinks, outside aliases, changed identity or metadata,
+and incomplete proofs are rejected. Source aliases are never detached, renamed,
+or chmodded by archival.
+
+Each destination path is materialized as an independent read-only0400,
+single-link file and reopened for checksum/size verification. Ephemeral source
+inode proofs never enter cloud receipts, public manifests, or persisted journal
+file inventories. Those retain their path/SHA256/size contract. Full PROJECT
+archival includes all original files; the curated cloud-artifact quota does not
+truncate this durable inventory.
+
+Worker batches contain at most32 records and128MiB of logical data; an existing
+larger file remains an explicitly isolated singleton. RPC metadata travels as
+bounded JSON stdin, capped at4MiB. Source copy also verifies each installed file;
+the worker separately verifies each completed batch before attestation.
+
+A partial restart re-inventories fresh source proofs and checks the immutable
+logical inventory. A completely verified PROJECT target can recover a lost
+acknowledgement after SCRATCH has disappeared. Missing targets do not hide later
+corruption: all cached verification batches finish before source work or writes.
+The existing archive event identity is reused; recovery never requires another
+browser archival request.
+
 ## Operator setup and release
 
 Existing calibration enrollment must already be complete. Never reset the

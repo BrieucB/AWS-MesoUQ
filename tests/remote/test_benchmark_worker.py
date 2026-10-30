@@ -425,8 +425,21 @@ def test_compact_archive_verifies_every_original_beyond_two_thousand_files(sessi
         os.chmod(target, 0o400)
         copied.add(item["destination"])
         verify(root, token, item)
-    monkeypatch.setattr(session.cluster, "archive_copy", copy_file)
-    monkeypatch.setattr(session.cluster, "archive_verify", verify)
+    copy_batches, verify_batches = [], []
+    def copy_batch(root, token, items):
+        assert 1 <= len(items) <= 32
+        assert len(items) == 1 or sum(item["size_bytes"] for item in items) <= 128 * 1024 * 1024
+        copy_batches.append([item["destination"] for item in items])
+        for item in items:
+            copy_file(root, token, item)
+    def verify_batch(root, token, items):
+        verify_batches.append([item["destination"] for item in items])
+        for item in items:
+            verify(root, token, item)
+    monkeypatch.setattr(session.cluster, "archive_copy_batch", copy_batch)
+    monkeypatch.setattr(session.cluster, "archive_verify_batch", verify_batch)
+    monkeypatch.setattr(session.cluster, "archive_copy", lambda *args: pytest.fail("Worker must use archive batches"))
+    monkeypatch.setattr(session.cluster, "archive_verify", lambda *args: pytest.fail("Worker must use archive batches"))
     session.worker.client.request_archive("p", session.campaign["id"])
     report = session.worker.sweep()
     assert not report["errors"]
@@ -436,6 +449,9 @@ def test_compact_archive_verifies_every_original_beyond_two_thousand_files(sessi
     assert len(receipt["retained_outputs"]) == 1
     assert len(canonical(receipt)) < 2000
     assert copied == verified
+    assert copy_batches == verify_batches
+    assert len(copy_batches) > 60
+    assert [name for batch in copy_batches for name in batch] == [item["path"] for item in session.worker.state["campaigns"][session.campaign["id"]]["archive_files"]]
     assert len(copied) == receipt["attested_original_file_count"] + 1
     assert (Path(session.operator["archive_root"]) / session.campaign["id"] / "retained/native-2000.json").read_bytes() == b"{}"
 
