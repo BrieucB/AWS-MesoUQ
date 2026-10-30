@@ -105,3 +105,45 @@ test('logout during a preflight renewal cannot restore bearer memory or send the
   await assert.rejects(request,/expired/);
   assert.equal(requests,0);assert.equal(api.token,'');assert.equal(api.authFailed,true);
 });
+
+test('postflight legacy expiry rejects a delayed result even with an ensure callback',async()=>{
+  const originalNow=Date.now;let now=1800000000000,reads=0,ensures=0,invalidations=0;
+  Date.now=()=>now;
+  const session={token:'legacy-memory-token',expiresAt:now+1000};
+  const api=new Api(config,session.token,async()=>{
+    reads++;now=session.expiresAt+1;return response({private:'late-result'});
+  },{...session,ensureSession:async()=>{ensures++;return session;},onUnauthorized:()=>invalidations++});
+  try{
+    await assert.rejects(api.request('/v1/results'),/expired/);
+    assert.equal(reads,1);assert.equal(ensures,2);assert.equal(invalidations,1);assert.equal(api.token,'');
+  }finally{Date.now=originalNow;}
+});
+test('postflight expired short grant renews authentication without replaying a successful mutation',async()=>{
+  const originalNow=Date.now;let now=1800000000000,writes=0,ensures=0;
+  Date.now=()=>now;
+  const initial={token:'initial',expiresAt:now+1000,renewable:true};
+  const renewed={...initial,token:'renewed',expiresAt:now+300000};
+  const api=new Api(config,initial.token,async()=>{
+    writes++;now=initial.expiresAt+1;return response({id:'already-created'});
+  },{...initial,ensureSession:async()=>++ensures===1?initial:renewed});
+  try{
+    assert.deepEqual(await api.request('/v1/campaigns',{idempotency_key:'single-intent'}),{id:'already-created'});
+    assert.equal(writes,1);assert.equal(ensures,2);assert.equal(api.token,'renewed');assert.equal(api.authFailed,false);
+  }finally{Date.now=originalNow;}
+});
+test('postflight transient auth failure preserves memory and never replays the completed mutation',async()=>{
+  const originalNow=Date.now;let now=1800000000000,writes=0,ensures=0,invalidations=0;
+  Date.now=()=>now;
+  const session={token:'retained',expiresAt:now+1000,renewable:true};
+  const api=new Api(config,session.token,async()=>{
+    writes++;now=session.expiresAt+1;return response({id:'already-created'});
+  },{...session,onUnauthorized:()=>invalidations++,ensureSession:async()=>{
+    if(++ensures===1)return session;
+    throw Object.assign(Error('Provider temporarily unavailable'),{status:503});
+  }});
+  try{
+    await assert.rejects(api.request('/v1/campaigns',{idempotency_key:'single-intent'}),error=>error.status===503);
+    assert.equal(writes,1);assert.equal(ensures,2);assert.equal(invalidations,0);
+    assert.equal(api.token,'retained');assert.equal(api.authFailed,false);
+  }finally{Date.now=originalNow;}
+});

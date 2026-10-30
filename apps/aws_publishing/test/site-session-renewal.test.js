@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {SiteSession} from '../src/site-session.js';
+import {Api} from '../src/client.js';
 
 const response=(data,status=200,headers={})=>({ok:status>=200&&status<300,status,json:async()=>data,headers:{get:name=>headers[name]??null}});
 const settle=async()=>{for(let i=0;i<20;i++)await Promise.resolve();};
@@ -161,4 +162,54 @@ test('an older server generation cannot replace a newer accepted token',async()=
     assert.equal(await h.manager.ensure({force:true}),current);
     assert.equal(h.manager.session.token,'synthetic-10');assert.equal(h.updates.length,1);
   }finally{h.manager.dispose();}
+});
+
+test('cached idle snapshot is revalidated after another tab extended the server session',async()=>{
+  const h=harness({refresh:(_activity,_n,{grant,clock})=>response({
+    ...grant(1,'same-family-new-idle'),expires_at:(clock.time+300000)/1000,
+    idle_expires_at:Math.min(h.absolute,clock.time+7*86400000)/1000,
+  })});try{
+    const old=await h.manager.bootstrap();h.clock.time=old.idleExpiresAt+1000;
+    assert.equal(h.manager.isActive(),true,'A stale idle snapshot cannot clear the current form');
+    const session=await h.manager.ensure();
+    assert.equal(session.token,'same-family-new-idle');assert.ok(session.idleExpiresAt>old.idleExpiresAt);
+    assert.deepEqual(refreshes(h).map(x=>JSON.parse(x.options.body)),[{activity:false}]);
+    assert.equal(session.absoluteExpiresAt,old.absoluteExpiresAt);assert.equal(h.ends.length,0);
+  }finally{h.manager.dispose();}
+});
+test('activity renewal crossing the superseded idle end accepts its successful same-epoch response',async()=>{
+  let finish;const pending=new Promise(resolve=>finish=resolve);
+  const h=harness({refresh:()=>pending});try{
+    const old=await h.manager.bootstrap();h.clock.time=old.idleExpiresAt-1000;
+    const request=h.manager.renew({sequence:1,at:h.clock.time});await settle();
+    assert.equal(JSON.parse(refreshes(h)[0].options.body).activity,true);
+    h.clock.time=old.idleExpiresAt+1000;
+    finish(response({...h.grant(1,'activity-renewed'),expires_at:(h.clock.time+300000)/1000,
+      idle_expires_at:Math.min(h.absolute,old.idleExpiresAt-1000+7*86400000)/1000}));
+    const session=await request;
+    assert.equal(session.token,'activity-renewed');assert.equal(h.manager.closed,false);
+    assert.ok(session.idleExpiresAt>old.idleExpiresAt);assert.equal(session.absoluteExpiresAt,old.absoluteExpiresAt);
+    assert.equal(h.ends.length,0);
+  }finally{h.manager.dispose();}
+});
+test('server idle rejection remains definitive after passive stale-snapshot revalidation',async()=>{
+  const h=harness({refresh:()=>response({error:{code:'session_expired'}},401)});try{
+    const old=await h.manager.bootstrap();h.clock.time=old.idleExpiresAt+1000;
+    await assert.rejects(h.manager.ensure(),error=>error.authEnded);
+    assert.deepEqual(refreshes(h).map(x=>JSON.parse(x.options.body)),[{activity:false}]);
+    assert.equal(h.manager.closed,true);assert.equal(h.manager.session,null);assert.equal(h.ends.length,1);
+  }finally{h.manager.dispose();}
+});
+test('postflight remembered absolute cap blocks late data even when the expiry timer is delayed',async()=>{
+  const originalNow=Date.now,h=harness({limit:120000});let reads=0,invalidations=0;
+  Date.now=()=>h.clock.time;
+  try{
+    const session=await h.manager.bootstrap();
+    const api=new Api({apiBaseUrl:'https://api.example.test'},session.token,async()=>{
+      reads++;h.clock.time=h.absolute+1;return response({private:'late-result'});
+    },{...session,onUnauthorized:()=>invalidations++,ensureSession:options=>h.manager.ensure(options)});
+    await assert.rejects(api.request('/v1/results'),error=>error.authEnded||/expired/.test(error.message));
+    assert.equal(reads,1);assert.equal(invalidations,1);assert.equal(api.authFailed,true);
+    assert.equal(h.manager.closed,true);assert.equal(h.ends.length,1);assert.equal(refreshes(h).length,0);
+  }finally{Date.now=originalNow;h.manager.dispose();}
 });

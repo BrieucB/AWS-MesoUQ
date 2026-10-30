@@ -28,7 +28,11 @@ Background renewal cannot keep an idle browser alive indefinitely.
 
 A 409 refresh_in_progress response gets one bounded Retry-After retry. Network
 or provider failures retain the current form and memory session and use bounded
-backoff. A definitive 401 or 403, or the remembered policy boundary, ends renewal.
+backoff. A definitive 401 or 403, or the immutable absolute boundary, ends
+renewal. A cached idle end is only a snapshot: another tab may have extended the
+same server session. Crossing that snapshot triggers passive BFF revalidation,
+and the server rejects a genuinely idle-expired family. An accepted response
+can replace the superseded idle end even if it arrives after that old boundary.
 Nonremembered sessions retain their original five-minute expiry.
 
 ## App state and mutation safety
@@ -40,7 +44,10 @@ The app shows a separate connection notice without rebuilding the form.
 An authenticated GET rejected with 401 may renew and retry once. Business POST,
 PUT and DELETE requests are never automatically replayed. Existing submission
 idempotency keys and uncertainty handling remain in place. A mutation waiting for
-preflight renewal is blocked if logout occurs before transmission.
+preflight renewal is blocked if logout occurs before transmission. Responses
+arriving after their short grant also pass the auth barrier before publication;
+legacy expiry, absolute expiry and logout still block the result when a timer
+has been delayed. This postflight barrier cannot retransmit a business mutation.
 
 A local epoch, aborted fetches, and server generation checks discard late replies.
 BroadcastChannel sends only a logout signal to other tabs, which immediately clear
@@ -57,7 +64,9 @@ and selected Benchmark Lab campaign retention.
 Within an allocated Karolina QA job, run the frontend package's Node test suite.
 For actual synthetic browser checks, start test/visual-server.mjs with
 MESOUQ_VISUAL_FIXTURES=1, then run test/firefox_session.py with /usr/bin/python3.11.
-The Firefox test uses its own temporary profile and loopback fixtures. It checks
+Set MESOUQ_SESSION_FIREFOX to an absolute executable shared Firefox path when
+/usr/bin/firefox is unavailable on compute nodes; the resolved binary is recorded
+in its evidence. The test uses its own temporary profile and loopback fixtures. It checks
 real trusted browser input, passive renewal, file/units retention, cold entry and
 cross-tab logout. Its screenshot and JSON evidence explicitly identify synthetic
 data. It never logs in to AWS, Cognito or an HPC service. All fixture files are

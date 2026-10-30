@@ -51,7 +51,11 @@ export class Api {
         }
         this.invalidate();throw Error('Your site session expired. Sign in again.');
       }
-      if(!this.ensureSession&&Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}
+      // A delayed fetch/JSON task can outlive its grant before a timer runs.
+      // Revalidate policy before publishing its result; ready() may renew auth
+      // but never replays this already-sent business request.
+      if(Date.now()>=this.expiresAt)await this.ready();
+      if(this.authFailed||version!==this.authVersion)throw Error('Your site session expired. Sign in again.');
       if(!response.ok)throw Error(data?.error?.message||'Request failed ('+response.status+').');
       return data;
     }

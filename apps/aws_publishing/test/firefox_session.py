@@ -8,11 +8,15 @@ import ast, base64, json, os, pathlib, socket, subprocess, tempfile, time
 output=pathlib.Path(os.environ.get("MESOUQ_SESSION_BROWSER_OUTPUT","/tmp/aws-mesouq-session-browser"))
 output.mkdir(parents=True,exist_ok=True)
 base=os.environ.get("MESOUQ_VISUAL_BASE_URL","http://127.0.0.1:4173")
+firefox=pathlib.Path(os.environ.get("MESOUQ_SESSION_FIREFOX","/usr/bin/firefox"))
+if not firefox.is_absolute() or not firefox.is_file() or not os.access(firefox,os.X_OK):
+    raise RuntimeError("An absolute executable MESOUQ_SESSION_FIREFOX is required")
+firefox=firefox.resolve(strict=True)
 temporary=tempfile.TemporaryDirectory(prefix="mesouq-session-browser-")
 profile=pathlib.Path(temporary.name)
 (profile/"user.js").write_text('user_pref("marionette.port", 2830);\nuser_pref("browser.shell.checkDefaultBrowser", false);\nuser_pref("datareporting.healthreport.uploadEnabled", false);\nuser_pref("toolkit.telemetry.enabled", false);\n')
 log=open(output/"firefox-session.log","w")
-process=subprocess.Popen(["/usr/bin/firefox","--headless","--no-remote","--profile",str(profile),"--marionette","--remote-allow-system-access"],stdout=log,stderr=log)
+process=subprocess.Popen([str(firefox),"--headless","--no-remote","--profile",str(profile),"--marionette","--remote-allow-system-access"],stdout=log,stderr=log)
 sock=None
 try:
     for _ in range(150):
@@ -89,6 +93,7 @@ try:
     assert not signed_out["privateForm"] and not signed_out["account"] and not signed_out["redirected"]
     (output/"session-browser-evidence.json").write_text(json.dumps({
         "synthetic_fixture_only":True,"live_authentication_verified":False,"aws_or_hpc_calculation_submitted":False,
+        "firefox_binary":str(firefox),
         "passive_refresh_preserves_units_and_file_preview":True,"passive_refresh_does_not_extend_idle":True,
         "trusted_browser_input_touches_idle_only":True,"no_browser_auth_storage":True,
         "cold_entry_resumes_with_passive_post":True,"cross_tab_logout_clears_private_view":True,

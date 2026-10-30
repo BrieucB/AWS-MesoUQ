@@ -31,7 +31,10 @@ export class SiteSession {
   }
   isActive(){
     if(this.closed||!this.session)return false;
-    const limit=this.session.renewable?Math.min(this.session.absoluteExpiresAt,this.session.idleExpiresAt):this.session.expiresAt;
+    // Another tab can extend this SID's server-side idle end. Only the
+    // immutable absolute cap (or a legacy grant) can end memory state locally;
+    // an expired idle snapshot must be revalidated by a passive BFF refresh.
+    const limit=this.session.renewable?this.session.absoluteExpiresAt:this.session.expiresAt;
     return this.now()<limit;
   }
   foreground(){return !this.document?.hidden&&this.document?.hasFocus?.()!==false;}
