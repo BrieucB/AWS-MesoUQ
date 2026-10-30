@@ -56,3 +56,34 @@ allocation charged and reported. Synthetic checks alone do not qualify the
 browser-to-Karolina benchmark.
 
 [Slurm native start/end environment variables](https://slurm.schedmd.com/sbatch.html)
+
+## Portable termination and group ownership
+
+Cleanup has one four-second monotonic budget, including process metadata and
+reaping, within the existing five-second watchdog margin. The supervisor checks
+Linux/macOS process-control capabilities and default SIGCHLD before launching a
+scientific child. Before the first group signal, waitpid with WNOHANG must prove
+a live owned child whose PID, process group and session identify the private
+group. An already exited/reaped child or ambiguous ownership fails closed
+without signalling a potentially recycled group.
+
+After SIGTERM, the supervisor keeps the owned leader unreaped through the
+bounded grace period and SIGKILL. A TERM-resistant descendant therefore still
+receives escalation when its leader exits. Only after the final group signal
+and bounded confirmation of no live members does the supervisor reap its child.
+
+Darwin can report EPERM for a group containing only zombies. This is accepted
+only when bounded exact-group metadata proves every member is a zombie, or a
+zero-signal probe proves that the group no longer exists. Live members, foreign
+ownership, malformed/partial/oversized output, missing tools and denied metadata
+remain failures. Process metadata requests contain PID, PGID, state and UID;
+they contain neither command lines nor environments.
+
+The selectors intentionally differ: Apple ps uses `-g PGID`, whereas procps uses
+the documented negative numeric PGID selector. Linux `-g` selects sessions and
+is unsuitable here. Python waitid/WNOWAIT is not assumed available on macOS.
+
+Sources: [Apple ps manual](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/ps.1),
+[procps ps manual](https://github.com/procps-ng/procps/blob/master/man/ps.1),
+[Python3.11 process waits](https://docs.python.org/3.11/library/os.html#os.waitpid),
+[Apple XNU group signalling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
