@@ -21,8 +21,10 @@ additional ceiling. These margins consume the existing allocation; no new GPU
 budget is added.
 
 The adapter supervises the scientific child in a private process group until
-five seconds before the hard end. A timeout terminates and, if necessary, kills
-the group. This bounds cooperative work and provides fail-stop behavior for a
+five seconds before the hard end. A timeout or supervisor SIGTERM/SIGINT terminates and, if necessary, kills
+the group. Startup before adapter entry is bounded by Slurm itself; it has no
+independent adapter watchdog. A finite startup delay consumes the absolute
+deadline, while hung setup can still end in an honestly accounted native TIMEOUT. This bounds cooperative work and provides fail-stop behavior for a
 hung native operation. It cannot guarantee a valid checkpoint or receipt after
 arbitrary filesystem, GPU or process failure. Native Slurm state and actual
 allocated accounting remain authoritative; a TIMEOUT is never a successful

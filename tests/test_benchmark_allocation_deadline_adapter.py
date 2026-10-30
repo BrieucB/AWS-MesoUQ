@@ -206,3 +206,58 @@ def test_exact_legacy_adapter_remains_bundled():
     assert adapter_snapshot(current) == Path(adapter.__file__).read_bytes()
     with pytest.raises(ValueError, match="unsupported"):
         adapter_snapshot("0" * 64)
+
+
+def test_supervisor_sigterm_stops_its_separate_scientific_group(tmp_path):
+    if not hasattr(adapter, "run_science"):
+        pytest.skip("allocation supervisor introduced with clock policy")
+    pid_path = tmp_path / "scientific-processes.json"
+    child_code = "import time;time.sleep(30)"
+    science_code = (
+        "import subprocess,sys,time,pathlib,json,os;"
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+        f"pathlib.Path({str(pid_path)!r}).write_text(json.dumps({{'science':os.getpid(),'descendant':p.pid}}));"
+        "time.sleep(30)"
+    )
+    supervisor_code = (
+        "import sys,time;from aws_mesouq.adapters import benchmark as a;"
+        f"command=[sys.executable,'-c',{science_code!r}];"
+        "\ntry:\n"
+        f" a.run_science(command,{str(tmp_path)!r},time.time()+20)\n"
+        "except BaseException as error:\n"
+        " raise SystemExit(128+getattr(error,'signum',0))\n"
+    )
+    supervisor = subprocess.Popen([sys.executable, "-c", supervisor_code], start_new_session=True)
+    pids = {}
+    states = []
+    try:
+        until = time.monotonic() + 5
+        while not pid_path.exists() and time.monotonic() < until:
+            if supervisor.poll() is not None:
+                break
+            time.sleep(0.02)
+        assert pid_path.exists(), "scientific subprocess did not start"
+        pids = json.loads(pid_path.read_text())
+        os.killpg(supervisor.pid, signal.SIGTERM)
+        returncode = supervisor.wait(timeout=5)
+        for pid in pids.values():
+            try:
+                state = subprocess.check_output(["ps", "-o", "stat=", "-p", str(pid)], text=True).strip()
+            except subprocess.CalledProcessError:
+                state = ""
+            states.append(state)
+        assert returncode == 128 + signal.SIGTERM
+        assert all(not value or value.startswith("Z") for value in states)
+    finally:
+        # The old-source regression intentionally leaves descendants alive.
+        if pids:
+            try:
+                os.killpg(pids["science"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if supervisor.poll() is None:
+            try:
+                os.killpg(supervisor.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            supervisor.wait(timeout=2)

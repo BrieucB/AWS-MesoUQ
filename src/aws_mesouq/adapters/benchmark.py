@@ -128,21 +128,60 @@ def _stop_group(process):
     process.wait(timeout=2)
 
 
+class AdapterInterrupted(RuntimeError):
+    """A native termination signal must also stop the owned scientific group."""
+
+    def __init__(self, signum):
+        super().__init__("Benchmark adapter interrupted by signal " + str(signum))
+        self.signum = signum
+
+
 def run_science(command, repository, watchdog_deadline):
     deadline = watchdog_deadline if isinstance(watchdog_deadline, _Deadline) else _Deadline(watchdog_deadline)
     _remaining(deadline)
-    # A private process group also includes local MPI/scientific descendants.
-    process = subprocess.Popen(command, cwd=repository, start_new_session=True)
+    process = None
+    launching = True
+    stopping = False
+    pending_signal = None
+    previous = {}
+
+    def interrupted(signum, frame):
+        nonlocal pending_signal, stopping
+        if launching or stopping:
+            # Finish acquiring the child's PID before cleanup; repeated signals
+            # cannot interrupt the bounded TERM/KILL/reap sequence.
+            pending_signal = signum
+            return
+        stopping = True
+        raise AdapterInterrupted(signum)
+
     try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupted)
+        # A private group contains the local scientific/MPI descendants.
+        process = subprocess.Popen(command, cwd=repository, start_new_session=True)
+        launching = False
+        if pending_signal is not None:
+            stopping = True
+            raise AdapterInterrupted(pending_signal)
         result = process.wait(timeout=_remaining(deadline))
         _remaining(deadline)
         return result
     except subprocess.TimeoutExpired as error:
-        _stop_group(process)
+        stopping = True
+        if process is not None:
+            _stop_group(process)
         raise AllocationDeadlineExceeded("Scientific process reached its native allocation deadline") from error
     except BaseException:
-        _stop_group(process)
+        stopping = True
+        if process is not None:
+            _stop_group(process)
         raise
+    finally:
+        stopping = True
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def execute(manifest_path):
@@ -203,7 +242,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
     args = parser.parse_args(argv)
-    return execute(args.manifest)
+    try:
+        return execute(args.manifest)
+    except AdapterInterrupted as error:
+        return 128 + error.signum
 
 
 if __name__ == "__main__":
