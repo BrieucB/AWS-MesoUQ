@@ -19,9 +19,13 @@ CONFIG = "runtime-config.json"
 BENCHMARK_NEW_KEYS = ("src/benchmark-figures.js", "src/benchmark-lab.js", "src/benchmark-lab.css")
 BENCHMARK_BASE_KEYS = (*BASE_KEYS, "src/posterior.js")
 BENCHMARK_ORDER = (*BENCHMARK_NEW_KEYS, "src/app.js", "index.html")
+REMEMBERED_BASE_KEYS = (*BENCHMARK_BASE_KEYS, *BENCHMARK_NEW_KEYS)
+REMEMBERED_NEW_KEYS = ("src/site-session.js",)
+REMEMBERED_ORDER = (*REMEMBERED_NEW_KEYS, "src/client.js", "src/style.css", "src/app.js")
 PROFILES = {
     "posterior": (BASE_KEYS, (ORDER[0],), ORDER),
     "benchmark": (BENCHMARK_BASE_KEYS, BENCHMARK_NEW_KEYS, BENCHMARK_ORDER),
+    "remembered-session": (REMEMBERED_BASE_KEYS, REMEMBERED_NEW_KEYS, REMEMBERED_ORDER),
 }
 
 
