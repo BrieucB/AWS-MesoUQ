@@ -89,3 +89,40 @@ A trusted scheduler JSON supports `partition`, `account`, `qos`, `gres`,
 and checks the actual CPU allocation before scientific work. Lost submission
 acknowledgements reconcile the unique own-user scheduler marker and never issue
 a second `sbatch`. Ambiguous scheduler identity requires operator reconciliation.
+
+## Benchmark execution-context upgrades
+
+Keep the existing enrolled journal, device key, and original --operator-config.
+An upgraded SDK can read a separate trusted registry from
+AWS_MESOUQ_BENCHMARK_CONTEXT_REGISTRY; this also works when an existing launcher
+constructs BenchmarkWorker directly. The registry must be a canonical absolute
+path to an owner-only 0600 regular file, with no symlinks or additional hard links.
+Its exact fields are schema (aws_mesouq.benchmark_context_registry.v1),
+legacy_operator (the unchanged complete original operator), and contexts
+(a list of one to fifteen new entries). Each entry has the full validated operator
+and runtime_clock_policy: allocation_deadline_v1. All entries share the verified
+HPC account and login host. The new deadline policy requires the new bundled
+adapter; it cannot be assigned to the legacy adapter.
+
+The backend freezes an operator execution-context ID in each new campaign.
+The SDK advertises only its trusted context IDs in its signed claim, before
+the server grants a lease or reserves computation. The complete unsigned claim
+or refresh body is journaled before transmission and reused after an ambiguous
+response. A pending request created before the upgrade retains its original
+selector-free body and request ID.
+
+Normal SDK startup validates and atomically migrates only the benchmark journal
+namespace. Flat stage/campaign records, aggregate concurrency, submission markers,
+attempts, pending events, upload reservations and archive event IDs remain in
+place. The complete legacy context is retained verbatim and each record gains
+an immutable context binding. The version marker makes an old SDK refuse this
+namespace. Keep all referenced operators in the external registry; removing the
+registry or changing a stored context fails closed. Do not hand-edit or reset the
+journal to downgrade a binary.
+
+Legacy stages retain their original adapter, script and source/environment pins.
+New stages capture the native Slurm job ID, start and deadline before loading
+the environment. Their immutable manifest also binds the allocated walltime.
+This gives the adapter and scientific runner one allocation-wide deadline without
+increasing the method allowance. A native TIMEOUT remains a native failure even
+when a retained scientific receipt says completed; it is not an accuracy verdict.

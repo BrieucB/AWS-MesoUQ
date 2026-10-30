@@ -65,9 +65,13 @@ def session(tmp_path):
     environment = tmp_path / "runtime.sh"
     environment.write_text("true\n")
     os.chmod(environment, 0o600)
-    adapter = Path(__file__).parents[2] / "src/aws_mesouq/adapters/benchmark.py"
+    import aws_mesouq.adapters as adapter_catalog
+    if hasattr(adapter_catalog, "LEGACY_BENCHMARK_ADAPTER_SHA256"):
+        adapter = adapter_catalog.adapter_snapshot(adapter_catalog.LEGACY_BENCHMARK_ADAPTER_SHA256)
+    else:
+        adapter = Path(adapter_catalog.__file__).with_name("benchmark.py").read_bytes()
     operator = {
-        "repository": str(repository), "science_revision": "a" * 40, "adapter_sha256": hashlib.sha256(adapter.read_bytes()).hexdigest(),
+        "repository": str(repository), "science_revision": "a" * 40, "adapter_sha256": hashlib.sha256(adapter).hexdigest(),
         "python_bin": "/usr/bin/python3.11", "environment_script": str(environment), "environment_sha256": hashlib.sha256(environment.read_bytes()).hexdigest(),
         "run_root": str(run), "archive_root": str(archive), "expected_user": "fixtureuser", "expected_host": "fixture.cluster",
         "scheduler": {"account": "fixture-account", "partition": "qgpu_exp", "qos": "fixture-qos", "cpus-per-task": 4, "mem": "16G"},
