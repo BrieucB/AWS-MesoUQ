@@ -2,15 +2,17 @@
 
 import base64
 import json
-from urllib.parse import parse_qs, urlsplit
+import re
+from urllib.parse import parse_qs, urlsplit, urlencode
 
 import jwt
 import pytest
 from cryptography.exceptions import InvalidSignature
+from cryptography.fernet import InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from aws_publishing.site_auth import SiteAuth, Cognito, FLOW, SESSION, EDGE_COOKIES
+from aws_publishing.site_auth import SiteAuth, Cognito, FLOW, SESSION, EDGE_COOKIES, INTENT, REMEMBERED
 
 
 class FakeCognito:
@@ -62,7 +64,14 @@ def event(path, method="GET", *, cookies=(), query="", headers=None):
 
 
 def login(auth):
-    response = auth.handle(event("/auth/login"))
+    landing = auth.handle(event("/auth/login"))
+    assert landing["statusCode"] == 200
+    nonce = re.search('name="csrf" value="([^"]+)"',landing["body"])[1]
+    intent = next(c.split(";",1)[0] for c in landing["cookies"] if c.startswith(INTENT+"="))
+    request = event("/auth/login","POST",cookies=[intent],
+        headers={"Origin":auth.base,"Content-Type":"application/x-www-form-urlencoded"})
+    request["body"] = urlencode({"csrf":nonce})
+    response = auth.handle(request)
     assert response["statusCode"] == 302
     query = parse_qs(urlsplit(response["headers"]["location"]).query)
     auth.cognito.nonce = query["nonce"][0]
@@ -123,7 +132,7 @@ def test_callback_signatures_exact_resource_and_encrypted_token_custody(auth):
     assert all(
         "Max-Age=" not in value and "Expires=" not in value
         for value in response["cookies"]
-        if not value.startswith(FLOW + "=")
+        if not value.startswith(FLOW + "=") and "Max-Age=0" not in value
     )
     session = auth.handle(
         event("/auth/session", cookies=[SESSION + "=" + values[SESSION]])
@@ -194,7 +203,7 @@ def test_logout_origin_and_complete_cookie_clear(auth):
     )
     response = auth.handle(event("/auth/logout", "POST", headers={"Origin": auth.base}))
     assert response["statusCode"] == 200
-    assert len(response["cookies"]) == len(EDGE_COOKIES) + 2
+    assert len(response["cookies"]) == len(EDGE_COOKIES) + 4
     assert all("Max-Age=0" in value for value in response["cookies"])
     target = parse_qs(urlsplit(json.loads(response["body"])["logout_url"]).query)
     assert target["logout_uri"] == [auth.base + "/auth/login"]
@@ -255,3 +264,16 @@ def test_token_exchange_rejects_expired_code_without_provider_body(monkeypatch):
             "one-use-code", "verifier", "https://private.cloudfront.net/auth/callback"
         )
     assert "sensitive" not in str(caught.value)
+
+
+def test_sealed_cookie_rejects_appended_data_for_every_base64_padding_length(auth):
+    tokens=[auth.seal({"expires_at":2000,"padding":"x"*size}) for size in (0,16,32)]
+    assert len({len(value)-len(value.rstrip("=")) for value in tokens})==3
+    for value in tokens:
+        assert auth.unseal(value)["expires_at"]==2000
+        for suffix in ("tamper","=","A","AA"):
+            with pytest.raises((ValueError,InvalidToken)):
+                auth.unseal(value+suffix)
+    for value in ("é"*20,"x"*8193):
+        with pytest.raises(ValueError):
+            auth.unseal(value)

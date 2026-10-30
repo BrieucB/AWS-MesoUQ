@@ -6,6 +6,8 @@ output "website_bucket" { value = aws_s3_bucket.web.id }
 output "ecr_repository" { value = aws_ecr_repository.backend.repository_url }
 output "github_publish_role_arn" { value = aws_iam_role.github.arn }
 output "cognito_user_pool_id" { value = aws_cognito_user_pool.users.id }
+# Native connector/legacy clients keep this original one-day-refresh client ID.
 output "cognito_client_id" { value = aws_cognito_user_pool_client.browser.id }
+output "cognito_remembered_web_client_id" { value = aws_cognito_user_pool_client.remembered_web.id }
 output "cognito_domain" { value = "https://${aws_cognito_user_pool_domain.users.domain}.auth.${var.region}.amazoncognito.com" }
 output "state_table" { value = aws_dynamodb_table.state.name }

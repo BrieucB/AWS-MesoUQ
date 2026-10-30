@@ -4,6 +4,20 @@ const preset=await (await fetch('/presets/indentation-v1.json')).json();
 const CANONICAL_PROFILE=preset.scientific_profile;
 const fixtureModel={model_version:'test-sonovue-canonical-v1',status:'released',description:'SYNTHETIC canonical registry fixture; no live validation claim',provenance:{test_fixture:true,pipeline_binding:{id:CANONICAL_PROFILE,verification_scope:'SYNTHETIC fixture; no artifact verification'}}};
 const requestedView=new URL(location.href).searchParams.get('view');
+const rememberedFixture=new URL(location.href).searchParams.get('remembered')==='1';
+const coldFixture=new URL(location.href).searchParams.get('cold')==='1';
+const fixtureBirth=Date.now();let fixtureNow=null,fixtureGeneration=0;
+let fixtureIdle=fixtureBirth+7*86400000;
+const fixtureAbsolute=fixtureBirth+30*86400000;
+if(rememberedFixture){
+  const originalNow=Date.now;Date.now=()=>fixtureNow??originalNow();
+  window.__mesouqSessionFixture={calls:[],limits(){return {idle:fixtureIdle,absolute:fixtureAbsolute,generation:fixtureGeneration};},advance(ms){fixtureNow=Date.now()+ms;},
+    resume(){window.dispatchEvent(new Event('pageshow'));}};
+}
+const fixtureSession=()=>({access_token:'TEST-ONLY-NONFUNCTIONAL-TOKEN-'+fixtureGeneration,
+  expires_at:Math.min(Date.now()+300000,fixtureIdle,fixtureAbsolute)/1000,
+  ...(rememberedFixture?{renewable:true,absolute_expires_at:fixtureAbsolute/1000,
+    idle_expires_at:fixtureIdle/1000,generation:fixtureGeneration}:{})});
 const banner=document.createElement('p');banner.className='visual-test-banner';banner.textContent='TEST FIXTURE · Synthetic API/auth/scientific data · No live AWS or HPC execution';document.body.prepend(banner);
 const css=document.createElement('link');css.rel='stylesheet';css.href='/test/browser-fixture.css';document.head.append(css);
 const sampleForce=Array.from({length:32},(_,i)=>i*0.5);
@@ -39,9 +53,18 @@ const config={apiBaseUrl:location.origin+'/test-api',cognitoDomain:location.orig
 const nativeFetch=window.fetch.bind(window);
 window.fetch=async(input,options={})=>{
   const url=new URL(String(input),location.href);let data;
+  if(rememberedFixture)window.__mesouqSessionFixture.calls.push({path:url.pathname,method:options.method||'GET',...(url.pathname==='/auth/refresh'?{activity:JSON.parse(options.body).activity}:{})});
   if(url.pathname.endsWith('/runtime-config.json'))data=config;
   else if(url.pathname.endsWith('/presets/indentation-v1.json'))data=preset;
-  else if(url.pathname==='/auth/session')data={access_token:'TEST-ONLY-NONFUNCTIONAL-TOKEN',expires_at:Math.floor(Date.now()/1000)+300};
+  else if(url.pathname==='/auth/session'){
+    if(rememberedFixture&&coldFixture&&fixtureGeneration===0)return new Response(JSON.stringify({error:{code:'refresh_required'}}),{status:401,headers:{'Content-Type':'application/json'}});
+    data=fixtureSession();
+  }else if(url.pathname==='/auth/refresh'){
+    const body=JSON.parse(options.body);
+    if(Object.keys(body).join(',')!=='activity'||typeof body.activity!=='boolean')throw Error('Synthetic refresh contract mismatch');
+    if(body.activity)fixtureIdle=Math.min(fixtureAbsolute,Date.now()+7*86400000);
+    fixtureGeneration++;data=fixtureSession();
+  }
   else if(url.pathname==='/auth/logout')data={logout_url:location.origin+'/logout?client_id=TEST-ONLY-public-client&logout_uri='+encodeURIComponent(location.origin+'/auth/login')};
   else if(url.pathname.endsWith('/v1/me'))data={subject:'test-researcher',email:'researcher@example.test',roles:['maintainer']};
   else if(url.pathname.endsWith('/v1/projects'))data={projects:[{id:'test-project',name:'Synthetic indentation study',role:'maintainer'}]};

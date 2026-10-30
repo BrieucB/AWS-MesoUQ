@@ -54,6 +54,14 @@ resource "aws_cloudfront_response_headers_policy" "web" {
     }
   }
 }
+# No credential parsing or origin access: only missing-grant root entry routing.
+resource "aws_cloudfront_function" "remembered_entry" {
+  name    = "${var.name}-remembered-entry"
+  runtime = "cloudfront-js-1.0"
+  comment = "Resume remembered browser login when root entry has no signed grants"
+  publish = true
+  code    = file("${path.module}/functions/remembered-entry.js")
+}
 resource "aws_cloudfront_distribution" "web" {
   enabled             = true
   default_root_object = "index.html"
@@ -84,6 +92,13 @@ resource "aws_cloudfront_distribution" "web" {
     response_headers_policy_id = aws_cloudfront_response_headers_policy.web.id
   }
   default_cache_behavior {
+    dynamic "function_association" {
+      for_each = var.remembered_browser_sessions_enabled ? [1] : []
+      content {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.remembered_entry.arn
+      }
+    }
     trusted_key_groups         = [aws_cloudfront_key_group.site.id]
     target_origin_id           = "private-web"
     viewer_protocol_policy     = "redirect-to-https"

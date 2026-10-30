@@ -1,19 +1,22 @@
-import {Api,validateRuntime,readSiteSession,endSiteSession,parseCurve,createJob,terminal,formatTimestamp} from './client.js';
+import {Api,validateRuntime,endSiteSession,parseCurve,createJob,terminal,formatTimestamp} from './client.js';
 import {escapeHtml as h,curvePlot,intervalPlot} from './plots.js';
 import {configurationFor,approvedModel,outputArtifacts} from './defaults.js';
 import {posteriorArtifact,loadPosteriorImage} from './posterior.js';
 import {CurveEditor,editorMarkup,mountEditor} from './curve-editor.js';
 import {BenchmarkLab} from './benchmark-lab.js';
+import {SiteSession} from './site-session.js';
 const app=document.querySelector('#app');
-const state={config:null,preset:null,api:null,me:null,projects:[],project:'',model:'',jobs:[],artifacts:[],preview:null,result:null,posterior:{status:'idle',src:'',error:''},detail:null,loading:false,error:'',notice:'',tab:'workspace',diameter:'3.2',forceUnit:'uN',displacementUnit:'um',order:'force-displacement',submitKey:null,logoutFailed:false};
+const state={config:null,preset:null,api:null,me:null,projects:[],project:'',model:'',jobs:[],artifacts:[],preview:null,result:null,posterior:{status:'idle',src:'',error:''},detail:null,loading:false,error:'',notice:'',tab:'workspace',diameter:'3.2',forceUnit:'uN',displacementUnit:'um',order:'force-displacement',submitKey:null,logoutFailed:false,sessionRenewable:false,sessionNotice:''};
 const drawing=new CurveEditor();
 const benchmarkLab=new BenchmarkLab({context:()=>({api:state.api,project:state.project,valid:currentSession}),onChange:()=>{if(state.tab==='benchmarks'&&state.me)render();},download});
-let expiryTimer,pollTimer,editorController,inputRevision=0;
+let siteSession,pollTimer,editorController,inputRevision=0;
 let posteriorController,posteriorRevision=0,viewRevision=0;
 const option=(value,label,selected)=>`<option value="${h(value)}" ${String(value)===String(selected)?'selected':''}>${h(label)}</option>`;
 function status(value){return `<span class="status ${h(value)}">${h(String(value).replaceAll('_',' '))}</span>`;}
 function download(name,value,type='application/json'){const url=URL.createObjectURL(new Blob([value instanceof Blob||typeof value==='string'?value:JSON.stringify(value,null,2)],{type}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
-function shell(content){return `<div class="layout"><aside><a class="brand" href="./"><span class="mark">μ</span><span>MesoUQ<small>INDENTATION</small></span></a><nav aria-label="Workspace"><button data-action="tab" data-tab="workspace">New analysis</button><button data-action="tab" data-tab="jobs">Calculations</button><button data-action="tab" data-tab="benchmarks">Benchmark Lab</button></nav><div class="side-bottom"><p>Private project · Invited MFA accounts</p><div class="account">${h(state.me?.email||'')}</div>${state.me?'<button class="quiet" data-action="logout">Sign out</button>':''}</div></aside><div class="main"><header>MesoUQ / ${state.tab==='benchmarks'?'Benchmark Lab':'Indentation analysis'}</header><main>${state.error?`<div role="alert" class="alert error" data-app-message>${h(state.error)}</div>`:''}${state.notice?`<div role="status" class="alert" data-app-message>${h(state.notice)}</div>`:''}${content}</main><footer>Approved indentation model · Own-account HPC session</footer></div></div>`;}
+function sessionLabel(){return state.sessionNotice||(state.sessionRenewable?'This browser is remembered. Sign out when finished.':'');}
+function sessionNotice(message=''){state.sessionNotice=message;const note=app.querySelector?.('#session-status');if(note)note.textContent=sessionLabel();}
+function shell(content){return `<div class="layout"><aside><a class="brand" href="./"><span class="mark">μ</span><span>MesoUQ<small>INDENTATION</small></span></a><nav aria-label="Workspace"><button data-action="tab" data-tab="workspace">New analysis</button><button data-action="tab" data-tab="jobs">Calculations</button><button data-action="tab" data-tab="benchmarks">Benchmark Lab</button></nav><div class="side-bottom"><p>Private project · Invited MFA accounts</p><div class="account">${h(state.me?.email||'')}</div>${state.me?'<button class="quiet" data-action="logout">Sign out</button>':''}</div></aside><div class="main"><header>MesoUQ / ${state.tab==='benchmarks'?'Benchmark Lab':'Indentation analysis'}</header><main><p id="session-status" class="session-note" role="status">${h(sessionLabel())}</p>${state.error?`<div role="alert" class="alert error" data-app-message>${h(state.error)}</div>`:''}${state.notice?`<div role="status" class="alert" data-app-message>${h(state.notice)}</div>`:''}${content}</main><footer>Approved indentation model · Own-account HPC session</footer></div></div>`;}
 function intro(title,subtitle){return `<div class="page-heading"><div><h1>${h(title)}</h1><p>${h(subtitle)}</p></div></div>`;}
 function loginView(){return shell(`${intro('Private research workspace','Sign in with your invited account. The hosted identity flow requires MFA.')}<button class="primary" data-action="login">Sign in securely</button>${state.logoutFailed?'<button class="secondary" data-action="logout">Retry sign-out</button>':''}`);}
 function projectSelect(){return `<label>Project<select id="project" ${state.loading?'disabled':''}>${state.projects.map(p=>option(p.id,p.name,state.project)).join('')}</select></label>`;}
@@ -28,7 +31,8 @@ function resetPosterior(){
 function leaveResult(){viewRevision++;resetPosterior();}
 function currentSession(api){
   if(api!==state.api||!state.me)return false;
-  if(api.authFailed||Date.now()>=api.expiresAt){expireSiteSession();return false;}
+  if(api.authFailed||(!api.renewable&&Date.now()>=api.expiresAt)||(!siteSession?.isActive())){expireSiteSession();return false;}
+  if(api.renewable&&Date.now()>=api.expiresAt)void siteSession.ensure().catch(()=>{});
   return true;
 }
 function posteriorPanel(){
@@ -117,7 +121,7 @@ function resetProject(){benchmarkLab.reset();leaveResult();clearInput();drawing.
 app.addEventListener('change',event=>{const {id,value,files}=event.target;if(id==='project'){busy(async()=>{state.project=value;resetProject();await loadProject();if(state.tab==='benchmarks')void benchmarkLab.enter();});return;}if(['diameter','forceUnit','displacementUnit','order'].includes(id)){if(state.loading)return;state[id]=value;clearInput();drawing.reset();render();return;}if(id==='file'&&files?.[0])busy(()=>prepareCurve(files[0]));});
 app.addEventListener('click',event=>{const button=event.target.closest('[data-action]');if(!button||button.disabled)return;const action=button.dataset.action;
 if(action==='login'){location.assign('/auth/login');return;}
-if(action==='logout'){const config=state.config;clearSiteMemory();state.loading=true;render();endSiteSession(config).then(url=>location.assign(url)).catch(error=>{state.logoutFailed=true;state.error=`Site cookies could not be cleared. Retry sign-out. ${error.message}`;}).finally(()=>{state.loading=false;render();});return;}
+if(action==='logout'){const config=state.config;siteSession?.end({reason:'signed_out',broadcast:true});clearSiteMemory();state.loading=true;render();endSiteSession(config).then(url=>location.assign(url)).catch(error=>{state.logoutFailed=true;state.error=`Site cookies could not be cleared. Retry sign-out. ${error.message}`;}).finally(()=>{state.loading=false;render();});return;}
 if(action==='tab'){benchmarkLab.leave();leaveResult();state.tab=button.dataset.tab;state.detail=null;state.result=null;render();if(state.tab==='benchmarks')void benchmarkLab.enter();return;}
 if(action==='back'){leaveResult();state.detail=null;state.result=null;state.tab='jobs';render();return;}
 if(action==='retry-posterior'){void showPosterior();return;}
@@ -133,17 +137,29 @@ if(action==='cancel'){state.detail=await state.api.request(state.api.project(sta
 if(action==='result')await loadScientificResult();
 if(action==='download-artifact'){const data=await state.api.request(state.api.project(state.project,`/artifacts/${encodeURIComponent(button.dataset.id)}`));const url=state.api.validateStorageUrl(data.download_url);const response=await fetch(url,{credentials:'omit',redirect:'error',cache:'no-store'});if(!response.ok)throw Error('Artifact download failed.');download(data.artifact?.name||'artifact',await response.blob(),'application/octet-stream');}
 });});
-function clearSiteMemory(){clearTimeout(expiryTimer);clearInterval(pollTimer);if(state.api){state.api.token='';state.api.authFailed=true;}state.api=null;state.me=null;state.projects=[];state.project='';resetProject();state.notice='';state.error='';state.logoutFailed=false;state.diameter='3.2';state.preset=null;sessionStorage.removeItem('mesouq.oauth');}
+function clearSiteMemory(){siteSession?.dispose();siteSession=null;clearInterval(pollTimer);state.sessionRenewable=false;state.sessionNotice='';if(state.api){state.api.token='';state.api.authFailed=true;}state.api=null;state.me=null;state.projects=[];state.project='';resetProject();state.notice='';state.error='';state.logoutFailed=false;state.diameter='3.2';state.preset=null;sessionStorage.removeItem('mesouq.oauth');}
+function finishSiteSession(reason='expired',error=null){
+  clearSiteMemory();
+  if(reason==='forbidden')state.error=error?.message||'Your invitation is no longer active.';
+  else state.notice=reason==='signed_out'?'This browser was signed out.':'Your private site session expired. Sign in again to continue.';
+  render();if(reason==='expired')location.assign('/auth/login');
+}
 function expireSiteSession(){
-  clearSiteMemory();state.notice='Your private site session expired. Sign in again to continue.';render();location.assign('/auth/login');
+  if(siteSession&&!siteSession.closed)siteSession.end({reason:'expired'});
+  else finishSiteSession('expired');
 }
 async function boot(){
   render();
   try{
     const params=new URLSearchParams(location.search);
     if(params.has('code')||params.has('state')||params.has('error'))history.replaceState(null,'',location.pathname);
-    const session=await readSiteSession();
-    if(!session){expireSiteSession();return;}
+    siteSession=new SiteSession({
+      onSession:session=>{state.sessionRenewable=!!session.renewable;state.api?.applySession(session);sessionNotice();},
+      onEnd:finishSiteSession,
+      onTransient:()=>sessionNotice('Connection interrupted. Your work stays here while sign-in reconnects.'),
+    });
+    const session=await siteSession.bootstrap();
+    if(!session)return;
     const response=await fetch('runtime-config.json',{cache:'no-store',credentials:'same-origin',redirect:'error'});
     if(response.status===401||response.status===403){expireSiteSession();return;}
     if(!response.ok)throw Error('Runtime deployment configuration is unavailable.');
@@ -151,8 +167,8 @@ async function boot(){
     const presetResponse=await fetch('presets/indentation-v1.json',{cache:'no-store',credentials:'same-origin',redirect:'error'});
     if(!presetResponse.ok)throw Error('Approved preset is unavailable.');
     state.preset=await presetResponse.json();configurationFor(state.preset,state.diameter);
-    state.api=new Api(state.config,session.token,fetch,{expiresAt:session.expiresAt,onUnauthorized:expireSiteSession});
-    expiryTimer=setTimeout(expireSiteSession,Math.max(0,session.expiresAt-Date.now()));
+    const controller=siteSession;
+    state.api=new Api(state.config,session.token,fetch,{expiresAt:session.expiresAt,renewable:!!session.renewable,onUnauthorized:expireSiteSession,ensureSession:options=>controller.ensure(options)});
     state.me=await state.api.request('/v1/me');
     state.projects=(await state.api.request('/v1/projects')).projects||[];
     state.project=state.projects[0]?.id||'';

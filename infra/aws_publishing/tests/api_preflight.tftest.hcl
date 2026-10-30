@@ -161,3 +161,79 @@ run "noncanonical_archive_root_rejected" {
   }
   expect_failures = [var.projects]
 }
+
+override_resource {
+  override_during = plan
+  target          = aws_cognito_user_pool_client.browser
+  values          = { id = "synthetic-native-client" }
+}
+override_resource {
+  override_during = plan
+  target          = aws_cognito_user_pool_client.remembered_web
+  values          = { id = "synthetic-remembered-client" }
+}
+override_resource {
+  override_during = plan
+  target          = aws_cloudfront_function.remembered_entry
+  values          = { arn = "arn:aws:cloudfront::000000000000:function/synthetic-remembered-entry" }
+}
+
+run "remembered_default_off_preserves_native_client_and_private_assets" {
+  command = plan
+  assert {
+    condition = (
+      !var.remembered_browser_sessions_enabled &&
+      aws_lambda_function.backend.environment[0].variables["SITE_REMEMBERED_SESSIONS_ENABLED"] == "false" &&
+      aws_lambda_function.backend.environment[0].variables["COGNITO_CLIENT_ID"] == "synthetic-native-client" &&
+      aws_cognito_user_pool_client.browser.refresh_token_validity == 1 &&
+      aws_cognito_user_pool_client.browser.access_token_validity == 15 &&
+      contains(aws_cognito_user_pool_client.browser.callback_urls, var.connector_callback_url)
+    )
+    error_message = "Default activation must remain off without changing the original native client or its one-day refresh policy."
+  }
+  assert {
+    condition = (
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].function_association) == 0 &&
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].trusted_key_groups) > 0 &&
+      aws_cloudfront_distribution.web.default_cache_behavior[0].target_origin_id == "private-web"
+    )
+    error_message = "Default behavior must retain private signed assets and no new active viewer association."
+  }
+  assert {
+    condition = (
+      aws_cognito_user_pool.users.mfa_configuration == "ON" &&
+      !aws_cognito_user_pool_client.remembered_web.generate_secret &&
+      aws_cognito_user_pool_client.remembered_web.refresh_token_validity == 30 &&
+      aws_cognito_user_pool_client.remembered_web.access_token_validity == 15 &&
+      aws_cognito_user_pool_client.remembered_web.callback_urls == toset(["https://synthetic.cloudfront.net/auth/callback"]) &&
+      aws_cognito_user_pool_client.remembered_web.explicit_auth_flows == toset(["ALLOW_REFRESH_TOKEN_AUTH"])
+    )
+    error_message = "Remembered sign-in requires existing MFA, a dedicated public web-only client and bounded token lifetimes."
+  }
+  assert {
+    condition = (
+      aws_apigatewayv2_authorizer.users.jwt_configuration[0].audience == toset(["synthetic-native-client", "synthetic-remembered-client"]) &&
+      aws_dynamodb_table.state.ttl[0].enabled &&
+      aws_dynamodb_table.state.ttl[0].attribute_name == "auth_expires_at"
+    )
+    error_message = "Both exact client audiences and auth-only TTL cleanup must be configured."
+  }
+}
+
+run "remembered_activation_adds_only_the_reviewed_viewer_entry_association" {
+  command = plan
+  variables {
+    remembered_browser_sessions_enabled = true
+  }
+  assert {
+    condition = (
+      aws_lambda_function.backend.environment[0].variables["SITE_REMEMBERED_SESSIONS_ENABLED"] == "true" &&
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].function_association) == 1 &&
+      one(aws_cloudfront_distribution.web.default_cache_behavior[0].function_association).event_type == "viewer-request" &&
+      one(aws_cloudfront_distribution.web.default_cache_behavior[0].function_association).function_arn == "arn:aws:cloudfront::000000000000:function/synthetic-remembered-entry" &&
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].trusted_key_groups) > 0 &&
+      aws_cloudfront_distribution.web.default_cache_behavior[0].allowed_methods == toset(["GET", "HEAD"])
+    )
+    error_message = "Activation must add the pinned viewer hook while preserving native signed grants and private asset method rules."
+  }
+}

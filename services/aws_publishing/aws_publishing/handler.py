@@ -56,6 +56,7 @@ def site_auth():
         import boto3
         from botocore.config import Config
         from .site_auth import Cognito, SiteAuth
+        from .browser_sessions import DynamoSessionRecords
 
         pem = (
             boto3.client("ssm")
@@ -65,12 +66,26 @@ def site_auth():
             .encode()
         )
 
+        dynamo = boto3.client("dynamodb")
         def invited(subject):
-            _, state = application().store.load()
-            identity = state["identities"].get(subject)
-            return bool(
-                identity and not identity.get("disabled") and identity.get("projects")
-            )
+            # Point-read the invitation; credentials stay outside business STATE.
+            item = dynamo.get_item(TableName=os.environ["STATE_TABLE"],
+                Key={"pk":{"S":"STATE"},"sk":{"S":"identities:"+subject}},
+                ConsistentRead=True).get("Item")
+            identity = json.loads(item["payload"]["S"]) if item else None
+            return bool(isinstance(identity,dict) and
+                not identity.get("disabled") and identity.get("projects"))
+        remembered_id = os.environ.get("COGNITO_REMEMBERED_CLIENT_ID")
+        enabled = os.environ.get("SITE_REMEMBERED_SESSIONS_ENABLED","false")
+        if enabled not in ("true","false") or enabled=="true" and not remembered_id:
+            raise ValueError("Invalid remembered-browser activation configuration")
+        remembered = {"remembered_enabled":enabled=="true"}
+        if remembered_id:
+            remembered = {
+                "remembered_enabled":enabled=="true",
+                "session_records":DynamoSessionRecords(dynamo,os.environ["STATE_TABLE"]),
+                "remembered_cognito":Cognito(os.environ["COGNITO_DOMAIN"],
+                    os.environ["COGNITO_ISSUER"],remembered_id)}
 
         _site_auth = SiteAuth(
             base_url=os.environ["SITE_BASE_URL"],
@@ -82,6 +97,7 @@ def site_auth():
                 os.environ["COGNITO_ISSUER"],
                 os.environ["COGNITO_CLIENT_ID"],
             ),
+            **remembered,
         )
     return _site_auth
 
@@ -157,15 +173,15 @@ def handler(event, context):
                 .get("jwt", {})
                 .get("claims", {})
             )
-            issuer, client_id = (
-                os.environ["COGNITO_ISSUER"],
-                os.environ["COGNITO_CLIENT_ID"],
-            )
+            issuer = os.environ["COGNITO_ISSUER"]
+            client_ids = {os.environ["COGNITO_CLIENT_ID"]}
+            if os.environ.get("COGNITO_REMEMBERED_CLIENT_ID"):
+                client_ids.add(os.environ["COGNITO_REMEMBERED_CLIENT_ID"])
             # API Gateway validates signature and expiry; these checks additionally
             # reject ID tokens and events from an unexpected pool/application.
             if (
                 claims.get("iss") != issuer
-                or claims.get("client_id") != client_id
+                or claims.get("client_id") not in client_ids
                 or claims.get("token_use") != "access"
             ):
                 raise APIError(
