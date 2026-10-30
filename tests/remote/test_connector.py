@@ -205,15 +205,34 @@ def test_untrusted_identifier_rejected(value):
         safe_id(value)
 
 
-def test_transport_quotes_ssh_argv(monkeypatch):
-    calls = []
-    def run(command, **kwargs):
-        calls.append(command)
-        return SimpleNamespace(stdout=b"", stderr=b"")
-    monkeypatch.setattr(subprocess, "run", run)
-    Transport(host="ownuser@cluster").run(["cat", "/path/$(touch stolen);x"])
-    assert calls[0][-1] == "cat '/path/$(touch stolen);x'"
-    assert "-oBatchMode=yes" in calls[0]
+def test_transport_quotes_ssh_argv(tmp_path, monkeypatch):
+    from aws_mesouq.connector import transport as module
+    from aws_mesouq.connector.ssh_session import _client_command
+    calls, closed = [], []
+    class Borrowed:
+        def __init__(self, host, directory, *, borrow_only=False):
+            assert host == "ownuser@cluster" and borrow_only is True
+            assert Path(directory) == tmp_path / "guard"
+        def run_bytes(self, argv, *, data=None):
+            command = _client_command(SimpleNamespace(socket=tmp_path / "unused.sock"),
+                {"hostname": "fixture.invalid", "user": "ownuser", "port": 22}, argv=argv)
+            calls.append((command, data))
+            return b""
+        def close(self):
+            closed.append(True)
+    monkeypatch.setattr(module, "SSHSession", Borrowed)
+    monkeypatch.setenv("AWS_MESOUQ_SSH_STATE_DIR", str(tmp_path / "guard"))
+    transport = Transport(host="ownuser@cluster")
+    try:
+        transport.run(["cat", "/path/$(touch stolen);x"])
+    finally:
+        transport.close()
+    command, data = calls[0]
+    assert command[-1] == "cat '/path/$(touch stolen);x'"
+    assert "-oBatchMode=yes" in command and "-oForwardAgent=no" in command
+    assert "-oProxyCommand=/usr/bin/false" in command
+    assert command[command.index("-F")+1] == "/dev/null"
+    assert data is None and closed == [True]
 
 
 @pytest.mark.parametrize("value", ["relative", "/a/../b", "/a\nb"])

@@ -1,5 +1,8 @@
 # AWS-MesoUQ
 
+For SSH operation, first start the shared foreground controller described in [SSH connection control](docs/ssh-connection-control.md). The connector borrows that authenticated session and cannot silently open a replacement.
+
+
 Publish private scientific workflows through AWS while calculations run under
 each collaborator's own HPC account. The first workflow calibrates one
 indentation curve with an approved MesoUQ model and preset.
