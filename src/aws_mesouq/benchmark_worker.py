@@ -103,11 +103,86 @@ class BenchmarkWorker:
         if slurm.user != operator["expected_user"] or transport.run(["hostname", "-f"]).strip() != operator["expected_host"]:
             raise ValueError("Verified Karolina account or hostname differs from operator policy")
         context = {"project": project, "owner_sub": journal.data["owner_sub"], "api": getattr(api, "base", None), "operator": self.operator, "connector_id": identity["connector_id"]}
-        namespace = journal.data.setdefault("benchmark_lab", {"context": context, "stages": {}, "campaigns": {}})
-        if namespace["context"] != context:
-            raise ValueError("Benchmark journal belongs to another immutable operator/session context")
+        from .benchmark_contexts import ExecutionContexts
+        self.context_registry = ExecutionContexts(self.operator, self.project, validate_operator)
+        namespace = self.context_registry.namespace(journal.data.get("benchmark_lab"), context)
+        journal.data["benchmark_lab"] = namespace
         self.state = namespace
         journal.save()
+
+    def _context_for_campaign(self, campaign):
+        return self.context_registry.campaign(campaign, self.journal.data["owner_sub"])
+
+    def _operator_for_campaign(self, campaign):
+        return self.context_registry.operator(self._context_for_campaign(campaign))
+
+    def _operator_for_entry(self, entry):
+        # Shell-renderer fixtures can exercise the legacy renderer without a worker.
+        if not hasattr(self, "context_registry"):
+            return self.operator
+        context_id = self._context_for_campaign(entry["claim"]["campaign"])
+        if entry.get("context_id") != context_id:
+            raise ValueError("Stage execution context differs from its immutable binding")
+        return self.context_registry.operator(context_id)
+
+    def _clock_policy(self, entry):
+        if not hasattr(self, "context_registry"):
+            return None
+        self._operator_for_entry(entry)
+        return self.context_registry.policy(entry["context_id"])
+
+    def _bound_campaign(self, entry, campaign):
+        self._operator_for_entry(entry)
+        previous = entry["claim"]["campaign"]
+        if (self._context_for_campaign(campaign) != entry["context_id"]
+                or any(campaign.get(key) != previous.get(key) for key in
+                       ("configuration_hash", "scientific_request_hash", "approved_adapter"))):
+            raise ValueError("Authoritative campaign context changed after its immutable binding")
+
+    def _check_claim_response(self, body, claimed):
+        if not claimed.get("stage"):
+            return
+        context_id = self._context_for_campaign(claimed["campaign"])
+        selectors = body.get("supported_contexts")
+        if ((selectors is None and "execution_context_id" in claimed["campaign"]["approved_adapter"])
+                or (selectors is not None and context_id not in selectors)):
+            raise ValueError("Claim response differs from the frozen supported context selector")
+
+    def _claim_body(self, state, id_key, body_key, *, campaign=None, stage=None):
+        body = state.get(body_key)
+        if body is not None:
+            base = {"project_id": self.project, "connector_id": self.journal.data["connector_id"],
+                    "site": "karolina", "request_id": state.get(id_key)}
+            if (not isinstance(body, dict) or any(body.get(key) != value for key, value in base.items())
+                    or not set(base) <= set(body)):
+                raise ValueError("Frozen claim request identity differs")
+            allowed = set(base) | {"supported_contexts"}
+            if campaign is not None:
+                allowed |= {"campaign_id", "exclude_stage_ids"}
+                if body.get("campaign_id") != campaign["id"]:
+                    raise ValueError("Frozen refresh campaign context differs")
+            if not set(body) <= allowed:
+                raise ValueError("Frozen claim request shape differs")
+            selectors = body.get("supported_contexts")
+            if selectors is not None and not set(selectors) <= set(self.context_registry.contexts):
+                raise ValueError("Frozen claim references an unsupported execution context")
+            return body
+        pre_upgrade_pending = id_key in state
+        if (pre_upgrade_pending and campaign is not None
+                and state["context_id"] != self.context_registry.legacy_id):
+            raise ValueError("New execution context lacks its frozen refresh body")
+        request_id = state.setdefault(id_key, uuid.uuid4().hex)
+        fields = {}
+        if campaign is not None:
+            fields = {"campaign_id": campaign["id"],
+                      "exclude_stage_ids": [s["id"] for s in campaign["stages"] if s["id"] != stage["id"]]}
+        if self.context_registry.versioned and not pre_upgrade_pending:
+            fields["supported_contexts"] = (
+                [state["context_id"]] if campaign is not None else sorted(self.context_registry.contexts))
+        body = self.client.build_claim_body(self.project, request_id, **fields)
+        state[body_key] = copy.deepcopy(body)
+        self.save()
+        return state[body_key]
 
     @property
     def transport(self):
@@ -143,26 +218,41 @@ else:
 
     def _refresh(self, entry):
         check_transport_health(self.transport)
+        self._operator_for_entry(entry)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
-        request_id = entry.setdefault("refresh_request_id", uuid.uuid4().hex)
-        self.save()
-        exclusions = [s["id"] for s in campaign["stages"] if s["id"] != stage["id"]]
-        claimed = self.client.claim(self.project, request_id, campaign_id=campaign["id"], exclude_stage_ids=exclusions)
+        body = self._claim_body(entry, "refresh_request_id", "refresh_request_body",
+                                campaign=campaign, stage=stage)
+        try:
+            claimed = self.client.claim_frozen(body)
+        except Exception as error:
+            if getattr(error, "code", None) == "claim_expired":
+                entry.pop("refresh_request_id", None)
+                entry.pop("refresh_request_body", None)
+                self.save()
+            raise
+        self._check_claim_response(body, claimed)
         if not claimed.get("stage"):
-            # An acknowledged terminal event may have already committed.
             current = self.client.get(self.project, campaign["id"])["campaign"]
+            self._bound_campaign(entry, current)
             if next(s for s in current["stages"] if s["id"] == stage["id"])["status"] in TERMINAL:
                 entry["cloud_terminal"] = True
                 self.save()
+                entry.pop("refresh_request_id", None)
+                entry.pop("refresh_request_body", None)
+                self.save()
                 return
             raise RuntimeError("Expired stage is not currently claimable")
+        self._bound_campaign(entry, claimed["campaign"])
         if claimed["stage"]["id"] != stage["id"] or claimed["stage"]["attempt"] != stage["attempt"]:
             raise ValueError("Stage recovery identity differs")
         entry["claim"] = claimed
+        self.save()
         entry.pop("refresh_request_id", None)
+        entry.pop("refresh_request_body", None)
         self.save()
 
     def _send(self, entry, kind=None, **fields):
+        self._operator_for_entry(entry)
         pending = entry.get("pending_event")
         if pending is None:
             self._valid_lease(entry)
@@ -176,6 +266,7 @@ else:
         except Exception as error:
             if getattr(error, "code", None) == "invalid_transition":
                 current = self.client.get(self.project, entry["claim"]["campaign"]["id"])["campaign"]
+                self._bound_campaign(entry, current)
                 authoritative = next(s for s in current["stages"] if s["id"] == entry["claim"]["stage"]["id"])
                 if authoritative["status"] == "cancelling" and pending["type"] in ("submitting", "running", "queued", "heartbeat"):
                     entry.pop("pending_event", None)
@@ -188,6 +279,8 @@ else:
                 raise
             self._refresh(entry)
             result = self.client.event(entry["claim"], pending["id"], pending["type"], **pending["fields"])
+        if result.get("campaign"):
+            self._bound_campaign(entry, result["campaign"])
         if pending["type"] == "artifact_upload" and result.get("uploads") is not None:
             entry["upload_plan"] = result["uploads"]
             entry["upload_reservation"] = copy.deepcopy(pending)
@@ -218,38 +311,53 @@ else:
 
     def _claim(self):
         check_transport_health(self.transport)
-        request_id = self.state.setdefault("claim_request_id", uuid.uuid4().hex)
-        self.save()
+        body = self._claim_body(self.state, "claim_request_id", "claim_request_body")
         try:
-            claimed = self.client.claim(self.project, request_id)
+            claimed = self.client.claim_frozen(body)
         except Exception as error:
             if getattr(error, "code", None) == "claim_expired":
                 self.state.pop("claim_request_id", None)
+                self.state.pop("claim_request_body", None)
                 self.save()
             raise
-        self.state.pop("claim_request_id", None)
+        self._check_claim_response(body, claimed)
+        entry = None
         if claimed.get("stage"):
             campaign, stage = claimed["campaign"], claimed["stage"]
-            expected = campaign["approved_adapter"]
-            if campaign["owner_sub"] != self.journal.data["owner_sub"] or campaign["project_id"] != self.project or expected["adapter_sha256"] != self.operator["adapter_sha256"] or expected["science_revision"] != self.operator["science_revision"] or expected.get("archive_root") != self.operator["archive_root"]:
-                raise ValueError("Cloud campaign differs from trusted owner, source or durable policy")
+            context_id = self._context_for_campaign(campaign)
+            operator = self.context_registry.operator(context_id)
             validate_create(campaign["configuration"])
             if checksum(campaign["configuration"]) != campaign["configuration_hash"]:
                 raise ValueError("Cloud configuration hash differs from frozen request")
             key = campaign["id"] + "/" + stage["id"] + "/" + str(stage["attempt"])
-            entry = self.state["stages"].setdefault(key, {"claim": claimed, "marker": marker(campaign["id"], stage["id"], stage["attempt"])})
-            entry["claim"] = claimed
-            self.state["campaigns"].setdefault(campaign["id"], {"root": self.operator["run_root"] + "/" + campaign["id"]})
+            expected_marker = marker(campaign["id"], stage["id"], stage["attempt"])
+            entry = self.state["stages"].get(key)
+            if entry is not None:
+                self._bound_campaign(entry, campaign)
+                if entry["marker"] != expected_marker:
+                    raise ValueError("Journaled stage marker differs from immutable execution identity")
+            root = operator["run_root"] + "/" + campaign["id"]
+            record = self.state["campaigns"].get(campaign["id"])
+            if record is not None and (record.get("root") != root or record.get("context_id") != context_id):
+                raise ValueError("Campaign journal context differs")
+            if entry is None:
+                entry = {"claim": claimed, "marker": expected_marker, "context_id": context_id}
+                self.state["stages"][key] = entry
+            else:
+                entry["claim"] = claimed
+            self.state["campaigns"].setdefault(campaign["id"], {"root": root, "context_id": context_id})
             self.save()
-            return entry
+        self.state.pop("claim_request_id", None)
+        self.state.pop("claim_request_body", None)
         self.save()
-        return None
+        return entry
 
     def stage(self, entry):
+        operator = self._operator_for_entry(entry)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
-        root = self.operator["run_root"] + "/" + safe_id(campaign["id"])
+        root = operator["run_root"] + "/" + safe_id(campaign["id"])
         control = root + "/control/" + safe_id(stage["id"])
-        for private in (self.operator["run_root"], self.operator["archive_root"]):
+        for private in (operator["run_root"], operator["archive_root"]):
             self._slow(entry, self.transport.private_root_probe, private)
         mkdir_code = """import os,stat,sys
 fd=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -269,15 +377,17 @@ for name in ('stdout.log','stderr.log'):
     os.close(output)
 os.close(fd)
 """
-        self._slow(entry, self.transport.run, [getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", mkdir_code, self.operator["run_root"], campaign["id"] + "/control/" + stage["id"]])
+        self._slow(entry, self.transport.run, [getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", mkdir_code, operator["run_root"], campaign["id"] + "/control/" + stage["id"]])
         entry["root"] = root
         request_path = root + "/request.json"
         self._slow(entry, self._immutable, request_path, canonical(campaign["configuration"]))
-        adapter = Path(__file__).with_name("adapters").joinpath("benchmark.py").read_bytes()
-        if hashlib.sha256(adapter).hexdigest() != self.operator["adapter_sha256"]:
-            raise ValueError("Installed benchmark adapter differs from operator pin")
-        window = scheduler_window(stage.get("reserved_seconds", self.operator["stage_seconds"].get(stage["id"], 0)), self.operator["scheduler"]["partition"])
-        manifest = {**{k: self.operator[k] for k in ("repository", "science_revision", "python_bin", "environment_script", "environment_sha256", "adapter_sha256")}, "request": request_path, "campaign_root": root, "campaign_instance_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "stage": stage["id"], "internal_seconds": window["internal_seconds"], "device": "cpu" if stage["id"] in ("cases", "reference", "metrics") else "cuda"}
+        from .adapters import adapter_snapshot
+        adapter = adapter_snapshot(operator["adapter_sha256"])
+        window = scheduler_window(stage.get("reserved_seconds", operator["stage_seconds"].get(stage["id"], 0)), operator["scheduler"]["partition"])
+        manifest = {**{k: operator[k] for k in ("repository", "science_revision", "python_bin", "environment_script", "environment_sha256", "adapter_sha256")}, "request": request_path, "campaign_root": root, "campaign_instance_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "stage": stage["id"], "internal_seconds": window["internal_seconds"], "device": "cpu" if stage["id"] in ("cases", "reference", "metrics") else "cuda"}
+        if self._clock_policy(entry) == "allocation_deadline_v1":
+            manifest["runtime_clock_policy"] = "allocation_deadline_v1"
+            manifest["allocated_seconds"] = window["allocated_seconds"]
         if stage["id"] == "metrics":
             costs = self.allocation_snapshot(entry)
             costs_blob = canonical(costs)
@@ -293,7 +403,9 @@ os.close(fd)
         self.save()
 
     def allocation_snapshot(self, entry):
+        operator = self._operator_for_entry(entry)
         campaign = self.client.get(self.project, entry["claim"]["campaign"]["id"])["campaign"]
+        self._bound_campaign(entry, campaign)
         stages = [s for s in campaign["stages"] if s["id"] != "metrics"]
         if not all(s["status"] in TERMINAL for s in stages):
             raise ValueError("Authoritative metrics require all scientific stages to be terminal")
@@ -324,23 +436,31 @@ os.close(fd)
         hnpe = [s for s in stages if s["kind"] in ("cases", "hnpe_train", "hnpe_infer")]
         tmcmc = [s for s in stages if s["id"] == "tmcmc"]
         reference = [s for s in stages if s["id"] == "reference"]
-        return {"schema": "aws_mesouq.benchmark_allocation_costs.v1", "campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": scientific_hash, "case_set_sha256": case_bank["sha256"], "science_revision": self.operator["science_revision"], "adapter_sha256": self.operator["adapter_sha256"], "source_binding_sha256": binding["sha256"], "stages": [{k: copy.deepcopy(s[k]) for k in ("id", "kind", "status", "slurm_job_id", "scheduler_accounting", "timing", "failure") if k in s} for s in stages], "costs": {"methods": {"hnpe": totals(hnpe), "tmcmc": totals(tmcmc)}, "reference": totals(reference)}}
+        return {"schema": "aws_mesouq.benchmark_allocation_costs.v1", "campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": scientific_hash, "case_set_sha256": case_bank["sha256"], "science_revision": operator["science_revision"], "adapter_sha256": operator["adapter_sha256"], "source_binding_sha256": binding["sha256"], "stages": [{k: copy.deepcopy(s[k]) for k in ("id", "kind", "status", "slurm_job_id", "scheduler_accounting", "timing", "failure") if k in s} for s in stages], "costs": {"methods": {"hnpe": totals(hnpe), "tmcmc": totals(tmcmc)}, "reference": totals(reference)}}
 
     def script(self, entry, control, window):
-        scheduler = {**self.operator["scheduler"], "gres": "gpu:1", "time": window["time"]}
+        operator = self._operator_for_entry(entry)
+        scheduler = {**operator["scheduler"], "gres": "gpu:1", "time": window["time"]}
         lines = ["#!/bin/bash", "#SBATCH --job-name=" + entry["marker"], "#SBATCH --output=" + control + "/stdout.log", "#SBATCH --error=" + control + "/stderr.log"]
         lines += ["#SBATCH --" + name + "=" + str(value) for name, value in scheduler.items()]
         lines += ["set -euo pipefail", "umask 077"]
-        environment = shlex.quote(self.operator["environment_script"])
-        digest = shlex.quote(self.operator["environment_sha256"])
-        lines += ["test \"$(sha256sum " + environment + " | cut -d' ' -f1)\" = " + digest, "source " + environment, "export MESOUQ_SITE=karolina", "export PYTHONPATH=" + shlex.quote(self.operator["repository"] + "/src") + '${PYTHONPATH:+:"$PYTHONPATH"}']
+        if self._clock_policy(entry) == "allocation_deadline_v1":
+            lines += [
+                'readonly AWS_MESOUQ_ALLOCATION_JOB_ID="${SLURM_JOB_ID:?Missing native job ID}"',
+                'readonly AWS_MESOUQ_ALLOCATION_START_EPOCH="${SLURM_JOB_START_TIME:?Missing native start time}"',
+                'readonly AWS_MESOUQ_ALLOCATION_DEADLINE_EPOCH="${SLURM_JOB_END_TIME:?Missing native deadline}"',
+                "export AWS_MESOUQ_ALLOCATION_JOB_ID AWS_MESOUQ_ALLOCATION_START_EPOCH AWS_MESOUQ_ALLOCATION_DEADLINE_EPOCH",
+            ]
+        environment = shlex.quote(operator["environment_script"])
+        digest = shlex.quote(operator["environment_sha256"])
+        lines += ["test \"$(sha256sum " + environment + " | cut -d' ' -f1)\" = " + digest, "source " + environment, "export MESOUQ_SITE=karolina", "export PYTHONPATH=" + shlex.quote(operator["repository"] + "/src") + '${PYTHONPATH:+:"$PYTHONPATH"}']
         stage = entry["claim"]["stage"]["id"]
         # Select Keras before the isolated interpreter imports a native backend.
         if stage in {"train_" + factor for factor in FACTORS}:
             lines.append("export KERAS_BACKEND=jax")
         elif stage == "hnpe_infer":
             lines.append("export KERAS_BACKEND=torch")
-        lines += ["exec " + shlex.quote(self.operator["python_bin"]) + " " + shlex.quote(control + "/adapter.py") + " --manifest " + shlex.quote(control + "/manifest.json")]
+        lines += ["exec " + shlex.quote(operator["python_bin"]) + " " + shlex.quote(control + "/adapter.py") + " --manifest " + shlex.quote(control + "/manifest.json")]
         return "\n".join(lines) + "\n"
 
     def accounting(self, entry):
@@ -408,6 +528,7 @@ os.close(fd)
         return self._send(entry, "artifact_status", artifact_ids=[artifact_id])
 
     def publish(self, entry, receipt):
+        operator = self._operator_for_entry(entry)
         stage = entry["claim"]["stage"]["id"]
         selected = []
         if stage == "metrics":
@@ -454,7 +575,7 @@ os.close(fd)
                         break
                     target = urlsplit(status["upload_url"])
                     origin = target.scheme + "://" + target.netloc
-                    if origin not in self.operator["allowed_upload_origins"] or target.username or target.password:
+                    if origin not in operator["allowed_upload_origins"] or target.username or target.password:
                         raise ValueError("Artifact upload URL is outside operator-approved HTTPS origins")
                     progress[ref["id"]] = {"status": "putting", "sha256": ref["sha256"], "size_bytes": ref["size_bytes"]}
                     self.save()
@@ -507,9 +628,16 @@ os.close(fd)
         return {"scientific_status": scientific.get("scientific_status"), "paired_comparison": scientific.get("paired_comparison"), "allocation_costs": scientific.get("allocation_costs"), "allocation_costs_binding": scientific.get("allocation_costs_binding"), "allocation_costs_sha256": scientific.get("allocation_costs_sha256"), "metrics": {method: payload.get("summary") for method, payload in scientific.get("methods", {}).items()}, "case_results": {method: [{"world_index": row.get("world_index"), "status": row.get("status"), "metrics": {"score": row.get("metrics", {}).get("score")}, "termination_reason": row.get("termination_reason")} for row in payload.get("cases", [])] for method, payload in scientific.get("methods", {}).items()}, "plots": [], "training_histories": histories, "artifacts": refs, "limitations": scientific.get("limitations", [])}
 
     def complete(self, entry, accounting):
+        operator = self._operator_for_entry(entry)
         timing = {"wall_seconds": accounting["elapsed_seconds"], "cpu_seconds": accounting["cpu_seconds"], "gpu_seconds": accounting["elapsed_seconds"] * accounting["allocated_gpus"]}
         if accounting["state"] == "CANCELLED":
             self._send(entry, "cancelled", timing=timing, scheduler_accounting=accounting)
+            return
+        if accounting["state"] != "COMPLETED":
+            self._send(entry, "failed", failure={
+                "code": safe_id("native_" + accounting["state"].lower()),
+                "message": "Native scheduler did not complete successfully; retained scientific files do not establish native completion",
+            }, timing=timing, scheduler_accounting=accounting)
             return
         relative = "stages/" + entry["claim"]["stage"]["id"] + "/receipt.json"
         probe = self._slow(entry, self.transport.run, [getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", "import os,sys;print('present' if os.path.lexists(sys.argv[1]) else 'missing')", entry["root"] + "/" + relative]).strip()
@@ -545,7 +673,7 @@ os.close(fd)
             raw = self._slow(entry, self.transport.read_beneath, entry["root"], "stages/cases/receipt.json")
             cases = json.loads(raw)
         case_hash = cases["case_bank"]["sha256"]
-        result = {"schema": SCHEMA, "provenance": {"campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "adapter_sha256": self.operator["adapter_sha256"], "science_revision": self.operator["science_revision"], "site": "karolina", "case_set_sha256": case_hash}, "timing": timing, "artifacts": refs, "metrics": {"scientific_status": receipt["status"]}}
+        result = {"schema": SCHEMA, "provenance": {"campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "adapter_sha256": operator["adapter_sha256"], "science_revision": operator["science_revision"], "site": "karolina", "case_set_sha256": case_hash}, "timing": timing, "artifacts": refs, "metrics": {"scientific_status": receipt["status"]}}
         if stage["id"] == "cases":
             result["metrics"]["common_case_generation_costs"] = {"wall_seconds": receipt.get("shared_case_generation_seconds")}
         if stage["id"] == "metrics":
@@ -608,6 +736,7 @@ os.close(fd)
         if job not in records:
             return
         current = self.client.get(self.project, entry["claim"]["campaign"]["id"])["campaign"]
+        self._bound_campaign(entry, current)
         entry["claim"]["campaign"] = current
         authoritative = next(s for s in current["stages"] if s["id"] == stage["id"])
         entry["claim"]["stage"] = authoritative
@@ -726,10 +855,11 @@ os.close(fd)
         return files, originals, expected, blob
 
     def _archive_acknowledge(self, campaign, record, files):
+        operator = self._operator_for_campaign(campaign)
         manifest = next(item for item in files if item["path"] == "archive-manifest.json")
         originals = [item for item in files if item["path"] != "archive-manifest.json"]
         refs = [{key: artifact[key] for key in ("id", "sha256", "size_bytes")} for artifact in campaign.get("artifacts", []) if artifact.get("verified")]
-        receipt = {"site": "karolina", "path": self.operator["archive_root"] + "/" + campaign["id"], "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": [manifest], "attested_original_file_count": len(originals), "attested_original_files_sha256": checksum(originals)}
+        receipt = {"site": "karolina", "path": operator["archive_root"] + "/" + campaign["id"], "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": [manifest], "attested_original_file_count": len(originals), "attested_original_files_sha256": checksum(originals)}
         event_id = record.setdefault("archive_event_id", uuid.uuid4().hex)
         self.save()
         self.client.archive(campaign, event_id, receipt)
@@ -737,18 +867,22 @@ os.close(fd)
         self.save()
 
     def archive(self, campaign):
+        operator = self._operator_for_campaign(campaign)
         check_transport_health(self.transport)
         ident = safe_id(campaign["id"])
         if campaign.get("archive", {}).get("status") != "requested":
             return
         binding = campaign["approved_adapter"]
-        if binding.get("archive_root") != self.operator["archive_root"] or binding.get("science_revision") != self.operator["science_revision"] or binding.get("adapter_sha256") != self.operator["adapter_sha256"] or campaign.get("owner_sub") != self.journal.data["owner_sub"] or campaign.get("project_id") != self.project:
+        if binding.get("archive_root") != operator["archive_root"] or binding.get("science_revision") != operator["science_revision"] or binding.get("adapter_sha256") != operator["adapter_sha256"] or campaign.get("owner_sub") != self.journal.data["owner_sub"] or campaign.get("project_id") != self.project:
             raise ArtifactIntegrityError("Archive campaign differs from immutable owner/source/storage binding")
         validate_create(campaign["configuration"])
         if checksum(campaign["configuration"]) != campaign["configuration_hash"] or campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])) != scientific_request_checksum(campaign["configuration"]):
             raise ArtifactIntegrityError("Archive request hashes differ from the frozen configuration")
-        expected_root = self.operator["run_root"] + "/" + ident
-        record = self.state["campaigns"].setdefault(ident, {"root": expected_root})
+        expected_root = operator["run_root"] + "/" + ident
+        context_id = self._context_for_campaign(campaign)
+        record = self.state["campaigns"].setdefault(ident, {"root": expected_root, "context_id": context_id})
+        if record.get("context_id") != context_id:
+            raise ArtifactIntegrityError("Archive campaign execution context differs")
         root = record["root"]
         if root != expected_root:
             raise ArtifactIntegrityError("Archive source root differs from the campaign binding")
@@ -759,7 +893,7 @@ os.close(fd)
             for batch in self._archive_batches(files):
                 transfers = [{"destination": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in batch]
                 try:
-                    self.transport.archive_verify_batch(self.operator["archive_root"], ident, transfers)
+                    self.transport.archive_verify_batch(operator["archive_root"], ident, transfers)
                 except subprocess.CalledProcessError as error:
                     if error.returncode == 255:
                         raise
@@ -788,7 +922,7 @@ os.close(fd)
             record["archive_files"] = files
             self.save()
         self._archive_remote(self._immutable, root + "/archive-manifest.json", blob)
-        self._archive_remote(self.transport.archive_prepare, self.operator["archive_root"], ident)
+        self._archive_remote(self.transport.archive_prepare, operator["archive_root"], ident)
         for batch in self._archive_batches(files):
             transfers = []
             for item in batch:
@@ -796,8 +930,8 @@ os.close(fd)
                 if item["path"] in proofs:
                     transfer["source_link_group"] = proofs[item["path"]]
                 transfers.append(transfer)
-            self._archive_remote(self.transport.archive_copy_batch, self.operator["archive_root"], ident, transfers)
-            self._archive_remote(self.transport.archive_verify_batch, self.operator["archive_root"], ident, transfers)
+            self._archive_remote(self.transport.archive_copy_batch, operator["archive_root"], ident, transfers)
+            self._archive_remote(self.transport.archive_verify_batch, operator["archive_root"], ident, transfers)
         self._archive_acknowledge(campaign, record, files)
 
 

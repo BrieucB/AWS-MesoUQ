@@ -976,15 +976,27 @@ def _archive_seam_worker(transport):
     import hashlib
     from types import SimpleNamespace
     from aws_mesouq.benchmark import DEFAULT_CONFIGURATION, checksum, scientific_request_checksum
-    from aws_mesouq.benchmark_worker import BenchmarkWorker
+    from aws_mesouq.benchmark_worker import BenchmarkWorker, validate_operator
+    from aws_mesouq.benchmark_contexts import ExecutionContexts
+    from aws_mesouq.adapters import LEGACY_BENCHMARK_ADAPTER_SHA256
     calls = {"claims": 0, "scans": 0, "archives": []}
     worker = object.__new__(BenchmarkWorker)
     worker.project = "p"
     worker.maximum_active = 16
-    worker.operator = {"run_root": "/private/scratch", "archive_root": "/private/archive",
-                       "science_revision": "b" * 40, "adapter_sha256": "a" * 64}
+    worker.operator = {
+        "run_root": "/private/scratch", "archive_root": "/private/archive",
+        "repository": "/private/science", "science_revision": "b" * 40,
+        "adapter_sha256": LEGACY_BENCHMARK_ADAPTER_SHA256, "python_bin": "/usr/bin/python3.11",
+        "environment_script": "/private/runtime.sh", "environment_sha256": "d" * 64,
+        "expected_user": "fixtureuser", "expected_host": "fixture.cluster",
+        "scheduler": {"partition": "qgpu", "account": "fixture", "qos": "fixture",
+                      "cpus-per-task": 16, "mem": "64G"},
+        "stage_seconds": {"reference": 300, "metrics": 300},
+        "allowed_upload_origins": ["https://uploads.example.invalid"],
+    }
+    worker.context_registry = ExecutionContexts(worker.operator, "p", validate_operator)
     worker.slurm = SimpleNamespace(transport=transport)
-    worker.journal = SimpleNamespace(data={"owner_sub": "alice"}, save=lambda: None)
+    worker.journal = SimpleNamespace(data={"owner_sub": "alice", "connector_id": "fixture-connector"}, save=lambda: None)
     configuration = copy.deepcopy(DEFAULT_CONFIGURATION)
     configuration["idempotency_key"] = "archive-seam"
     campaign = {
@@ -1002,19 +1014,26 @@ def _archive_seam_worker(transport):
                 "size_bytes": len(blob)}
     worker.state = {"stages": {}, "campaigns": {campaign["id"]: {
         "root": "/private/scratch/campaign", "archive_files": [*originals, manifest],
-        "archive_manifest": blob.decode(),
+        "archive_manifest": blob.decode(), "context_id": worker.context_registry.legacy_id,
     }}}
     def forbidden(*args, **kwargs):
         pytest.fail("Archive failure allowed source, payload, or ACK work")
-    def claim(project, request_id, **kwargs):
-        assert project == "p"
+    def build_claim_body(project, request_id, **kwargs):
+        assert project == "p" and not kwargs
+        return {"project_id": project, "connector_id": "fixture-connector",
+                "site": "karolina", "request_id": request_id}
+    def claim_frozen(body):
+        assert set(body) == {"project_id", "connector_id", "site", "request_id"}
+        assert body["project_id"] == "p" and body["connector_id"] == "fixture-connector"
+        assert body["site"] == "karolina" and body["request_id"]
         calls["claims"] += 1
         return {}
     def request(method, path, payload=None):
         assert (method, path, payload) == ("GET", "/v1/projects/p/benchmarks", None)
         calls["scans"] += 1
         return {"campaigns": [campaign, {**campaign, "id": "later-campaign"}]}
-    worker.client = SimpleNamespace(claim=claim, archive=forbidden)
+    worker.client = SimpleNamespace(build_claim_body=build_claim_body,
+                                    claim_frozen=claim_frozen, archive=forbidden)
     worker.api = SimpleNamespace(request=request)
     worker._archive_snapshot = forbidden
     worker._immutable = forbidden

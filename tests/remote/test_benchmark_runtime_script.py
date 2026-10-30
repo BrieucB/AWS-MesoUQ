@@ -158,3 +158,69 @@ def test_stage_backend_is_selected_before_python_and_backend_import(
     assert result.returncode == 0, result.stderr
     assert before_python.read_text() == ("UNSET" if expected is None else expected)
     assert json.loads(result.stdout) == {"backend_seen_by_import": expected}
+
+
+def deadline_shell_fixture(tmp_path, profile_body="true\n"):
+    script, repository, control, environment = shell_fixture(tmp_path, None)
+    environment.write_text(profile_body)
+    worker = object.__new__(BenchmarkWorker)
+    worker.operator = {
+        "repository": str(repository), "python_bin": sys.executable,
+        "environment_script": str(environment),
+        "environment_sha256": hashlib.sha256(environment.read_bytes()).hexdigest(),
+        "scheduler": {"partition": "qgpu_exp", "account": "synthetic", "qos": "synthetic",
+                      "cpus-per-task": 1, "mem": "1G"},
+    }
+    worker._clock_policy = lambda entry: "allocation_deadline_v1"
+    script.write_text(worker.script(
+        {"marker": "synthetic-runtime", "claim": {"stage": {"id": "cases"}}},
+        str(control), {"time": "00:01:00", "allocated_seconds": 60}))
+    (control / "adapter.py").write_text(
+        "import json,os\n"
+        "print(json.dumps({k:os.environ[k] for k in ("
+        "'AWS_MESOUQ_ALLOCATION_JOB_ID','AWS_MESOUQ_ALLOCATION_START_EPOCH',"
+        "'AWS_MESOUQ_ALLOCATION_DEADLINE_EPOCH')}))\n")
+    return script
+
+
+def execute_deadline_shell(script, tmp_path, omit=None):
+    native = {"SLURM_JOB_ID": "12345", "SLURM_JOB_START_TIME": "2000000000",
+              "SLURM_JOB_END_TIME": "2000000060"}
+    if omit:
+        native.pop(omit)
+    return subprocess.run(
+        [shutil.which("bash"), str(script)], cwd=tmp_path,
+        env={"PATH": os.defpath + os.pathsep + os.pathsep.join(sorted({
+            str(Path(shutil.which(name)).parent) for name in ("bash", "sha256sum")})),
+             **native}, text=True, capture_output=True, timeout=15)
+
+
+def test_deadline_shell_captures_native_bounds_before_profile(tmp_path):
+    result = execute_deadline_shell(deadline_shell_fixture(tmp_path), tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "AWS_MESOUQ_ALLOCATION_JOB_ID": "12345",
+        "AWS_MESOUQ_ALLOCATION_START_EPOCH": "2000000000",
+        "AWS_MESOUQ_ALLOCATION_DEADLINE_EPOCH": "2000000060",
+    }
+
+
+@pytest.mark.parametrize("field", [
+    "AWS_MESOUQ_ALLOCATION_JOB_ID", "AWS_MESOUQ_ALLOCATION_START_EPOCH",
+    "AWS_MESOUQ_ALLOCATION_DEADLINE_EPOCH",
+])
+def test_profile_cannot_change_captured_native_bounds(tmp_path, field):
+    script = deadline_shell_fixture(tmp_path, "export " + field + "=changed\n")
+    result = execute_deadline_shell(script, tmp_path)
+    assert result.returncode != 0
+    assert not result.stdout
+
+
+@pytest.mark.parametrize("field", [
+    "SLURM_JOB_ID", "SLURM_JOB_START_TIME", "SLURM_JOB_END_TIME",
+])
+def test_missing_native_clock_fails_before_profile(tmp_path, field):
+    script = deadline_shell_fixture(tmp_path, "touch PROFILE_STARTED\n")
+    result = execute_deadline_shell(script, tmp_path, omit=field)
+    assert result.returncode != 0
+    assert not (tmp_path / "PROFILE_STARTED").exists()
