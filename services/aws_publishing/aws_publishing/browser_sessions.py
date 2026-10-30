@@ -169,10 +169,23 @@ class BrowserSessions:
             raise RefreshUnavailable("Remembered session could not be created")
         return sid, self._response(record)
 
+    def _active_now(self, record):
+        now = self.clock()
+        if record["state"]!="active" or now>=min(
+                record["idle_expires_at"],record["absolute_expires_at"]):
+            raise SessionExpired("Remembered browser session expired")
+        return now
+
     def _response(self, record):
+        # Identity/JWKS and conditional storage calls can cross a deadline.
+        # Re-read the live clock after that work, immediately before publishing.
+        now = self._active_now(record)
+        expires = min(record["grant_expires_at"],record["access_expires_at"],
+            record["idle_expires_at"],record["absolute_expires_at"])
+        if expires<=now:
+            raise RefreshBusy("refresh_required")
         return {"access_token":record["tokens"]["access_token"],
-            "expires_at":min(record["grant_expires_at"],record["access_expires_at"],
-                record["idle_expires_at"],record["absolute_expires_at"]),
+            "expires_at":expires,
             "renewable":True,"absolute_expires_at":record["absolute_expires_at"],
             "idle_expires_at":record["idle_expires_at"],"generation":record["version"]}
 
@@ -182,7 +195,12 @@ class BrowserSessions:
         if self.clock()>=min(record["grant_expires_at"],record["access_expires_at"]):
             raise RefreshBusy("refresh_required")
         self._verify(record["tokens"]["access_token"],record["subject"])
-        return self._response(record)
+        try:
+            return self._response(record)
+        except SessionExpired:
+            # This GET observed an older snapshot. Another tab may have extended
+            # idle during verification; let one fresh POST decide authoritatively.
+            raise RefreshBusy("refresh_required") from None
 
     def refresh(self, sid, *, activity):
         if type(activity) is not bool:
@@ -190,7 +208,7 @@ class BrowserSessions:
         for _ in range(4):
             record = self._read(sid)
             self._member(record["subject"])
-            now = int(self.clock())
+            now = int(self._active_now(record))
             if record["refresh_owner"] is not None and record["refresh_until"]>now:
                 raise RefreshBusy("refresh_in_progress")
             updated = copy.deepcopy(record)
@@ -200,6 +218,12 @@ class BrowserSessions:
                 updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
             if record["access_expires_at"]>now+60:
                 self._verify(record["tokens"]["access_token"],record["subject"])
+                # Verify against the original bounds before allowing activity to
+                # extend idle. Never use the pre-verification timestamp for CAS.
+                now = int(self._active_now(record))
+                if activity:
+                    updated["last_activity_at"] = now
+                    updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
                 updated["grant_expires_at"] = min(now+GRANT_SECONDS,updated["idle_expires_at"],
                     record["absolute_expires_at"],record["access_expires_at"])
                 if self._write(record,updated):
