@@ -156,8 +156,21 @@ def test_claim_replay_and_expired_submission_reconciles_without_new_attempt(lab)
 def test_parallel_claims_are_distinct_and_budget_conserved(lab):
     campaign = create(lab)
     finish_cases(lab)
+    def claim_with_retry(index):
+        request_id = f"parallel-{index}"
+        for attempt in range(3):
+            try:
+                return claim(lab, request_id)
+            except APIError as error:
+                if error.status != 409 or error.code != "concurrent_update" or attempt == 2:
+                    raise
+
     with ThreadPoolExecutor(max_workers=6) as pool:
-        claims = list(pool.map(lambda index: claim(lab, f"parallel-{index}"), range(9)))
+        claims = list(pool.map(claim_with_retry, range(9)))
+    for index, original in enumerate(claims):
+        replay = claim(lab, f"parallel-{index}")
+        assert replay["lease_token"] == original["lease_token"]
+        assert replay["stage"]["id"] == original["stage"]["id"]
     ids = [c["stage"]["id"] for c in claims if c["stage"]]
     assert len(ids) == len(set(ids)) == 9
     assert "hnpe_infer" not in ids and "metrics" not in ids
