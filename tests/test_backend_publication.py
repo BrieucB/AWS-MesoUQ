@@ -75,6 +75,27 @@ def publish(aws, **kwargs):
 
 
 class BackendPublicationTests(unittest.TestCase):
+    def test_execution_context_policy_preserves_flat_mapping_and_cas_guards(self):
+        aws = FakeAws()
+        publish(aws)
+        old = aws.cfg["Environment"]["Variables"]["BENCHMARK_POLICIES"]
+        policies = copy.deepcopy(POLICIES)
+        policies["fixture"]["execution_context_id"] = "f" * 64
+        aws.calls.clear()
+        with self.assertRaisesRegex(backend.PublicationError, "policy-conflict"):
+            publish(aws, policies=policies, expected_policy_sha256="0" * 64)
+        self.assertFalse(any(args[1].startswith("update-") for args in aws.calls))
+        changed = publish(aws, policies=policies,
+                          expected_policy_sha256=hashlib.sha256(old.encode()).hexdigest())
+        self.assertEqual((changed["configuration_updates"], changed["code_updates"]), (1, 0))
+        variables = aws.cfg["Environment"]["Variables"]
+        self.assertEqual(json.loads(variables["BENCHMARK_POLICIES"]), policies)
+        self.assertEqual(variables["KEEP"], "private-value")
+        self.assertEqual(changed["benchmark_policy_sha256"],
+                         hashlib.sha256(variables["BENCHMARK_POLICIES"].encode()).hexdigest())
+        again = publish(aws, policies=policies)
+        self.assertEqual((again["configuration_updates"], again["code_updates"]), (0, 0))
+
     def test_preserves_environment_and_uses_revision_preconditions(self):
         aws = FakeAws()
         result = publish(aws)
