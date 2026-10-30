@@ -44,15 +44,17 @@ def beneath(fd,name,create=False):
         os.close(parent)
         raise
 
-def verify(fd,digest,size,source=False,proven=False):
+def verify(fd,digest,size,source=False,proven=False,pending=False):
     assert isinstance(digest,str) and re.fullmatch(r'[a-f0-9]{64}',digest)
     assert type(size) is int and size>=0
-    info=private(fd,False,source_links=source and proven)
+    allow_links=(source and proven) or pending
+    info=private(fd,False,source_links=allow_links)
+    if pending: assert not source and info.st_nlink==2
     if not source: assert stat.S_IMODE(info.st_mode)==0o400
     before=src_stamp(info)
     assert info.st_size==size
     assert src_hash(fd,size)==digest, 'Archive checksum mismatch'
-    assert src_stamp(private(fd,False,source_links=source and proven))==before
+    assert src_stamp(private(fd,False,source_links=allow_links))==before
 
 
 def copy_one(item):
@@ -136,6 +138,7 @@ def copy_one(item):
             assert stat.S_ISREG(installed.st_mode) and installed.st_uid==os.getuid()
             assert stat.S_IMODE(installed.st_mode)==0o400 and installed.st_nlink==2
             assert (temporary_stat.st_dev,temporary_stat.st_ino)==(installed.st_dev,installed.st_ino)
+            verify(existing,digest,size,pending=True)
             os.unlink(temporary,dir_fd=target)
             os.fsync(target)
         verify(existing,digest,size)
@@ -170,6 +173,7 @@ def verify_one(item):
                 assert stat.S_ISREG(installed.st_mode) and installed.st_uid==os.getuid()
                 assert stat.S_IMODE(installed.st_mode)==0o400 and installed.st_nlink==2
                 assert (pending.st_dev,pending.st_ino)==(installed.st_dev,installed.st_ino)
+                verify(existing,item['sha256'],item['size_bytes'],pending=True)
                 raise SystemExit(3)
             verify(existing,item['sha256'],item['size_bytes'])
             os.fsync(existing)

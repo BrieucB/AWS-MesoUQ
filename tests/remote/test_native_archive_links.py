@@ -451,3 +451,129 @@ def test_cached_verification_transport_failure_propagates_without_source_work(se
         session.worker.archive(campaign)
     assert caught.value.returncode == 255
     assert not archive_record(session).get("archive_verified")
+
+
+def pending_installation_alias(destination):
+    partial = destination.with_name("." + destination.name + ".partial")
+    os.link(destination, partial)
+    assert destination.stat().st_nlink == 2
+    assert source_stat(destination) == source_stat(partial)
+    return partial
+
+
+@pytest.mark.parametrize("source_gone", [False, True])
+def test_valid_pending_installation_verifies_readonly_then_recovers(native_files, source_gone):
+    transport, source, target = native_files
+    original = private_file(source, "a.bin")
+    blob = original.read_bytes()
+    item = transfers(transport, source)[0]
+    transport.archive_copy_batch(str(target), "native-1", [item])
+    destination = target / "native-1" / "a.bin"
+    partial = pending_installation_alias(destination)
+    original_before = source_stat(original)
+    if source_gone:
+        shutil.rmtree(source)
+    before = {path.name: source_stat(path) for path in (destination, partial)}
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        transport.archive_verify_batch(str(target), "native-1", [item])
+    assert caught.value.returncode == 3
+    assert {path.name: source_stat(path) for path in (destination, partial)} == before
+    assert destination.read_bytes() == partial.read_bytes() == blob
+    transport.archive_copy_batch(str(target), "native-1", [item])
+    transport.archive_verify_batch(str(target), "native-1", [item])
+    assert not partial.exists() and destination.read_bytes() == blob
+    assert source_stat(destination)[:2] == before[destination.name][:2]
+    assert destination.stat().st_mode & 0o777 == 0o400
+    assert destination.stat().st_nlink == 1
+    if not source_gone:
+        assert source_stat(original) == original_before
+
+
+@pytest.mark.parametrize("operation", ["archive_copy_batch", "archive_verify_batch"])
+@pytest.mark.parametrize("damage", ["hash", "size"])
+def test_corrupt_pending_installation_rejects_without_alias_mutation(native_files, operation, damage):
+    transport, source, target = native_files
+    private_file(source, "a.bin")
+    item = transfers(transport, source)[0]
+    transport.archive_copy_batch(str(target), "native-1", [item])
+    destination = target / "native-1" / "a.bin"
+    partial = pending_installation_alias(destination)
+    destination.chmod(0o600)
+    destination.write_bytes(b"!" * item["size_bytes"] if damage == "hash" else b"short")
+    destination.chmod(0o400)
+    shutil.rmtree(source)
+    before = {path.name: source_stat(path) for path in (destination, partial)}
+    blobs = {path.name: path.read_bytes() for path in (destination, partial)}
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        getattr(transport, operation)(str(target), "native-1", [item])
+    assert caught.value.returncode == 1
+    assert {path.name: source_stat(path) for path in (destination, partial)} == before
+    assert {path.name: path.read_bytes() for path in (destination, partial)} == blobs
+
+
+def test_cached_valid_pending_installation_recovers_with_fresh_source_proof(session, monkeypatch):
+    campaign, root = pending_archive(session, extra=40, aliases=True)
+    seed_interrupted_archive(session, campaign, monkeypatch, partial=False)
+    record = archive_record(session)
+    old_files = copy.deepcopy(record["archive_files"])
+    old_manifest = record["archive_manifest"]
+    item = record["archive_files"][-1]
+    destination = Path(session.operator["archive_root"]) / campaign["id"] / item["path"]
+    partial = pending_installation_alias(destination)
+    before = {name: source_stat(root / name) for name in ("retained/linked-a.bin", "retained/linked-b.bin")}
+    original_snapshot = session.worker._archive_snapshot
+    snapshots = []
+    def capture_snapshot(path):
+        snapshots.append(path)
+        return original_snapshot(path)
+    monkeypatch.setattr(session.worker, "_archive_snapshot", capture_snapshot)
+    session.worker.archive(campaign)
+    assert snapshots == [str(root)] and not partial.exists()
+    assert destination.stat().st_nlink == 1
+    assert destination.stat().st_mode & 0o777 == 0o400
+    assert {name: source_stat(root / name) for name in before} == before
+    assert record["archive_files"] == old_files and record["archive_manifest"] == old_manifest
+    assert record["archive_verified"]
+    assert_plain_archive_cache(record)
+    assert session.store.state["benchmark_campaigns"][campaign["id"]]["archive"]["status"] == "verified"
+
+
+@pytest.mark.parametrize("source_gone", [False, True])
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_cached_corrupt_pending_installation_rejects_before_source_or_payload_writes(session, monkeypatch, source_gone, incomplete):
+    campaign, root = pending_archive(session, extra=70, aliases=True)
+    seed_interrupted_archive(session, campaign, monkeypatch, partial=False)
+    record = archive_record(session)
+    files = record["archive_files"]
+    old_files, old_manifest = copy.deepcopy(files), record["archive_manifest"]
+    batches = session.worker._archive_batches(files)
+    assert len(batches) >= 3
+    archive = Path(session.operator["archive_root"]) / campaign["id"]
+    if incomplete:
+        (archive / files[0]["path"]).unlink()
+    destination = archive / files[-1]["path"]
+    partial = pending_installation_alias(destination)
+    corrupt_private_target(destination)
+    before = {path.name: source_stat(path) for path in (destination, partial)}
+    blobs = {path.name: path.read_bytes() for path in (destination, partial)}
+    source_before = {name: source_stat(root / name) for name in ("retained/linked-a.bin", "retained/linked-b.bin")}
+    if source_gone:
+        shutil.rmtree(root)
+    original_verify = session.cluster.archive_verify_batch
+    verified = []
+    def capture_verify(target, token, items):
+        verified.append([item["destination"] for item in items])
+        return original_verify(target, token, items)
+    monkeypatch.setattr(session.cluster, "archive_verify_batch", capture_verify)
+    forbid_source_work(session, monkeypatch)
+    with pytest.raises(ArtifactIntegrityError):
+        session.worker.archive(campaign)
+    assert len(verified) == len(batches)
+    assert {path.name: source_stat(path) for path in (destination, partial)} == before
+    assert {path.name: path.read_bytes() for path in (destination, partial)} == blobs
+    if not source_gone:
+        assert {name: source_stat(root / name) for name in source_before} == source_before
+    assert record["archive_files"] == old_files and record["archive_manifest"] == old_manifest
+    assert not record.get("archive_verified")
+    assert_plain_archive_cache(record)
+    assert session.store.state["benchmark_campaigns"][campaign["id"]]["archive"]["status"] == "requested"

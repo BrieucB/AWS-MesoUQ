@@ -122,7 +122,11 @@ the worker separately verifies each completed batch before attestation.
 A partial restart re-inventories fresh source proofs and checks the immutable
 logical inventory. A completely verified PROJECT target can recover a lost
 acknowledgement after SCRATCH has disappeared. Missing targets do not hide later
-corruption: all cached verification batches finish before source work or writes.
+corruption: cached verification continues through missing targets and rejects
+corrupt payloads before source inspection, staging, or payload writes. Verification
+may create the archive token directory and its .archive.lock control file. A
+recognized interrupted two-link installation passes checksum, size and stable
+inode checks without changing either alias before recovery is allowed.
 The existing archive event identity is reused; recovery never requires another
 browser archival request.
 
