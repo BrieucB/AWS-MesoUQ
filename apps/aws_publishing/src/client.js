@@ -11,16 +11,50 @@ export function validateRuntime(config, location = globalThis.location) {
   return config;
 }
 export class Api {
-  constructor(config,token,fetcher=fetch,{expiresAt=Infinity,onUnauthorized=()=>{}}={}){this.config=config;this.token=token;this.fetcher=fetcher.bind(globalThis);this.expiresAt=expiresAt;this.onUnauthorized=onUnauthorized;this.authFailed=false;}
-  invalidate(){if(!this.authFailed){this.authFailed=true;this.token='';this.onUnauthorized();}}
+  constructor(config,token,fetcher=fetch,{expiresAt=Infinity,onUnauthorized=()=>{},ensureSession=null,renewable=false}={}){
+    this.config=config;this.token=token;this.fetcher=fetcher.bind(globalThis);this.expiresAt=expiresAt;
+    this.onUnauthorized=onUnauthorized;this.ensureSession=ensureSession;this.renewable=renewable;this.authFailed=false;this.authVersion=0;
+  }
+  invalidate(){if(!this.authFailed){this.authFailed=true;this.authVersion++;this.token='';this.onUnauthorized();}}
+  applySession(session){
+    if(this.authFailed)return;
+    this.token=session.token;this.expiresAt=session.expiresAt;this.renewable=!!session.renewable;
+  }
+  async ready(options={}){
+    if(this.authFailed)throw Error('Your site session expired. Sign in again.');
+    if(this.ensureSession){
+      const version=this.authVersion;
+      let session;
+      try{session=await this.ensureSession(options);}
+      catch(error){if(error.authEnded||error.status===401||error.status===403)this.invalidate();throw error;}
+      if(this.authFailed||version!==this.authVersion)throw Error('Your site session expired. Sign in again.');
+      if(!session){this.invalidate();throw Error('Your site session expired. Sign in again.');}
+      this.applySession(session);
+    }
+    if(this.authFailed||Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}
+  }
   async request(path,body,method=body===undefined?'GET':'POST'){
-    if(this.authFailed||Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}
-    const response=await this.fetcher(this.config.apiBaseUrl.replace(/\/$/,'')+path,{method,headers:{Authorization:`Bearer ${this.token}`,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),cache:'no-store',credentials:'omit',redirect:'error'});
-    const data=await response.json().catch(()=>null);
-    if(response.status===401)this.invalidate();
-    if(this.authFailed||Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}
-    if(!response.ok)throw Error(data?.error?.message||`Request failed (${response.status}).`);
-    return data;
+    method=method.toUpperCase();
+    await this.ready();
+    const version=this.authVersion;
+    for(let attempt=0;attempt<2;attempt++){
+      if(this.authFailed||version!==this.authVersion)throw Error('Your site session expired. Sign in again.');
+      const rejectedToken=this.token;
+      const response=await this.fetcher(this.config.apiBaseUrl.replace(/\/$/,'')+path,{method,headers:{Authorization:'Bearer '+this.token,...(body===undefined?{}:{'Content-Type':'application/json'})},...(body===undefined?{}:{body:JSON.stringify(body)}),cache:'no-store',credentials:'omit',redirect:'error'});
+      const data=await response.json().catch(()=>null);
+      if(this.authFailed||version!==this.authVersion)throw Error('Your site session expired. Sign in again.');
+      if(response.status===401){
+        if(this.renewable&&this.ensureSession&&attempt===0){
+          await this.ready({force:true,rejectedToken});
+          if(method==='GET')continue;
+          throw Error('Sign-in was renewed. This action was not retried; check its status before trying again.');
+        }
+        this.invalidate();throw Error('Your site session expired. Sign in again.');
+      }
+      if(!this.ensureSession&&Date.now()>=this.expiresAt){this.invalidate();throw Error('Your site session expired. Sign in again.');}
+      if(!response.ok)throw Error(data?.error?.message||'Request failed ('+response.status+').');
+      return data;
+    }
   }
   project(id,suffix){return `/v1/projects/${encodeURIComponent(id)}${suffix}`;}
   async upload(project,file,kind,metadata){
@@ -91,16 +125,45 @@ export function formatTimestamp(value){
 
 // Protected-portal session bootstrap. Only the regional /auth/* service handles
 // OAuth callbacks/cookies; the research application receives a memory-only token.
-export async function readSiteSession(fetcher=fetch,now=Date.now()){
-  const response=await fetcher('/auth/session',{method:'GET',headers:{Accept:'application/json'},credentials:'include',cache:'no-store',redirect:'error'});
-  const data=await response.json().catch(()=>null);
-  if(response.status===401)return null;
-  if(!response.ok){const error=Error(data?.error?.message||`Site session request failed (${response.status}).`);error.status=response.status;throw error;}
+function siteSession(data,now){
+  const allowed=data?.renewable===true?['access_token','expires_at','renewable','absolute_expires_at','idle_expires_at','generation']:['access_token','expires_at'];
+  if(!data||Object.keys(data).some(key=>!allowed.includes(key)))throw Error('Invalid site session response fields.');
   if(typeof data?.access_token!=='string'||!data.access_token||!Number.isFinite(data.expires_at))throw Error('Invalid site session response.');
   const expiresAt=data.expires_at*1000;
   if(!Number.isFinite(expiresAt))throw Error('Invalid site session expiry.');
   if(expiresAt<=now)return null;
-  return {token:data.access_token,expiresAt};
+  const session={token:data.access_token,expiresAt};
+  if(data.renewable!==undefined){
+    if(data.renewable!==true||!Number.isSafeInteger(data.generation)||data.generation<0
+       ||!Number.isFinite(data.absolute_expires_at)||!Number.isFinite(data.idle_expires_at))throw Error('Invalid remembered site session response.');
+    const absoluteExpiresAt=data.absolute_expires_at*1000,idleExpiresAt=data.idle_expires_at*1000;
+    if(!Number.isFinite(absoluteExpiresAt)||!Number.isFinite(idleExpiresAt)||idleExpiresAt>absoluteExpiresAt
+       ||expiresAt>Math.min(absoluteExpiresAt,idleExpiresAt))throw Error('Invalid remembered site session limits.');
+    Object.assign(session,{renewable:true,absoluteExpiresAt,idleExpiresAt,generation:data.generation});
+  }
+  return session;
+}
+function siteSessionError(response,data){
+  const error=Error(data?.error?.message||'Site session request failed ('+response.status+').');
+  error.status=response.status;error.code=data?.error?.code;
+  const retry=Number(response.headers?.get?.('Retry-After'));
+  error.retryAfterMs=Number.isFinite(retry)&&retry>0?Math.min(5000,Math.max(1000,retry*1000)):1000;
+  return error;
+}
+export async function readSiteSession(fetcher=fetch,now=Date.now()){
+  const response=await fetcher('/auth/session',{method:'GET',headers:{Accept:'application/json'},credentials:'include',cache:'no-store',redirect:'error'});
+  const data=await response.json().catch(()=>null);
+  if(response.status===401)return null;
+  if(!response.ok)throw siteSessionError(response,data);
+  return siteSession(data,now);
+}
+export async function refreshSiteSession(activity=false,fetcher=fetch,now=Date.now()){
+  if(typeof activity!=='boolean')throw Error('Session activity must be explicit.');
+  const response=await fetcher('/auth/refresh',{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify({activity}),credentials:'include',cache:'no-store',redirect:'error'});
+  const data=await response.json().catch(()=>null);
+  if(response.status===401)return null;
+  if(!response.ok)throw siteSessionError(response,data);
+  return siteSession(data,now);
 }
 export async function endSiteSession(config,fetcher=fetch,origin=globalThis.location.origin){
   const response=await fetcher('/auth/logout',{method:'POST',headers:{Accept:'application/json'},credentials:'include',cache:'no-store',redirect:'error'});
