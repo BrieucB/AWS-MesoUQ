@@ -294,14 +294,23 @@ def test_cancel_only_exact_own_native_stage(session):
     assert entry["cloud_terminal"]
 
 
-def test_missing_receipt_is_failed_and_actual_reservation_settles(session):
+@pytest.mark.parametrize("native_state,expected_code", [
+    ("FAILED", "native_failed"), ("COMPLETED", "missing_scientific_receipt"),
+])
+def test_native_or_missing_receipt_failure_settles_actual_reservation(
+        session, native_state, expected_code):
     session.worker.sweep()
-    session.cluster.jobs["101"]["state"] = "FAILED"
+    session.cluster.jobs["101"]["state"] = native_state
     session.worker.sweep()
     stage = session.store.state["benchmark_campaigns"][session.campaign["id"]]["stages"][0]
     assert stage["status"] == "failed"
-    assert stage["failure"]["code"] == "missing_scientific_receipt"
-    assert session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"]["hnpe"]["settled_gpu_seconds"] == 10
+    assert stage["failure"]["code"] == expected_code
+    assert stage["scheduler_accounting"]["state"] == native_state
+    assert stage["scheduler_accounting"]["elapsed_seconds"] == 10
+    assert stage["scheduler_accounting"]["allocated_gpus"] == 1
+    assert stage["scheduler_accounting"]["cpu_seconds"] == 160
+    ledger = session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"]["hnpe"]
+    assert ledger["settled_gpu_seconds"] == 10 and not ledger["reservations"]
 
 
 def test_forged_receipt_request_hash_is_not_published_as_success(session):
@@ -357,8 +366,8 @@ def test_fixture_full_dag_honest_failure_and_verified_private_archive(session):
 
 
 @pytest.mark.parametrize("stage,uses_mpi", [("tmcmc", True), ("cases", False), ("metrics", False)])
-def test_standalone_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, monkeypatch, stage, uses_mpi):
-    from aws_mesouq.adapters import benchmark
+def test_standalone_legacy_adapter_pins_source_and_runs_the_real_stage_cli(tmp_path, monkeypatch, stage, uses_mpi):
+    from aws_mesouq.adapters import benchmark_legacy as benchmark
     request_path = tmp_path / "request.json"
     request_path.write_bytes(canonical({"fixture": True}))
     manifest = {"adapter_sha256": "a" * 64, "environment_script": "/trusted/runtime.sh", "environment_sha256": "a" * 64, "repository": "/trusted/science", "science_revision": "b" * 40, "request": str(request_path), "configuration_hash": checksum({"fixture": True}), "python_bin": "/trusted/bin/python", "campaign_root": "/private/fixture", "campaign_instance_id": "fixture-campaign", "stage": stage, "internal_seconds": 50, "device": "cpu" if stage == "cases" else "cuda"}

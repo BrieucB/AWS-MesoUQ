@@ -352,16 +352,20 @@ def test_expired_refresh_retires_only_request_then_recovers_same_stage(
             observed.append(copy.deepcopy(payload))
             result = original(method, path, payload)
             if lose[0]:
+                assert result.get("stage") and result["stage"]["id"] == entry["claim"]["stage"]["id"]
                 lose[0] = False
                 raise OSError("fixture lost committed refresh response")
             return result
         return original(method, path, payload)
 
     monkeypatch.setattr(session.api, "request", lose_first_claim)
+    session.clock[0] = entry["claim"]["lease_expires_at"] + 1
     with pytest.raises(OSError):
         worker._refresh(entry)
     frozen = copy.deepcopy(entry["refresh_request_body"])
-    session.clock[0] = entry["claim"]["lease_expires_at"] + 1
+    authoritative = session.store.state["benchmark_campaigns"][session.campaign["id"]]
+    renewed = next(stage for stage in authoritative["stages"] if stage["id"] == entry["claim"]["stage"]["id"])
+    session.clock[0] = renewed["lease"]["expires_at"] + 1
     with pytest.raises(Exception) as expired:
         worker._refresh(entry)
     assert getattr(expired.value, "code", None) == "claim_expired"
