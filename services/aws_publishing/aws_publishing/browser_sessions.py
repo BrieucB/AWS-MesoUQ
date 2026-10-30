@@ -12,7 +12,7 @@ import threading
 import time
 
 from jwt import PyJWTError
-from jwt.exceptions import PyJWKClientConnectionError
+from jwt.exceptions import PyJWKClientConnectionError, ExpiredSignatureError
 
 MAXIMUM_SECONDS = 30 * 86400
 IDLE_SECONDS = 7 * 86400
@@ -23,6 +23,10 @@ NAMESPACE = "AUTH_SESSION#"
 
 class SessionExpired(ValueError):
     pass
+
+
+class AccessTokenExpired(SessionExpired):
+    """A cached access credential may be replaced only through the live family."""
 
 
 class RefreshBusy(RuntimeError):
@@ -136,13 +140,20 @@ class BrowserSessions:
     def _verify(self, token, subject):
         try:
             claims = self.provider.verify(token)
-            if claims["sub"]!=subject or claims["exp"]<=self.clock():
-                raise SessionExpired("Remembered token identity differs")
-            return claims
+        except ExpiredSignatureError:
+            raise AccessTokenExpired("Remembered access token expired") from None
         except PyJWKClientConnectionError:
             raise RefreshUnavailable("Identity verification is temporarily unavailable") from None
         except (ValueError,KeyError,TypeError,PyJWTError):
             raise SessionExpired("Remembered token identity differs") from None
+        try:
+            if claims["sub"]!=subject:
+                raise SessionExpired("Remembered token identity differs")
+            if claims["exp"]<=self.clock():
+                raise AccessTokenExpired("Remembered access token expired")
+        except (KeyError,TypeError):
+            raise SessionExpired("Remembered token identity differs") from None
+        return claims
 
     def _member(self, subject):
         if not self.invited(subject):
@@ -194,7 +205,12 @@ class BrowserSessions:
         self._member(record["subject"])
         if self.clock()>=min(record["grant_expires_at"],record["access_expires_at"]):
             raise RefreshBusy("refresh_required")
-        self._verify(record["tokens"]["access_token"],record["subject"])
+        try:
+            self._verify(record["tokens"]["access_token"],record["subject"])
+        except AccessTokenExpired:
+            # An eligible encrypted family can replace an expired cached JWT.
+            # Return no token; only the subsequent authoritative POST can renew.
+            raise RefreshBusy("refresh_required") from None
         try:
             return self._response(record)
         except SessionExpired:
@@ -217,18 +233,31 @@ class BrowserSessions:
                 updated["last_activity_at"] = now
                 updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
             if record["access_expires_at"]>now+60:
-                self._verify(record["tokens"]["access_token"],record["subject"])
-                # Verify against the original bounds before allowing activity to
-                # extend idle. Never use the pre-verification timestamp for CAS.
-                now = int(self._active_now(record))
-                if activity:
-                    updated["last_activity_at"] = now
-                    updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
-                updated["grant_expires_at"] = min(now+GRANT_SECONDS,updated["idle_expires_at"],
-                    record["absolute_expires_at"],record["access_expires_at"])
-                if self._write(record,updated):
-                    return self._response(updated)
-                continue
+                try:
+                    self._verify(record["tokens"]["access_token"],record["subject"])
+                except AccessTokenExpired:
+                    # Verification crossed cached JWT expiry. Do not publish it
+                    # or revoke an otherwise eligible family; acquire the normal
+                    # CAS lease below to obtain a new verified provider token.
+                    pass
+                else:
+                    now = int(self._active_now(record))
+                    if activity:
+                        updated["last_activity_at"] = now
+                        updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
+                    updated["grant_expires_at"] = min(now+GRANT_SECONDS,updated["idle_expires_at"],
+                        record["absolute_expires_at"],record["access_expires_at"])
+                    if self._write(record,updated):
+                        return self._response(updated)
+                    continue
+            # Revalidate original family bounds after any cached-token work and
+            # before committing an activity touch or a provider-refresh lease.
+            now = int(self._active_now(record))
+            updated = copy.deepcopy(record)
+            updated.update(refresh_owner=None,refresh_until=0)
+            if activity:
+                updated["last_activity_at"] = now
+                updated["idle_expires_at"] = min(now+IDLE_SECONDS,record["absolute_expires_at"])
             updated["refresh_owner"] = secrets.token_urlsafe(16)
             updated["refresh_until"] = now+REFRESH_LEASE_SECONDS
             if not self._write(record,updated):
