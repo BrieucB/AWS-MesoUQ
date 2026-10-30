@@ -82,7 +82,7 @@ try:
     assert activity["preview"] and activity["foreground"]
     assert activity["limits"]["idle"]>before["limits"]["idle"] and activity["limits"]["absolute"]==before["limits"]["absolute"]
     assert activity["localStorageItems"]==activity["sessionStorageItems"]==0
-    screenshot=value(command("WebDriver:TakeScreenshot",{"id":None,"highlights":[],"full":False}))
+    screenshot=value(command("WebDriver:TakeScreenshot",{"id":None,"highlights":[],"full":True}))
     (output/"remembered-preview.png").write_bytes(base64.b64decode(screenshot))
     second=value(command("WebDriver:NewWindow",{"type":"tab"}))["handle"]
     command("WebDriver:SwitchToWindow",{"handle":second})

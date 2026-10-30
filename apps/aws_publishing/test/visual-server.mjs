@@ -9,6 +9,11 @@ http.createServer(async(req,res)=>{
   try{
     res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     const url=new URL(req.url,'http://127.0.0.1:4173');
+    if(url.pathname==='/logout'&&['GET','HEAD'].includes(req.method)){
+      // Fixed synthetic landing only: ignore every query value, never redirect.
+      res.setHeader('Content-Type','text/html');res.setHeader('Cache-Control','no-store');
+      res.end('<!doctype html><html lang="en"><meta charset="utf-8"><title>Synthetic sign-out</title><body><h1>Signed out of the synthetic test</h1><p>Test fixture only. No live authentication or private application data.</p></body></html>');return;
+    }
     if(url.pathname==='/__fixtures__/workspace'){
       let html=await readFile(path.join(root,'index.html'),'utf8');
       html=html.replace('href="src/style.css"','href="/src/style.css"').replace('src="src/app.js"','src="/test/browser-fixture.js"');

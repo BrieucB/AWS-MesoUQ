@@ -75,6 +75,8 @@ content execution for its test-only page globals. A named Marionette sandbox has
 Xray wrappers that hide properties added by page scripts; this must not be
 mistaken for a missing app fixture. Native ElementClick still supplies the trusted
 foreground event, and all preview, idle-policy and logout assertions remain.
+The loopback fixture's exact /logout route serves a fixed public signed-out page;
+it ignores query values and never follows a supplied logout_uri or redirects.
 See [Mozilla's Marionette script documentation](https://firefox-source-docs.mozilla.org/python/marionette_driver.html)
 and its [content-command implementation](https://github.com/mozilla/gecko-dev/blob/master/remote/marionette/actors/MarionetteCommandsChild.sys.mjs).
 
