@@ -1,11 +1,21 @@
 """Explicit own-user local or SSH transport; never evaluates user-provided shell code."""
 from __future__ import annotations
 
+import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
+from .ssh_session import SSHSession, SSHSessionError
+
+_MISSING_HEALTH_CHECK = object()
+
+
+def check_transport_health(transport):
+    """Use the health hook when provided by an SSH-aware transport."""
+    check = getattr(transport, "check_healthy", _MISSING_HEALTH_CHECK)
+    if check is not _MISSING_HEALTH_CHECK:
+        check()
 
 
 PRIVATE_ROOT_PROBE = r'''import os,stat,sys,uuid
@@ -50,22 +60,48 @@ finally:
 
 
 class Transport:
-    def __init__(self, *, host: str | None = None, local: bool = False):
+    def __init__(self, *, host: str | None = None, local: bool = False, state_dir: str | Path | None = None):
         if local == bool(host):
             raise ValueError("Select exactly one of verified local mode or an SSH host")
         if host and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@-]*", host):
             raise ValueError("Invalid SSH host alias")
         self.host = host
+        self._state_dir = state_dir
+        self._session = None
+        self._closed = False
         # Local helpers use the explicitly selected connector interpreter. SSH
         # helpers retain the verified cluster-side Python policy, never a bare
         # system python3 (which is unsupported on Karolina).
         self.staging_python = sys.executable if local else "/usr/bin/python3.11"
 
+    def _ssh_session(self):
+        if self._closed:
+            raise SSHSessionError("closed_session")
+        if self._session is None:
+            directory = self._state_dir or os.environ.get("AWS_MESOUQ_SSH_STATE_DIR")
+            if not directory:
+                raise SSHSessionError("state_directory_required")
+            self._session = SSHSession(self.host, directory, borrow_only=True)
+        return self._session
+
+    def check_healthy(self):
+        """Check SSH admission/session state without opening a connection."""
+        if self._closed:
+            raise SSHSessionError("closed_session")
+        if self.host is not None:
+            self._ssh_session().check_healthy()
+
     def run_bytes(self, argv: list[str], *, data: bytes | None = None) -> bytes:
-        command = argv if self.host is None else ["ssh", "-oBatchMode=yes", "-oForwardAgent=no", self.host, shlex.join(argv)]
-        result = subprocess.run(command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        if self.host is not None:
+            return self._ssh_session().run_bytes(argv, data=data)
+        result = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 check=True, timeout=90)
         return result.stdout
+
+    def close(self):
+        self._closed = True
+        if self._session is not None:
+            self._session.close()
 
     def run(self, argv: list[str], *, data: bytes | None = None) -> str:
         return self.run_bytes(argv, data=data).decode()

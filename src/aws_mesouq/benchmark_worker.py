@@ -16,7 +16,8 @@ import uuid
 
 from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_create, scientific_request_checksum
 from .benchmark_client import BenchmarkClient, native_accounting
-from .connector.transport import absolute_path, safe_id, safe_relative
+from .connector.transport import absolute_path, safe_id, safe_relative, check_transport_health
+from .connector.ssh_session import SSHSessionError
 from .connector.archive_source import TREE_HELPER
 
 class ArtifactIntegrityError(ValueError):
@@ -141,6 +142,7 @@ else:
             self._refresh(entry)
 
     def _refresh(self, entry):
+        check_transport_health(self.transport)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         request_id = entry.setdefault("refresh_request_id", uuid.uuid4().hex)
         self.save()
@@ -215,6 +217,7 @@ else:
         return result
 
     def _claim(self):
+        check_transport_health(self.transport)
         request_id = self.state.setdefault("claim_request_id", uuid.uuid4().hex)
         self.save()
         try:
@@ -550,6 +553,7 @@ os.close(fd)
         self._send(entry, "succeeded", result=result, scheduler_accounting=accounting)
 
     def poll(self, entry):
+        check_transport_health(self.transport)
         if entry.get("pending_event"):
             self._send(entry)
         if entry.get("cloud_terminal"):
@@ -733,6 +737,7 @@ os.close(fd)
         self.save()
 
     def archive(self, campaign):
+        check_transport_health(self.transport)
         ident = safe_id(campaign["id"])
         if campaign.get("archive", {}).get("status") != "requested":
             return
@@ -798,11 +803,14 @@ os.close(fd)
 
 
     def sweep(self):
+        check_transport_health(self.transport)
         errors = []
         for entry in list(self.state["stages"].values()):
             if not entry.get("cloud_terminal"):
                 try:
                     self.poll(entry)
+                except SSHSessionError:
+                    raise
                 except Exception as error:
                     errors.append(type(error).__name__)
         while sum(not e.get("cloud_terminal") for e in self.state["stages"].values()) < self.maximum_active:
@@ -811,13 +819,18 @@ os.close(fd)
                 break
             try:
                 self.poll(entry)
+            except SSHSessionError:
+                raise
             except Exception as error:
                 errors.append(type(error).__name__)
+        check_transport_health(self.transport)
         campaigns = self.api.request("GET", f"/v1/projects/{self.project}/benchmarks")["campaigns"]
         for campaign in campaigns:
             if campaign.get("archive", {}).get("status") == "requested":
                 try:
                     self.archive(campaign)
+                except (SSHSessionError, ArtifactIntegrityError):
+                    raise
                 except Exception as error:
                     errors.append(type(error).__name__)
         return {"active_stages": sum(not e.get("cloud_terminal") for e in self.state["stages"].values()), "errors": errors}
@@ -847,20 +860,33 @@ def main(argv=None):
     from .connector.journal import Journal
     from .connector.slurm import Slurm
     from .connector.transport import Transport
-    operator = json.loads(args.operator_config.read_text())
-    journal = Journal(args.journal)
+    operator = validate_operator(json.loads(args.operator_config.read_text()))
+    transport = Transport(host=args.ssh_host, local=args.local_cluster)
+    journal = None
     try:
+        journal = Journal(args.journal)
         existing_identity(journal)
+        slurm = Slurm(transport)
+        if transport.identity() != operator["expected_user"] or transport.run(["hostname", "-f"]).strip() != operator["expected_host"]:
+            parser.error("HPC identity differs from the approved operator account and endpoint")
         api = API(args.api_url, browser_login(args.oauth_domain, args.client_id, args.callback_port))
-        worker = BenchmarkWorker(api, Slurm(Transport(host=args.ssh_host, local=args.local_cluster)), journal, project=args.project, operator=operator)
+        worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator)
         while True:
             print(json.dumps(worker.sweep(), sort_keys=True), flush=True)
             if args.once:
                 break
             time.sleep(args.poll_seconds)
+        return 0
+    except (SSHSessionError, ArtifactIntegrityError) as error:
+        category = error.category if isinstance(error, SSHSessionError) else "archive_integrity_error"
+        print(json.dumps({"observed_at": time.time(), "connector_blocked": True, "error_category": category, "recovery_required": True}), flush=True)
+        return 2
     finally:
-        journal.close()
-    return 0
+        try:
+            if journal is not None:
+                journal.close()
+        finally:
+            transport.close()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,21 +42,32 @@ def test_actual_helper_strips_submission_overrides_and_forces_one_job(tmp_path, 
     calls = []
     original_run = subprocess.run
     if mode == 'ssh':
-        def ssh_standin(command, *args, **kwargs):
-            calls.append(command)
-            assert command[0] == 'ssh'
-            assert '-oBatchMode=yes' in command
-            assert '-oForwardAgent=no' in command
-            # Model the SSH server's quoted argv without starting a connection.
-            remote = shlex.split(command[-1])
-            # The simulated server path need not exist on a CI toolcache host.
-            if remote[0] == '/usr/bin/python3.11':
-                remote[0] = sys.executable
-            else:
-                assert remote == ['id', '-un']
-            return original_run(remote, *args, **kwargs)
-        monkeypatch.setattr(subprocess, 'run', ssh_standin)
-        transport = Transport(host='ownuser@fake-cluster')
+        from aws_mesouq.connector import transport as module
+        from aws_mesouq.connector.ssh_session import _client_command
+        class Borrowed:
+            def __init__(self, host, directory, *, borrow_only=False):
+                assert host == "ownuser@fake-cluster" and borrow_only is True
+                assert Path(directory) == tmp_path / "guard"
+            def run_bytes(self, argv, *, data=None):
+                command = _client_command(SimpleNamespace(socket=tmp_path / "unused.sock"),
+                    {"hostname": "fake-cluster", "user": "ownuser", "port": 22}, argv=argv)
+                calls.append(command)
+                assert command[0] == "ssh"
+                assert "-oBatchMode=yes" in command and "-oForwardAgent=no" in command
+                assert "-oProxyCommand=/usr/bin/false" in command
+                remote = shlex.split(command[-1])
+                if remote[0] == "/usr/bin/python3.11":
+                    remote[0] = sys.executable
+                else:
+                    assert remote == ["id", "-un"]
+                result = original_run(remote, input=data, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, check=True, timeout=90)
+                return result.stdout
+            def close(self):
+                pass
+        monkeypatch.setattr(module, "SSHSession", Borrowed)
+        monkeypatch.setenv("AWS_MESOUQ_SSH_STATE_DIR", str(tmp_path / "guard"))
+        transport = Transport(host="ownuser@fake-cluster")
     else:
         transport = Transport(local=True)
     scheduler = Slurm(transport)

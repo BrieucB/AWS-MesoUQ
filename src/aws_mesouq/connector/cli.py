@@ -14,6 +14,7 @@ from .connector import Connector
 from .journal import Journal
 from .slurm import Slurm
 from .transport import Transport
+from .ssh_session import SSHSessionError
 from .signing import device_identity
 
 
@@ -65,12 +66,13 @@ def main(argv=None):
     if args.durable_archive_root and not args.archive_root:
         parser.error("--durable-archive-root requires --archive-root separate from SCRATCH")
     transport = Transport(host=args.ssh_host, local=args.local_cluster)
-    if transport.identity() != args.expected_user or transport.run(["hostname", "-f"]).strip() != args.expected_host:
-        parser.error("HPC identity/hostname differs from the explicitly approved account and endpoint")
-    token = browser_login(args.oauth_domain, args.client_id, args.callback_port)
-    api = API(args.api_url, token)
-    journal = Journal(args.journal)
+    journal = None
     try:
+        if transport.identity() != args.expected_user or transport.run(["hostname", "-f"]).strip() != args.expected_host:
+            parser.error("HPC identity/hostname differs from the explicitly approved account and endpoint")
+        token = browser_login(args.oauth_domain, args.client_id, args.callback_port)
+        api = API(args.api_url, token)
+        journal = Journal(args.journal)
         connector = Connector(api, Slurm(transport), journal, project=args.project, site=site,
                               run_root=args.run_root, repository=args.repository,
                               archive_root=args.archive_root, durable_archive_root=args.durable_archive_root,
@@ -82,9 +84,16 @@ def main(argv=None):
             if args.once:
                 break
             time.sleep(args.poll_seconds)
+        return 0
+    except SSHSessionError as error:
+        print(json.dumps({"observed_at": time.time(), "connector_blocked": True, "error_category": error.category, "recovery_required": True}), flush=True)
+        return 2
     finally:
-        journal.close()
-    return 0
+        try:
+            if journal is not None:
+                journal.close()
+        finally:
+            transport.close()
 
 
 if __name__ == "__main__":

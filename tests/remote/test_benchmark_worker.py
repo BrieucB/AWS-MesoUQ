@@ -468,3 +468,34 @@ def test_same_request_receipt_from_another_campaign_is_rejected(session):
     stage = session.store.state["benchmark_campaigns"][session.campaign["id"]]["stages"][0]
     assert stage["status"] == "failed"
     assert stage["failure"]["code"] == "invalid_scientific_receipt"
+
+
+def test_module_cli_help_exits_before_authentication(tmp_path):
+    import subprocess
+    import sys
+    hooks = tmp_path / 'hooks'
+    hooks.mkdir()
+    loaded = hooks / 'loaded'
+    (hooks / 'sitecustomize.py').write_text(
+        'import sys\nfrom pathlib import Path\n'
+        + f'Path({str(loaded)!r}).write_text("loaded")\n'
+        + 'def guard(event, arguments):\n'
+        + '    if event in {"socket.connect", "subprocess.Popen", "webbrowser.open"}:\n'
+        + '        raise RuntimeError("help attempted external work")\n'
+        + 'sys.addaudithook(guard)\n'
+    )
+    environment = dict(os.environ)
+    source = Path(__file__).resolve().parents[2] / 'src'
+    environment['PYTHONPATH'] = os.pathsep.join([str(hooks), str(source)])
+    environment['PYTHONDONTWRITEBYTECODE'] = '1'
+    environment.pop('AWS_MESOUQ_SSH_STATE_DIR', None)
+    result = subprocess.run(
+        [sys.executable, '-m', 'aws_mesouq.benchmark_worker', '--help'],
+        cwd=tmp_path, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, timeout=10,
+    )
+    assert loaded.read_text() == 'loaded'
+    assert result.returncode == 0
+    assert 'usage:' in result.stdout
+    assert '--operator-config' in result.stdout and '--ssh-host' in result.stdout
+    assert result.stderr == '' and set(tmp_path.iterdir()) == {hooks}

@@ -18,6 +18,8 @@ def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch, s
             return 'ownuser'
         def run(self, argv):
             return 'verified.cluster\n'
+        def close(self):
+            performed.append('transport_closed')
     class Journal:
         def __init__(self, directory):
             pass
@@ -43,4 +45,4 @@ def test_once_runs_one_bounded_sweep_and_closes_journal(tmp_path, monkeypatch, s
         '--expected-user', 'ownuser', '--expected-host', 'verified.cluster', '--run-root', '/private/runs',
         '--repository', '/trusted/repo', '--model-registry', str(registry), '--journal', str(tmp_path / 'journal')])
     assert result == 0
-    assert performed == ['sweep', 'closed']
+    assert performed == ['sweep', 'closed', 'transport_closed']
