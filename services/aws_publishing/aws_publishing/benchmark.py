@@ -14,7 +14,7 @@ from aws_mesouq.benchmark import (
     validate_stage_result, keys, number, archive_signing_bytes,
     validate_benchmark_policy, scientific_request_checksum, expected_artifact_bytes, project_artifact_charge,
     campaign_artifact_charge, ARTIFACT_PROJECT_BYTES, ARTIFACT_CAMPAIGN_BYTES,
-    ARTIFACT_MAX_COUNT,
+    ARTIFACT_MAX_COUNT, campaign_execution_context_id, validate_supported_contexts,
 )
 from .api import fail, require_keys
 
@@ -229,7 +229,8 @@ class BenchmarkRoutes:
         return 202, {"campaign": public_campaign(campaign)}
 
     def claim(self, state, sub, identity, body, now):
-        keys(body, ("project_id", "connector_id", "site", "request_id", "signature"), ("campaign_id", "exclude_stage_ids"))
+        keys(body, ("project_id", "connector_id", "site", "request_id", "signature"), ("campaign_id", "exclude_stage_ids", "supported_contexts"))
+        supported = validate_supported_contexts(body["supported_contexts"]) if "supported_contexts" in body else None
         self.app.member(state, identity, body["project_id"])
         token(body["connector_id"])
         token(body["request_id"])
@@ -250,6 +251,13 @@ class BenchmarkRoutes:
         campaigns = sorted(state["benchmark_campaigns"].values(), key=lambda c: c["created_at"])
         for campaign in campaigns:
             if campaign["project_id"] != body["project_id"] or campaign["owner_sub"] != sub or body.get("campaign_id", campaign["id"]) != campaign["id"] or campaign["status"] in ("completed", "failed", "cancelled"):
+                continue
+            # Capability selection precedes even DAG refresh: an incompatible
+            # connector cannot change leases, revisions, failures, or budgets.
+            if supported is None:
+                if "execution_context_id" in campaign["approved_adapter"]:
+                    continue
+            elif campaign_execution_context_id(campaign) not in supported:
                 continue
             stages = {s["id"]: s for s in campaign["stages"]}
             self.refresh(campaign, now)

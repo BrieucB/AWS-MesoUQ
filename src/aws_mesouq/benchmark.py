@@ -25,6 +25,41 @@ def checksum(value):
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def operator_execution_context_id(operator):
+    """Digest a complete, already validated trusted operator configuration.
+
+    This fingerprint is a capability selector, not authorization to execute an
+    arbitrary operator. The worker validates its private registry independently.
+    """
+    return checksum({"schema": "aws_mesouq.benchmark_execution_context.v1", "operator": operator})
+
+
+def campaign_execution_context_id(campaign):
+    """Resolve only the campaign's frozen policy, never a new project default."""
+    policy = campaign["approved_adapter"]
+    if "execution_context_id" in policy:
+        value = policy["execution_context_id"]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("Invalid frozen benchmark execution context")
+        return value
+    return checksum({
+        "schema": "aws_mesouq.benchmark_context.v1",
+        "project_id": campaign["project_id"],
+        "science_revision": policy["science_revision"],
+        "adapter_sha256": policy["adapter_sha256"],
+        "archive_root": policy.get("archive_root"),
+    })
+
+
+def validate_supported_contexts(value):
+    """Validate the exact signed, bounded capability list without normalizing it."""
+    if (not isinstance(value, list) or not 1 <= len(value) <= 16 or
+            any(not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item) for item in value) or
+            value != sorted(set(value))):
+        raise ValueError("Supported benchmark contexts must be 1–16 sorted unique SHA256 identifiers")
+    return list(value)
+
+
 def keys(value, required, optional=()):
     if not isinstance(value, dict) or set(value) - set(required) - set(optional) or set(required) - set(value):
         raise ValueError("Unexpected or missing benchmark fields")
@@ -236,7 +271,11 @@ def archive_signing_bytes(campaign, body):
 def validate_benchmark_policy(policy):
     """Operator-only policy; never accepted from campaign request fields."""
     from pathlib import PurePosixPath
-    keys(policy, ("adapter_sha256", "science_revision", "scenario_families"), ("max_concurrent_stages", "archive_root"))
+    keys(policy, ("adapter_sha256", "science_revision", "scenario_families"), ("max_concurrent_stages", "archive_root", "execution_context_id"))
+    if "execution_context_id" in policy:
+        value = policy["execution_context_id"]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("Invalid operator benchmark execution context")
     for name, length in (("adapter_sha256", 64), ("science_revision", 40)):
         if not isinstance(policy[name], str) or not re.fullmatch("[0-9a-f]{" + str(length) + "}", policy[name]):
             raise ValueError("Invalid operator benchmark source pin")

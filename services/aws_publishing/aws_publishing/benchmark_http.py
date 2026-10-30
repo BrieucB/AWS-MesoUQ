@@ -6,7 +6,9 @@ from typing import Annotated, Literal
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from aws_mesouq.benchmark import validate_supported_contexts
 from mangum import Mangum
 
 from .api import APIError
@@ -86,6 +88,14 @@ class Claim(WireModel):
     signature: Annotated[str, Field(max_length=128)]
     campaign_id: Identifier | None = None
     exclude_stage_ids: list[Identifier] | None = None
+    supported_contexts: Annotated[list[str], Field(min_length=1, max_length=16)] | None = None
+
+    @field_validator("supported_contexts")
+    @classmethod
+    def canonical_contexts(cls, value):
+        # The default is omitted for old claims. Explicit null is invalid;
+        # normalizing it away would change the signed request body.
+        return validate_supported_contexts(value)
 
 
 class ArchiveEvent(WireModel):
