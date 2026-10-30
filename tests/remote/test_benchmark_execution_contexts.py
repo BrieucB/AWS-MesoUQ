@@ -389,3 +389,33 @@ def test_expired_refresh_retires_only_request_then_recovers_same_stage(
     assert record["archive_event_id"] == "f" * 32
     assert session.cluster.submit_count == 1
     assert session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"] == budget
+
+
+@pytest.mark.parametrize("adapter_kind", ["deadline_adapter", "unknown_adapter"])
+def test_default_operator_rejects_nonlegacy_adapter_before_claim(
+        session, monkeypatch, adapter_kind):
+    from types import SimpleNamespace
+    monkeypatch.delenv(REGISTRY_ENV, raising=False)
+    operator = copy.deepcopy(session.operator)
+    operator["adapter_sha256"] = (
+        hashlib.sha256(Path(adapter_catalog.__file__).with_name("benchmark.py").read_bytes()).hexdigest()
+        if adapter_kind == "deadline_adapter" else "f" * 64)
+    data = copy.deepcopy(session.journal.data)
+    data.pop("benchmark_lab")
+    before = copy.deepcopy(data)
+    saved = []
+    journal = SimpleNamespace(data=data, save=lambda: saved.append(copy.deepcopy(data)))
+    calls = []
+    original = session.api.request
+
+    def observed(method, path, payload=None):
+        calls.append((method, path))
+        return original(method, path, payload)
+
+    monkeypatch.setattr(session.api, "request", observed)
+    with pytest.raises(ValueError, match="exact legacy adapter"):
+        BenchmarkWorker(session.api, session.slurm, journal, project="p",
+                        operator=operator, clock=lambda: session.clock[0])
+    assert data == before and not saved
+    assert not any(method == "POST" for method, _ in calls)
+    assert session.cluster.submit_count == 0

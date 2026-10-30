@@ -57,6 +57,9 @@ class ExecutionContexts:
     def __init__(self, legacy_operator, project, validator):
         self.project = project
         self.legacy_operator = validator(legacy_operator)
+        from .adapters import LEGACY_BENCHMARK_ADAPTER_SHA256
+        if self.legacy_operator["adapter_sha256"] != LEGACY_BENCHMARK_ADAPTER_SHA256:
+            raise ValueError("Original benchmark operator requires the exact legacy adapter")
         legacy_campaign = {"project_id": project, "approved_adapter": {
             key: legacy_operator[key] for key in ("science_revision", "adapter_sha256", "archive_root")}}
         self.legacy_id = campaign_execution_context_id(legacy_campaign)

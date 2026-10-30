@@ -978,6 +978,7 @@ def _archive_seam_worker(transport):
     from aws_mesouq.benchmark import DEFAULT_CONFIGURATION, checksum, scientific_request_checksum
     from aws_mesouq.benchmark_worker import BenchmarkWorker, validate_operator
     from aws_mesouq.benchmark_contexts import ExecutionContexts
+    from aws_mesouq.adapters import LEGACY_BENCHMARK_ADAPTER_SHA256
     calls = {"claims": 0, "scans": 0, "archives": []}
     worker = object.__new__(BenchmarkWorker)
     worker.project = "p"
@@ -985,7 +986,7 @@ def _archive_seam_worker(transport):
     worker.operator = {
         "run_root": "/private/scratch", "archive_root": "/private/archive",
         "repository": "/private/science", "science_revision": "b" * 40,
-        "adapter_sha256": "a" * 64, "python_bin": "/usr/bin/python3.11",
+        "adapter_sha256": LEGACY_BENCHMARK_ADAPTER_SHA256, "python_bin": "/usr/bin/python3.11",
         "environment_script": "/private/runtime.sh", "environment_sha256": "d" * 64,
         "expected_user": "fixtureuser", "expected_host": "fixture.cluster",
         "scheduler": {"partition": "qgpu", "account": "fixture", "qos": "fixture",
