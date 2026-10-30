@@ -193,8 +193,8 @@ def test_exact_platform_group_selector_never_requests_commands(cleanup, monkeypa
     assert kwargs["env"]["LC_ALL"] == "C"
 
 
-@pytest.mark.parametrize("repeat", range(20))
-def test_term_resistant_descendant_dies_even_after_leader_exits(tmp_path, repeat):
+@pytest.fixture
+def real_group(tmp_path):
     # Two pipes provide failure cleanup and an unrecycled liveness observation.
     guard_read, guard_write = os.pipe()
     alive_read, alive_write = os.pipe()
@@ -223,12 +223,7 @@ def test_term_resistant_descendant_dies_even_after_leader_exits(tmp_path, repeat
         assert ready.exists(), "synthetic child did not complete its atomic ready handshake"
         identity = json.loads(ready.read_text())
         assert identity["group"] == process.pid
-        started = adapter.time.monotonic()
-        adapter._stop_group(process)
-        assert adapter.time.monotonic() - started < 4.2
-        assert process.returncode == -signal.SIGTERM
-        readable, _, _ = select.select([alive_read], [], [], .5)
-        assert readable and os.read(alive_read, 1) == b""
+        yield SimpleNamespace(process=process, identity=identity, alive_read=alive_read)
     finally:
         # Closing the guard lets an orphaned fixture exit without signalling a
         # potentially recycled descendant PID or process-group number.
@@ -282,3 +277,40 @@ def test_metadata_reader_is_hard_bounded_and_reaps_its_child(tmp_path, monkeypat
     assert observed["stdout_bytes"] <= 65537
     if kind == "overflow":
         assert observed["stdout_bytes"] == 65537
+
+
+@pytest.mark.parametrize("repeat", range(20))
+def test_term_resistant_descendant_dies_even_after_leader_exits(real_group, repeat):
+    started = adapter.time.monotonic()
+    adapter._stop_group(real_group.process)
+    assert adapter.time.monotonic() - started < 4.2
+    assert real_group.process.returncode == -signal.SIGTERM
+    readable, _, _ = select.select([real_group.alive_read], [], [], .5)
+    assert readable and os.read(real_group.alive_read, 1) == b""
+
+def test_darwin_metadata_overrides_poisoned_command_mode(cleanup, monkeypatch):
+    monkeypatch.setenv("COMMAND_MODE", "legacy")
+    adapter._stop_group(cleanup.process)
+    assert cleanup.ps_calls[0][1]["env"]["COMMAND_MODE"] == "unix2003"
+    assert os.environ["COMMAND_MODE"] == "legacy"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Actual Apple ps compatibility-mode regression")
+def test_actual_darwin_selector_sees_descendant_despite_legacy_parent_mode(real_group, monkeypatch):
+    monkeypatch.setenv("COMMAND_MODE", "legacy")
+    capture = adapter._capture_group_metadata
+    observed = []
+    def record(command, **kwargs):
+        assert kwargs["env"]["COMMAND_MODE"] == "unix2003"
+        result = capture(command, **kwargs)
+        observed.extend(result.stdout.decode("ascii").splitlines())
+        return result
+    monkeypatch.setattr(adapter, "_capture_group_metadata", record)
+    assert adapter._group_quiescent(real_group.process.pid, adapter.time.monotonic() + 2) is False
+    members = {int(row.split()[0]): row.split() for row in observed}
+    child = members[real_group.identity["pid"]]
+    assert int(child[1]) == real_group.process.pid and not child[2].startswith("Z")
+    assert int(child[3]) == os.geteuid()
+    adapter._stop_group(real_group.process)
+    readable, _, _ = select.select([real_group.alive_read], [], [], .5)
+    assert readable and os.read(real_group.alive_read, 1) == b""

@@ -224,6 +224,9 @@ def _group_quiescent(pgid, deadline):
     environment["LC_ALL"] = "C"
     if sys.platform == "linux":
         environment["PS_PERSONALITY"] = "linux"
+    else:
+        # Apple legacy mode ignores -g and can treat the PGID as a PID list.
+        environment["COMMAND_MODE"] = "unix2003"
     try:
         result = _capture_group_metadata(command,
                                          timeout=min(GROUP_PROOF_SECONDS, remaining - .1),

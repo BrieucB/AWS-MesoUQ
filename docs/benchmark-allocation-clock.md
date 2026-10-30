@@ -84,10 +84,13 @@ Process metadata requests contain PID, PGID, state and UID;
 they contain neither command lines nor environments.
 
 The selectors intentionally differ: Apple ps uses `-g PGID`, whereas procps uses
-the documented negative numeric PGID selector. Linux `-g` selects sessions and
-is unsuitable here. Python waitid/WNOWAIT is not assumed available on macOS.
+the documented negative numeric PGID selector. Darwin metadata children force
+COMMAND_MODE=unix2003 so inherited legacy mode cannot silently turn the group
+selector into a PID-only selection. Linux `-g` selects sessions and is unsuitable here. Python waitid/WNOWAIT is not assumed available on macOS.
 
 Sources: [Apple ps manual](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/ps.1),
 [procps ps manual](https://github.com/procps-ng/procps/blob/master/man/ps.1),
 [Python3.11 process waits](https://docs.python.org/3.11/library/os.html#os.waitpid),
 [Apple XNU group signalling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
+
+Apple compatibility-mode sources: [ps option parsing](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/ps.c) and [COMMAND_MODE handling](https://github.com/apple-oss-distributions/Libc/blob/main/gen/get_compat.c).
