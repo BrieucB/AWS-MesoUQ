@@ -148,6 +148,47 @@ class Transport:
         self.run([self.staging_python, "-I", "-c", ARCHIVE_HELPER,
                   absolute_path(root), safe_id(token), "verify", json.dumps(item)])
 
+    def _archive_batch(self, root: str, token: str, items: list[dict], operation: str) -> None:
+        import json
+        from .archive import ARCHIVE_HELPER
+        absolute_path(root)
+        safe_id(token)
+        if operation not in ("copy-batch", "verify-batch") or not isinstance(items, list) or not 1 <= len(items) <= 32:
+            raise ValueError("Archive batches require between1 and32 items")
+        allowed = {"source_root", "source", "destination", "sha256", "size_bytes", "source_link_group"}
+        required = {"destination", "sha256", "size_bytes"}
+        if operation == "copy-batch":
+            required |= {"source_root", "source"}
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or not required <= set(item) <= allowed:
+                raise ValueError("Unexpected archive batch fields")
+            safe_relative(item["destination"])
+            if item["destination"] in seen:
+                raise ValueError("Duplicate archive batch destination")
+            seen.add(item["destination"])
+            if not isinstance(item["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"]) or type(item["size_bytes"]) is not int or item["size_bytes"] < 0:
+                raise ValueError("Invalid archive batch checksum or size")
+            if operation == "copy-batch":
+                absolute_path(item["source_root"])
+                safe_relative(item["source"])
+                if "source_link_group" in item and not isinstance(item["source_link_group"], dict):
+                    raise ValueError("Invalid archive source proof")
+        payload = json.dumps(items, allow_nan=False, separators=(",", ":")).encode()
+        if len(payload) > 4 * 1024 * 1024:
+            raise ValueError("Archive batch payload exceeds4MiB")
+        self.run([self.staging_python, "-I", "-c", ARCHIVE_HELPER,
+                  absolute_path(root), safe_id(token), operation], data=payload)
+
+    def archive_copy_batch(self, root: str, token: str, items: list[dict]) -> None:
+        """Copy and reopen/verify at most32 files in one bounded private RPC."""
+        self._archive_batch(root, token, items, "copy-batch")
+
+    def archive_verify_batch(self, root: str, token: str, items: list[dict]) -> None:
+        """Verify one bounded batch; corruption takes priority over missing files."""
+        self._archive_batch(root, token, items, "verify-batch")
+
+
     def read_beneath(self, root: str, name: str) -> bytes:
         return self._beneath(root, [name], read=True)
 

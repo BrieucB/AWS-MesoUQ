@@ -9,6 +9,7 @@ import math
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import subprocess
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -17,6 +18,7 @@ from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_
 from .benchmark_client import BenchmarkClient, native_accounting
 from .connector.transport import absolute_path, safe_id, safe_relative, check_transport_health
 from .connector.ssh_session import SSHSessionError
+from .connector.archive_source import TREE_HELPER
 
 class ArtifactIntegrityError(ValueError):
     """A publication differs from its immutable local or cloud reservation."""
@@ -24,27 +26,6 @@ class ArtifactIntegrityError(ValueError):
 
 NATIVE_TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
 
-TREE_HELPER = r"""import hashlib,json,os,stat,sys
-root=sys.argv[1]
-assert os.path.realpath(root)==root
-files=[]
-for parent,dirs,names in os.walk(root,followlinks=False):
-    for name in dirs+names:
-        path=os.path.join(parent,name)
-        info=os.lstat(path)
-        assert not stat.S_ISLNK(info.st_mode)
-        assert info.st_uid==os.getuid() and not stat.S_IMODE(info.st_mode)&0o077
-    for name in names:
-        path=os.path.join(parent,name)
-        info=os.lstat(path)
-        assert stat.S_ISREG(info.st_mode) and info.st_nlink==1
-        h=hashlib.sha256()
-        with open(path,'rb') as stream:
-            for block in iter(lambda:stream.read(1048576),b''): h.update(block)
-        files.append({'path':os.path.relpath(path,root),'sha256':h.hexdigest(),'size_bytes':info.st_size})
-assert len(files)<=10000
-print(json.dumps(sorted(files,key=lambda x:x['path']),allow_nan=False))
-"""
 
 
 def marker(campaign, stage, attempt):
@@ -640,39 +621,186 @@ os.close(fd)
         elif records[job] == "RUNNING" and authoritative["status"] in ("submitted", "queued"):
             self._send(entry, "running")
 
-    def archive(self, campaign):
-        check_transport_health(self.transport)
-        ident = campaign["id"]
-        record = self.state["campaigns"].setdefault(ident, {"root": self.operator["run_root"] + "/" + ident})
-        if campaign.get("archive", {}).get("status") != "requested":
-            return
-        if campaign["approved_adapter"].get("archive_root") != self.operator["archive_root"]:
-            raise ValueError("Archive root differs from immutable campaign binding")
-        root = record["root"]
-        files = record.get("archive_files")
-        if files is None:
-            output = self.transport.run([getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", TREE_HELPER, root])
-            files = json.loads(output)
-            manifest = canonical({"campaign_id": ident, "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])), "approved_adapter": campaign["approved_adapter"], "original_file_count": len(files), "original_files_sha256": checksum(files), "retained_outputs": files})
-            record["archive_manifest"] = manifest.decode()
-            files.append({"path": "archive-manifest.json", "sha256": hashlib.sha256(manifest).hexdigest(), "size_bytes": len(manifest)})
-            record["archive_files"] = files
-            self.save()
-        self._immutable(root + "/archive-manifest.json", record["archive_manifest"].encode())
-        self.transport.archive_prepare(self.operator["archive_root"], ident)
-        for item in files:
-            transfer = {"source_root": root, "source": item["path"], "destination": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]}
-            self.transport.archive_copy(self.operator["archive_root"], ident, transfer)
-            self.transport.archive_verify(self.operator["archive_root"], ident, transfer)
-        manifest = next(item for item in files if item["path"] == "archive-manifest.json")
-        refs = [{k: artifact[k] for k in ("id", "sha256", "size_bytes")} for artifact in campaign.get("artifacts", []) if artifact.get("verified")]
+    @staticmethod
+    def _archive_batches(items):
+        batches = []
+        batch = []
+        logical_bytes = 0
+        for item in items:
+            size = item.get("size_bytes")
+            if type(size) is not int or size < 0:
+                raise ArtifactIntegrityError("Invalid archive file size")
+            if batch and (len(batch) >= 32 or logical_bytes + size > 128 * 1024 * 1024):
+                batches.append(batch)
+                batch = []
+                logical_bytes = 0
+            batch.append(item)
+            logical_bytes += size
+            if len(batch) == 32 or logical_bytes >= 128 * 1024 * 1024:
+                batches.append(batch)
+                batch = []
+                logical_bytes = 0
+        if batch:
+            batches.append(batch)
+        return batches
+
+    def _archive_remote(self, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 255:
+                raise
+            raise ArtifactIntegrityError("Archive helper refused unsafe, changed or unavailable files") from error
+
+    @staticmethod
+    def _archive_file_records(values):
+        if not isinstance(values, list) or len(values) > 10001:
+            raise ArtifactIntegrityError("Invalid bounded archive inventory")
+        result, names = [], set()
+        for value in values:
+            if not isinstance(value, dict) or set(value) != {"path", "sha256", "size_bytes"}:
+                raise ArtifactIntegrityError("Archive file records must remain path/hash/size only")
+            try:
+                name = safe_relative(value["path"])
+            except (TypeError, ValueError) as error:
+                raise ArtifactIntegrityError("Unsafe archive path") from error
+            if name in names or not isinstance(value["sha256"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["sha256"]) or type(value["size_bytes"]) is not int or value["size_bytes"] < 0:
+                raise ArtifactIntegrityError("Invalid or duplicate archive file")
+            names.add(name)
+            result.append(dict(value))
+        return result
+
+    def _archive_snapshot(self, root):
+        output = self._archive_remote(self.transport.run, [getattr(self.transport, "staging_python", "/usr/bin/python3.11"), "-I", "-c", TREE_HELPER, root])
+        try:
+            snapshot = json.loads(output)
+        except (ValueError, TypeError) as error:
+            raise ArtifactIntegrityError("Invalid archive source inventory response") from error
+        if not isinstance(snapshot, dict) or set(snapshot) != {"version", "files", "source_link_groups"} or type(snapshot["version"]) is not int or snapshot["version"] != 1:
+            raise ArtifactIntegrityError("Unsupported archive source inventory")
+        files = self._archive_file_records(snapshot["files"])
+        if files != sorted(files, key=lambda item: item["path"]):
+            raise ArtifactIntegrityError("Archive source inventory is not canonical")
+        by_path = {item["path"]: item for item in files}
+        groups = snapshot["source_link_groups"]
+        if not isinstance(groups, list) or len(groups) > 5000:
+            raise ArtifactIntegrityError("Invalid bounded archive link groups")
+        proofs = {}
+        root_keys = {"dev", "ino", "uid", "mode"}
+        file_keys = root_keys | {"nlink", "size", "mtime_ns", "ctime_ns"}
+        for proof in groups:
+            if not isinstance(proof, dict) or set(proof) != {"root", "file", "paths"} or not isinstance(proof["root"], dict) or set(proof["root"]) != root_keys or not isinstance(proof["file"], dict) or set(proof["file"]) != file_keys:
+                raise ArtifactIntegrityError("Malformed source link proof")
+            if any(type(value) is not int or value < 0 for value in (*proof["root"].values(), *proof["file"].values())):
+                raise ArtifactIntegrityError("Invalid source link identity")
+            paths = proof["paths"]
+            if not isinstance(paths, list) or not 2 <= len(paths) <= 128 or not all(isinstance(name, str) for name in paths) or paths != sorted(set(paths)) or proof["file"]["nlink"] != len(paths) or len(canonical(proof)) > 65536:
+                raise ArtifactIntegrityError("Incomplete or excessive source alias proof")
+            if proof["root"]["mode"] != 0o700 or proof["root"]["uid"] != proof["file"]["uid"] or proof["file"]["mode"] & 0o077:
+                raise ArtifactIntegrityError("Source proof is not private")
+            hashes = set()
+            for name in paths:
+                if name not in by_path or name in proofs or name == "archive-manifest.json" or by_path[name]["size_bytes"] != proof["file"]["size"]:
+                    raise ArtifactIntegrityError("Source proof differs from its complete inventory")
+                hashes.add(by_path[name]["sha256"])
+                proofs[name] = proof
+            if len(hashes) != 1:
+                raise ArtifactIntegrityError("One source inode has inconsistent bytes")
+        return files, proofs
+
+    def _archive_manifest(self, campaign, originals):
+        return canonical({"campaign_id": campaign["id"], "configuration_hash": campaign["configuration_hash"], "scientific_request_hash": campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])), "approved_adapter": campaign["approved_adapter"], "original_file_count": len(originals), "original_files_sha256": checksum(originals), "retained_outputs": originals})
+
+    def _archive_cached(self, campaign, record):
+        files = self._archive_file_records(record["archive_files"])
         originals = [item for item in files if item["path"] != "archive-manifest.json"]
-        receipt = {"site": "karolina", "path": self.operator["archive_root"] + "/" + ident, "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": [manifest], "attested_original_file_count": len(originals), "attested_original_files_sha256": checksum(originals)}
+        manifests = [item for item in files if item["path"] == "archive-manifest.json"]
+        if len(originals) > 10000 or originals != sorted(originals, key=lambda item: item["path"]) or len(manifests) != 1 or not isinstance(record.get("archive_manifest"), str):
+            raise ArtifactIntegrityError("Cached archive inventory is incomplete")
+        blob = self._archive_manifest(campaign, originals)
+        if record["archive_manifest"].encode() != blob:
+            raise ArtifactIntegrityError("Cached archive manifest differs from campaign/request/source bindings")
+        expected = {"path": "archive-manifest.json", "sha256": hashlib.sha256(blob).hexdigest(), "size_bytes": len(blob)}
+        if manifests[0] != expected:
+            raise ArtifactIntegrityError("Cached archive manifest hash or size differs")
+        return files, originals, expected, blob
+
+    def _archive_acknowledge(self, campaign, record, files):
+        manifest = next(item for item in files if item["path"] == "archive-manifest.json")
+        originals = [item for item in files if item["path"] != "archive-manifest.json"]
+        refs = [{key: artifact[key] for key in ("id", "sha256", "size_bytes")} for artifact in campaign.get("artifacts", []) if artifact.get("verified")]
+        receipt = {"site": "karolina", "path": self.operator["archive_root"] + "/" + campaign["id"], "manifest_sha256": manifest["sha256"], "artifacts": refs, "retained_outputs": [manifest], "attested_original_file_count": len(originals), "attested_original_files_sha256": checksum(originals)}
         event_id = record.setdefault("archive_event_id", uuid.uuid4().hex)
         self.save()
         self.client.archive(campaign, event_id, receipt)
         record["archive_verified"] = True
         self.save()
+
+    def archive(self, campaign):
+        check_transport_health(self.transport)
+        ident = safe_id(campaign["id"])
+        if campaign.get("archive", {}).get("status") != "requested":
+            return
+        binding = campaign["approved_adapter"]
+        if binding.get("archive_root") != self.operator["archive_root"] or binding.get("science_revision") != self.operator["science_revision"] or binding.get("adapter_sha256") != self.operator["adapter_sha256"] or campaign.get("owner_sub") != self.journal.data["owner_sub"] or campaign.get("project_id") != self.project:
+            raise ArtifactIntegrityError("Archive campaign differs from immutable owner/source/storage binding")
+        validate_create(campaign["configuration"])
+        if checksum(campaign["configuration"]) != campaign["configuration_hash"] or campaign.get("scientific_request_hash", scientific_request_checksum(campaign["configuration"])) != scientific_request_checksum(campaign["configuration"]):
+            raise ArtifactIntegrityError("Archive request hashes differ from the frozen configuration")
+        expected_root = self.operator["run_root"] + "/" + ident
+        record = self.state["campaigns"].setdefault(ident, {"root": expected_root})
+        root = record["root"]
+        if root != expected_root:
+            raise ArtifactIntegrityError("Archive source root differs from the campaign binding")
+        cached = record.get("archive_files") is not None
+        if cached:
+            files, originals, manifest_ref, blob = self._archive_cached(campaign, record)
+            complete = True
+            for batch in self._archive_batches(files):
+                transfers = [{"destination": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]} for item in batch]
+                try:
+                    self.transport.archive_verify_batch(self.operator["archive_root"], ident, transfers)
+                except subprocess.CalledProcessError as error:
+                    if error.returncode == 255:
+                        raise
+                    if error.returncode != 3:
+                        raise ArtifactIntegrityError("Durable archive verification failed; operator review is required") from error
+                    complete = False
+            if complete:
+                self._archive_acknowledge(campaign, record, files)
+                return
+        elif record.get("archive_manifest") is not None:
+            raise ArtifactIntegrityError("Cached archive manifest lacks its bound inventory")
+        fresh, proofs = self._archive_snapshot(root)
+        original_inventory = [item for item in fresh if item["path"] != "archive-manifest.json"]
+        own_manifest = [item for item in fresh if item["path"] == "archive-manifest.json"]
+        if cached:
+            if original_inventory != originals or own_manifest and own_manifest != [manifest_ref]:
+                raise ArtifactIntegrityError("Partial archive source differs from its immutable inventory")
+        else:
+            if own_manifest or len(original_inventory) > 10000:
+                raise ArtifactIntegrityError("Unexpected pre-existing archive manifest")
+            originals = original_inventory
+            blob = self._archive_manifest(campaign, originals)
+            manifest_ref = {"path": "archive-manifest.json", "sha256": hashlib.sha256(blob).hexdigest(), "size_bytes": len(blob)}
+            files = [*originals, manifest_ref]
+            record["archive_manifest"] = blob.decode()
+            record["archive_files"] = files
+            self.save()
+        self._archive_remote(self._immutable, root + "/archive-manifest.json", blob)
+        self._archive_remote(self.transport.archive_prepare, self.operator["archive_root"], ident)
+        for batch in self._archive_batches(files):
+            transfers = []
+            for item in batch:
+                transfer = {"source_root": root, "source": item["path"], "destination": item["path"], "sha256": item["sha256"], "size_bytes": item["size_bytes"]}
+                if item["path"] in proofs:
+                    transfer["source_link_group"] = proofs[item["path"]]
+                transfers.append(transfer)
+            self._archive_remote(self.transport.archive_copy_batch, self.operator["archive_root"], ident, transfers)
+            self._archive_remote(self.transport.archive_verify_batch, self.operator["archive_root"], ident, transfers)
+        self._archive_acknowledge(campaign, record, files)
+
+
 
     def sweep(self):
         check_transport_health(self.transport)

@@ -970,3 +970,182 @@ def test_local_health_check_performs_no_subprocess(monkeypatch):
     transport = Transport(local=True)
     transport.check_healthy()
     assert transport._session is None
+
+def _archive_seam_worker(transport):
+    import copy
+    import hashlib
+    from types import SimpleNamespace
+    from aws_mesouq.benchmark import DEFAULT_CONFIGURATION, checksum, scientific_request_checksum
+    from aws_mesouq.benchmark_worker import BenchmarkWorker
+    calls = {"claims": 0, "scans": 0, "archives": []}
+    worker = object.__new__(BenchmarkWorker)
+    worker.project = "p"
+    worker.maximum_active = 16
+    worker.operator = {"run_root": "/private/scratch", "archive_root": "/private/archive",
+                       "science_revision": "b" * 40, "adapter_sha256": "a" * 64}
+    worker.slurm = SimpleNamespace(transport=transport)
+    worker.journal = SimpleNamespace(data={"owner_sub": "alice"}, save=lambda: None)
+    configuration = copy.deepcopy(DEFAULT_CONFIGURATION)
+    configuration["idempotency_key"] = "archive-seam"
+    campaign = {
+        "id": "campaign", "project_id": "p", "owner_sub": "alice",
+        "configuration": configuration, "configuration_hash": checksum(configuration),
+        "scientific_request_hash": scientific_request_checksum(configuration),
+        "approved_adapter": {key: worker.operator[key]
+                             for key in ("archive_root", "science_revision", "adapter_sha256")},
+        "archive": {"status": "requested"}, "artifacts": [],
+    }
+    originals = [{"path": f"retained/file-{index:03d}.bin", "sha256": "c" * 64,
+                  "size_bytes": 1} for index in range(33)]
+    blob = worker._archive_manifest(campaign, originals)
+    manifest = {"path": "archive-manifest.json", "sha256": hashlib.sha256(blob).hexdigest(),
+                "size_bytes": len(blob)}
+    worker.state = {"stages": {}, "campaigns": {campaign["id"]: {
+        "root": "/private/scratch/campaign", "archive_files": [*originals, manifest],
+        "archive_manifest": blob.decode(),
+    }}}
+    def forbidden(*args, **kwargs):
+        pytest.fail("Archive failure allowed source, payload, or ACK work")
+    def claim(project, request_id, **kwargs):
+        assert project == "p"
+        calls["claims"] += 1
+        return {}
+    def request(method, path, payload=None):
+        assert (method, path, payload) == ("GET", "/v1/projects/p/benchmarks", None)
+        calls["scans"] += 1
+        return {"campaigns": [campaign, {**campaign, "id": "later-campaign"}]}
+    worker.client = SimpleNamespace(claim=claim, archive=forbidden)
+    worker.api = SimpleNamespace(request=request)
+    worker._archive_snapshot = forbidden
+    worker._immutable = forbidden
+    transport.archive_prepare = forbidden
+    transport.archive_copy_batch = forbidden
+    archive = worker.archive
+    def tracked_archive(current):
+        calls["archives"].append(current["id"])
+        return archive(current)
+    worker.archive = tracked_archive
+    return worker, calls
+
+
+def test_archive_batches_preserve_json_stdin_through_shared_session(tmp_path, fake_ssh, monkeypatch):
+    import shlex
+    from aws_mesouq.connector.archive import ARCHIVE_HELPER
+    from aws_mesouq.connector.transport import Transport
+    guard = tmp_path / "guard"
+    with sessions.SSHSession("karolina", guard) as owner:
+        transport = Transport(host="karolina", state_dir=guard)
+        original_run = sessions.subprocess.run
+        captured = []
+        def capture(command, **kwargs):
+            if "-G" not in command and "-O" not in command:
+                captured.append((list(command), kwargs.get("input")))
+            return original_run(command, **kwargs)
+        monkeypatch.setattr(sessions.subprocess, "run", capture)
+        proof = {
+            "root": {"dev": 1, "ino": 2, "uid": os.getuid(), "mode": 0o700},
+            "file": {"dev": 1, "ino": 3, "uid": os.getuid(), "mode": 0o600,
+                     "nlink": 2, "size": 7, "mtime_ns": 4, "ctime_ns": 5},
+            "paths": ["a.bin", "b.bin"],
+        }
+        items = [{"source_root": "/private/scratch/campaign", "source": name,
+                  "destination": name, "sha256": "a" * 64, "size_bytes": 7,
+                  "source_link_group": proof} for name in proof["paths"]]
+        verification = [{key: item[key] for key in ("destination", "sha256", "size_bytes")}
+                        for item in items]
+        before = owner.snapshot()["counters"]["rpc_requests"]
+        try:
+            transport.archive_copy_batch("/private/archive", "campaign", items)
+            fake_ssh.rpc_codes = [3, 0]
+            with pytest.raises(subprocess.CalledProcessError) as failure:
+                transport.archive_verify_batch("/private/archive", "campaign", verification)
+            assert failure.value.returncode == 3
+            assert owner.snapshot()["circuit"] is None
+            transport.archive_verify_batch("/private/archive", "campaign", verification)
+            expected = [("copy-batch", items), ("verify-batch", verification),
+                        ("verify-batch", verification)]
+            assert len(captured) == len(expected)
+            for (command, payload), (operation, values) in zip(captured, expected):
+                assert shlex.split(command[-1]) == [
+                    transport.staging_python, "-I", "-c", ARCHIVE_HELPER,
+                    "/private/archive", "campaign", operation,
+                ]
+                assert payload == json.dumps(values, allow_nan=False, separators=(",", ":")).encode()
+                assert len(payload) <= 4 * 1024 * 1024
+            snapshot = owner.snapshot()
+            assert snapshot["circuit"] is None
+            assert snapshot["counters"]["rpc_requests"] - before == 3
+            assert snapshot["counters"]["admitted"] == 1
+            assert len(fake_ssh.masters) == 1
+        finally:
+            transport.close()
+        assert fake_ssh.masters[0].poll() is None
+
+
+def test_cached_missing_then_corrupt_archive_stops_without_tripping_ssh(tmp_path, fake_ssh):
+    from aws_mesouq.benchmark_worker import ArtifactIntegrityError
+    from aws_mesouq.connector.transport import Transport
+    guard = tmp_path / "guard"
+    with sessions.SSHSession("karolina", guard) as owner:
+        transport = Transport(host="karolina", state_dir=guard)
+        worker, calls = _archive_seam_worker(transport)
+        fake_ssh.rpc_codes = [3, 1, 0]
+        before = owner.snapshot()["counters"]["rpc_requests"]
+        try:
+            with pytest.raises(ArtifactIntegrityError) as failure:
+                worker.sweep()
+            assert isinstance(failure.value.__cause__, subprocess.CalledProcessError)
+            assert failure.value.__cause__.returncode == 1
+            assert calls == {"claims": 1, "scans": 1, "archives": ["campaign"]}
+            assert fake_ssh.rpc_codes == [0]
+            snapshot = owner.snapshot()
+            assert snapshot["circuit"] is None
+            assert snapshot["counters"]["rpc_requests"] - before == 2
+            assert snapshot["counters"]["admitted"] == 1
+            assert len(fake_ssh.masters) == 1
+            assert not worker.state["campaigns"]["campaign"].get("archive_verified")
+        finally:
+            transport.close()
+
+
+@pytest.mark.parametrize("failure,category", [("255", "connection_lost"),
+                                             ("timeout", "command_timeout")])
+def test_archive_transport_failure_blocks_later_claim_and_sweep(tmp_path, fake_ssh, monkeypatch, failure, category):
+    from aws_mesouq.connector.transport import Transport
+    guard = tmp_path / "guard"
+    with sessions.SSHSession("karolina", guard) as owner:
+        transport = Transport(host="karolina", state_dir=guard)
+        worker, calls = _archive_seam_worker(transport)
+        original_run = sessions.subprocess.run
+        rpc_calls = []
+        fake_ssh.rpc_codes = [255, 0] if failure == "255" else [0]
+        def fail_rpc(command, **kwargs):
+            if "-G" not in command and "-O" not in command:
+                rpc_calls.append((list(command), kwargs.get("input")))
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return original_run(command, **kwargs)
+        monkeypatch.setattr(sessions.subprocess, "run", fail_rpc)
+        before = owner.snapshot()["counters"]["rpc_requests"]
+        try:
+            with pytest.raises(sessions.SSHSessionError) as caught:
+                worker.sweep()
+            assert caught.value.category == category
+            assert calls == {"claims": 1, "scans": 1, "archives": ["campaign"]}
+            previous_calls = (calls["claims"], calls["scans"], tuple(calls["archives"]))
+            for operation, args in [(worker._claim, ()), (worker.sweep, ()),
+                                    (worker._refresh, ({},)), (worker.poll, ({},))]:
+                with pytest.raises(sessions.SSHSessionError) as caught:
+                    operation(*args)
+                assert caught.value.category == category
+            assert (calls["claims"], calls["scans"], tuple(calls["archives"])) == previous_calls
+            assert len(rpc_calls) == 1
+            assert fake_ssh.rpc_codes == [0]
+            snapshot = owner.snapshot()
+            assert snapshot["circuit"] == category
+            assert snapshot["counters"]["rpc_requests"] - before == 1
+            assert snapshot["counters"]["admitted"] == 1
+            assert len(fake_ssh.masters) == 1
+            assert not worker.state["campaigns"]["campaign"].get("archive_verified")
+        finally:
+            transport.close()
