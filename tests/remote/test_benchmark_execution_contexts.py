@@ -328,3 +328,60 @@ def test_actual_previous_sdk_rejects_migrated_namespace_before_claim(
     assert not any(method == "POST" for method, _ in calls)
     assert session.cluster.submit_count == 0
     assert session.journal.data == before
+
+
+def test_expired_refresh_retires_only_request_then_recovers_same_stage(
+        session, tmp_path, monkeypatch):
+    session.worker.sweep()
+    registry_fixture(session, tmp_path, monkeypatch)
+    worker = restart(session)
+    entry = entries(session)[0]
+    entry["pending_event"] = {"id": "d" * 32, "type": "heartbeat", "fields": {}}
+    entry["upload_reservation"] = {"id": "e" * 32, "type": "artifact_upload", "fields": {}}
+    record = worker.state["campaigns"][session.campaign["id"]]
+    record["archive_event_id"] = "f" * 32
+    worker.save()
+    retained = copy.deepcopy(entry)
+    budget = copy.deepcopy(session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"])
+    original = session.api.request
+    observed = []
+    lose = [True]
+
+    def lose_first_claim(method, path, payload=None):
+        if path == "/v1/benchmark-connector/claim":
+            observed.append(copy.deepcopy(payload))
+            result = original(method, path, payload)
+            if lose[0]:
+                lose[0] = False
+                raise OSError("fixture lost committed refresh response")
+            return result
+        return original(method, path, payload)
+
+    monkeypatch.setattr(session.api, "request", lose_first_claim)
+    with pytest.raises(OSError):
+        worker._refresh(entry)
+    frozen = copy.deepcopy(entry["refresh_request_body"])
+    session.clock[0] = entry["claim"]["lease_expires_at"] + 1
+    with pytest.raises(Exception) as expired:
+        worker._refresh(entry)
+    assert getattr(expired.value, "code", None) == "claim_expired"
+    assert len(observed) == 2
+    assert observed[0] == observed[1]
+    assert "refresh_request_id" not in entry and "refresh_request_body" not in entry
+    assert entry == retained
+    assert record["archive_event_id"] == "f" * 32
+    worker._refresh(entry)
+    assert len(observed) == 3
+    assert observed[2]["request_id"] != frozen["request_id"]
+    assert observed[2]["campaign_id"] == frozen["campaign_id"]
+    assert observed[2]["exclude_stage_ids"] == frozen["exclude_stage_ids"]
+    assert observed[2]["supported_contexts"] == frozen["supported_contexts"] == [entry["context_id"]]
+    assert entry["claim"]["stage"]["id"] == retained["claim"]["stage"]["id"]
+    assert entry["claim"]["stage"]["attempt"] == retained["claim"]["stage"]["attempt"]
+    assert entry["marker"] == retained["marker"]
+    assert entry["job_id"] == retained["job_id"]
+    assert entry["pending_event"] == retained["pending_event"]
+    assert entry["upload_reservation"] == retained["upload_reservation"]
+    assert record["archive_event_id"] == "f" * 32
+    assert session.cluster.submit_count == 1
+    assert session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"] == budget

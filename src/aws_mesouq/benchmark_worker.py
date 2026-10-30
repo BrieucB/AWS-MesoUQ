@@ -222,7 +222,14 @@ else:
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         body = self._claim_body(entry, "refresh_request_id", "refresh_request_body",
                                 campaign=campaign, stage=stage)
-        claimed = self.client.claim_frozen(body)
+        try:
+            claimed = self.client.claim_frozen(body)
+        except Exception as error:
+            if getattr(error, "code", None) == "claim_expired":
+                entry.pop("refresh_request_id", None)
+                entry.pop("refresh_request_body", None)
+                self.save()
+            raise
         self._check_claim_response(body, claimed)
         if not claimed.get("stage"):
             current = self.client.get(self.project, campaign["id"])["campaign"]
