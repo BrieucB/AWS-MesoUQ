@@ -7,6 +7,7 @@ from aws_mesouq.connector.ssh_session import SSHSessionError
 
 def skeleton():
     worker = object.__new__(BenchmarkWorker)
+    worker.slurm = SimpleNamespace(transport=SimpleNamespace())
     worker.state = {"stages": {}, "campaigns": {}}
     worker.maximum_active = 16
     worker.project = "fixture"

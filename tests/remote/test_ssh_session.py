@@ -864,3 +864,109 @@ def test_excess_control_path_is_denied_before_configuration_or_launch(tmp_path, 
         sessions.SSHSession("karolina", guard)
     assert fake_ssh.masters == [] and fake_ssh.config_calls == 0
     assert fake_ssh.resolutions == []
+
+@pytest.mark.parametrize("kind", ["calibration", "benchmark"])
+def test_other_borrower_circuit_blocks_next_worker_claim(tmp_path, fake_ssh, kind):
+    from types import SimpleNamespace
+    from aws_mesouq.connector.connector import Connector
+    from aws_mesouq.connector.transport import Transport
+    from aws_mesouq.benchmark_worker import BenchmarkWorker
+    guard = tmp_path / "guard"
+    cloud_calls, claims = [], []
+    def request(method, path, payload=None):
+        cloud_calls.append((method, path))
+        if path == "/v1/me":
+            return {"subject": "owner"}
+        if path == "/v1/connector/claim":
+            claims.append(path)
+            pytest.fail("calibration claimed after another borrower tripped circuit")
+        pytest.fail("unexpected cloud operation after shared circuit")
+    def benchmark_claim(*args, **kwargs):
+        claims.append("benchmark")
+        pytest.fail("benchmark claimed after another borrower tripped circuit")
+    with sessions.SSHSession("karolina", guard):
+        transport = Transport(host="karolina", state_dir=guard)
+        transport._ssh_session()
+        try:
+            with sessions.SSHSession("karolina", guard, borrow_only=True) as other:
+                fake_ssh.rpc_codes = [255, 0]
+                with pytest.raises(sessions.SSHSessionError, match="connection_lost"):
+                    other.run_bytes(["true"])
+            before = json.loads((guard / "attempts.json").read_text())
+            config_calls = fake_ssh.config_calls
+            worker_type = Connector if kind == "calibration" else BenchmarkWorker
+            worker = object.__new__(worker_type)
+            worker.slurm = SimpleNamespace(transport=transport)
+            worker.api = SimpleNamespace(request=request)
+            worker.project = "fixture"
+            worker.journal = SimpleNamespace(data={"jobs": {}}, save=lambda: None)
+            if kind == "calibration":
+                worker.connector_id = "fixture"
+                worker.site = "karolina"
+                worker.durable_archive_root = False
+                worker.archive_root = None
+            else:
+                worker.state = {"stages": {}, "campaigns": {}}
+                worker.maximum_active = 16
+                worker.client = SimpleNamespace(claim=benchmark_claim)
+            with pytest.raises(sessions.SSHSessionError, match="connection_lost"):
+                worker.sweep()
+            after = json.loads((guard / "attempts.json").read_text())
+            assert claims == [] and cloud_calls == []
+            assert after["counters"] == before["counters"]
+            assert fake_ssh.rpc_codes == [0]
+            assert fake_ssh.config_calls == config_calls
+            assert len(fake_ssh.masters) == 1
+        finally:
+            transport.close()
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("failure", ["missing_socket", "dead_process"])
+def test_offline_health_latches_missing_or_dead_session(tmp_path, fake_ssh, monkeypatch, cached, failure):
+    guard = tmp_path / "guard"
+    with sessions.SSHSession("karolina", guard) as owner:
+        borrower = sessions.SSHSession("karolina", guard, borrow_only=True) if cached else None
+        if failure == "missing_socket":
+            owner.store.socket.unlink()
+        else:
+            monkeypatch.setattr(sessions, "_alive", lambda pid: False)
+        config_calls = fake_ssh.config_calls
+        with pytest.raises(sessions.SSHSessionError, match="connection_lost"):
+            if borrower is None:
+                sessions.SSHSession("karolina", guard, borrow_only=True)
+            else:
+                borrower.check_healthy()
+        state = json.loads((guard / "attempts.json").read_text())
+        assert state["circuit"] == "connection_lost"
+        assert state["counters"]["rpc_requests"] == 0
+        assert fake_ssh.config_calls == config_calls
+        assert len(fake_ssh.masters) == 1
+        if borrower is not None:
+            borrower.close()
+
+
+def test_health_adapter_only_tolerates_absent_hooks():
+    from types import SimpleNamespace
+    from aws_mesouq.connector.transport import check_transport_health
+    check_transport_health(SimpleNamespace())
+    with pytest.raises(TypeError):
+        check_transport_health(SimpleNamespace(check_healthy=None))
+    for error in (sessions.SSHSessionError("connection_lost"),
+                  AttributeError("health hook failed"), OSError("health state unavailable")):
+        def fail(error=error):
+            raise error
+        with pytest.raises(type(error)) as caught:
+            check_transport_health(SimpleNamespace(check_healthy=fail))
+        assert caught.value is error
+
+
+def test_local_health_check_performs_no_subprocess(monkeypatch):
+    from aws_mesouq.connector.transport import Transport
+    monkeypatch.setattr(sessions.subprocess, "run",
+                        lambda *a, **k: pytest.fail("local health launched subprocess"))
+    monkeypatch.setattr(sessions.subprocess, "Popen",
+                        lambda *a, **k: pytest.fail("local health launched master"))
+    transport = Transport(local=True)
+    transport.check_healthy()
+    assert transport._session is None

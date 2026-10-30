@@ -411,10 +411,33 @@ class SSHSession:
             active = state["active"]
             if active is None or not active["ready"] or active["host_alias"] != self.host:
                 raise SSHSessionError("no_ready_session")
-            if not _alive(active["owner_pid"]) or not _alive(active["master_pid"]):
-                raise SSHSessionError("unclean_session")
-            _socket_private(self.store.socket)
             self.id, self.target, self.endpoint = active["id"], active["target"], active["endpoint"]
+            self._require_healthy(state, now)
+
+    def _require_healthy(self, state, now):
+        if self._closed:
+            raise SSHSessionError("closed_session")
+        if state["circuit"]:
+            raise SSHSessionError(state["circuit"])
+        active = state["active"]
+        if active is None or active["id"] != self.id or not active["ready"]:
+            raise SSHSessionError("session_changed")
+        if not _alive(active["owner_pid"]) or not _alive(active["master_pid"]):
+            state["circuit"] = "connection_lost"
+            self.store.save(state, now)
+            raise SSHSessionError("connection_lost")
+        try:
+            _socket_private(self.store.socket)
+        except SSHSessionError as error:
+            if error.category == "connection_lost":
+                state["circuit"] = "connection_lost"
+                self.store.save(state, now)
+            raise
+
+    def check_healthy(self):
+        """Check shared state and process/socket presence without an SSH RPC."""
+        with self.store.locked() as (state, now):
+            self._require_healthy(state, now)
 
     def _drain(self):
         try:
@@ -497,18 +520,7 @@ class SSHSession:
         if not isinstance(argv, list) or not argv or any(not isinstance(x, str) or "\x00" in x for x in argv):
             raise ValueError("Expected a nonempty remote argv of strings")
         with self.store.locked() as (state, now):
-            if state["circuit"]:
-                raise SSHSessionError(state["circuit"])
-            active = state["active"]
-            if active is None or active["id"] != self.id or not active["ready"]:
-                raise SSHSessionError("session_changed")
-            try:
-                _socket_private(self.store.socket)
-            except SSHSessionError as error:
-                if error.category == "connection_lost":
-                    state["circuit"] = "connection_lost"
-                    self.store.save(state, now)
-                raise
+            self._require_healthy(state, now)
             state["counters"]["rpc_requests"] += 1
             self.store.save(state, now)
             command = _client_command(self.store, self.target, argv=argv)

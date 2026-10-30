@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 import shlex
 import uuid
 
-from .transport import absolute_path, safe_id, safe_relative
+from .transport import absolute_path, safe_id, safe_relative, check_transport_health
 from .ssh_session import SSHSessionError
 from .signing import device_identity, sign_archive, sign_result
 from aws_mesouq.contracts import CANONICAL_PROFILE, validate_result
@@ -572,6 +572,7 @@ class Connector:
             return True
 
     def _tick(self, exclude_job_ids=None):
+        check_transport_health(self.slurm.transport)
         me = self.api.request("GET", "/v1/me")
         if self.journal.data.get("owner_sub", me["subject"]) != me["subject"]:
             raise ValueError("Journal belongs to another cloud identity")
@@ -583,6 +584,7 @@ class Connector:
                    "archive_capable": self.archive_capable}
         if exclude_job_ids is not None:
             payload["exclude_job_ids"] = exclude_job_ids
+        check_transport_health(self.slurm.transport)
         claim = self.api.request("POST", "/v1/connector/claim", payload)
         job = claim.get("job")
         if job is None:

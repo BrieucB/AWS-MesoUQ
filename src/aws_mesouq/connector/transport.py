@@ -8,6 +8,15 @@ import sys
 from pathlib import Path
 from .ssh_session import SSHSession, SSHSessionError
 
+_MISSING_HEALTH_CHECK = object()
+
+
+def check_transport_health(transport):
+    """Use the health hook when provided by an SSH-aware transport."""
+    check = getattr(transport, "check_healthy", _MISSING_HEALTH_CHECK)
+    if check is not _MISSING_HEALTH_CHECK:
+        check()
+
 
 PRIVATE_ROOT_PROBE = r'''import os,stat,sys,uuid
 path=sys.argv[1]
@@ -74,6 +83,13 @@ class Transport:
                 raise SSHSessionError("state_directory_required")
             self._session = SSHSession(self.host, directory, borrow_only=True)
         return self._session
+
+    def check_healthy(self):
+        """Check SSH admission/session state without opening a connection."""
+        if self._closed:
+            raise SSHSessionError("closed_session")
+        if self.host is not None:
+            self._ssh_session().check_healthy()
 
     def run_bytes(self, argv: list[str], *, data: bytes | None = None) -> bytes:
         if self.host is not None:

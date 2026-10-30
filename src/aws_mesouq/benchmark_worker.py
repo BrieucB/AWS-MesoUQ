@@ -15,7 +15,7 @@ import uuid
 
 from .benchmark import SCHEMA, FACTORS, TERMINAL, canonical, checksum, validate_create, scientific_request_checksum
 from .benchmark_client import BenchmarkClient, native_accounting
-from .connector.transport import absolute_path, safe_id, safe_relative
+from .connector.transport import absolute_path, safe_id, safe_relative, check_transport_health
 from .connector.ssh_session import SSHSessionError
 
 class ArtifactIntegrityError(ValueError):
@@ -161,6 +161,7 @@ else:
             self._refresh(entry)
 
     def _refresh(self, entry):
+        check_transport_health(self.transport)
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]
         request_id = entry.setdefault("refresh_request_id", uuid.uuid4().hex)
         self.save()
@@ -235,6 +236,7 @@ else:
         return result
 
     def _claim(self):
+        check_transport_health(self.transport)
         request_id = self.state.setdefault("claim_request_id", uuid.uuid4().hex)
         self.save()
         try:
@@ -570,6 +572,7 @@ os.close(fd)
         self._send(entry, "succeeded", result=result, scheduler_accounting=accounting)
 
     def poll(self, entry):
+        check_transport_health(self.transport)
         if entry.get("pending_event"):
             self._send(entry)
         if entry.get("cloud_terminal"):
@@ -638,6 +641,7 @@ os.close(fd)
             self._send(entry, "running")
 
     def archive(self, campaign):
+        check_transport_health(self.transport)
         ident = campaign["id"]
         record = self.state["campaigns"].setdefault(ident, {"root": self.operator["run_root"] + "/" + ident})
         if campaign.get("archive", {}).get("status") != "requested":
@@ -671,6 +675,7 @@ os.close(fd)
         self.save()
 
     def sweep(self):
+        check_transport_health(self.transport)
         errors = []
         for entry in list(self.state["stages"].values()):
             if not entry.get("cloud_terminal"):
@@ -690,6 +695,7 @@ os.close(fd)
                 raise
             except Exception as error:
                 errors.append(type(error).__name__)
+        check_transport_health(self.transport)
         campaigns = self.api.request("GET", f"/v1/projects/{self.project}/benchmarks")["campaigns"]
         for campaign in campaigns:
             if campaign.get("archive", {}).get("status") == "requested":

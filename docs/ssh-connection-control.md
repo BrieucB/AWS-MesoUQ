@@ -107,6 +107,13 @@ missing-file and immutable-create probes. Permanent archive integrity failures
 halt automatic sweeps. Timestamped errors and status expose sanitized categories
 and counters without credentials or scientific payloads.
 
+Workers inspect shared health without an SSH RPC at sweep, poll, archive and
+claim boundaries, including lease-refresh claims. These checks reject a circuit
+already latched when the boundary is checked. They do not cancel an HTTPS request
+or remote command already in flight, nor make the health check and subsequent
+HTTPS request atomic. A failure appearing between them is observed at the next
+guard or transport operation.
+
 After an operator verifies the prior controller and master are gone:
 
 ~~~sh
