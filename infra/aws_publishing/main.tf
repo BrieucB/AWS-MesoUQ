@@ -28,6 +28,10 @@ resource "aws_dynamodb_table" "state" {
     type = "S"
   }
   server_side_encryption { enabled = true }
+  ttl {
+    attribute_name = "auth_expires_at"
+    enabled        = true
+  }
   deletion_protection_enabled = true
   tags                        = local.tags
 }
@@ -177,6 +181,29 @@ resource "aws_cognito_user_pool_client" "browser" {
     refresh_token = "days"
   }
 }
+# Separate public PKCE client; native connector/legacy web client stays unchanged.
+resource "aws_cognito_user_pool_client" "remembered_web" {
+  name                                 = "${var.name}-remembered-web"
+  user_pool_id                         = aws_cognito_user_pool.users.id
+  generate_secret                      = false
+  allowed_oauth_flows_user_pool_client = true
+  allowed_oauth_flows                   = ["code"]
+  allowed_oauth_scopes                  = ["openid", "email", "profile"]
+  supported_identity_providers         = ["COGNITO"]
+  callback_urls                        = ["https://${aws_cloudfront_distribution.web.domain_name}/auth/callback"]
+  logout_urls                          = ["https://${aws_cloudfront_distribution.web.domain_name}/auth/login"]
+  prevent_user_existence_errors        = "ENABLED"
+  enable_token_revocation              = true
+  access_token_validity                = 15
+  id_token_validity                    = 15
+  refresh_token_validity               = 30
+  explicit_auth_flows                  = ["ALLOW_REFRESH_TOKEN_AUTH"]
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
+}
 resource "aws_cloudwatch_log_group" "backend" {
   name              = "/aws/lambda/${var.name}-backend"
   retention_in_days = 7
@@ -217,6 +244,8 @@ resource "aws_lambda_function" "backend" {
       EVENT_QUEUE_URL              = aws_sqs_queue.events.url
       COGNITO_ISSUER               = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.users.id}"
       COGNITO_CLIENT_ID            = aws_cognito_user_pool_client.browser.id
+      COGNITO_REMEMBERED_CLIENT_ID = aws_cognito_user_pool_client.remembered_web.id
+      SITE_REMEMBERED_SESSIONS_ENABLED = tostring(var.remembered_browser_sessions_enabled)
       ARCHIVE_MAINTENANCE_RULE_ARN = aws_cloudwatch_event_rule.archive_maintenance.arn
       AWS_ACCOUNT_ID               = data.aws_caller_identity.current.account_id
       SITE_BASE_URL                = "https://${aws_cloudfront_distribution.web.domain_name}"
@@ -245,7 +274,7 @@ resource "aws_apigatewayv2_authorizer" "users" {
   identity_sources = ["$request.header.Authorization"]
   name             = "cognito-access"
   jwt_configuration {
-    audience = [aws_cognito_user_pool_client.browser.id]
+    audience = [aws_cognito_user_pool_client.browser.id, aws_cognito_user_pool_client.remembered_web.id]
     issuer   = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.users.id}"
   }
 }

@@ -131,7 +131,11 @@ OAuth state/nonce/PKCE and fixed redirects protect callback. Regional RSA signin
 issues signed cookies and encrypted HttpOnly host-only session cookies with an
 absolute five-minute maximum bounded by token expiry. Session cookies have Secure,
 SameSite=Lax, Path=/ and no Domain; their `__Host-` prefix applies to encrypted
-session/OAuth cookies. No refresh token is retained. GET `/auth/session` rechecks
+session/OAuth cookies. Legacy sign-in retains no refresh token. A separate,
+explicit remembered-web client stores encrypted server credentials outside business
+STATE with a 30-day maximum/seven-day idle cap; native-client lifetimes remain
+unchanged. Its activation switch defaults to false. See
+[Remembered browser sessions](../../docs/remembered-browser-sessions.md). GET `/auth/session` rechecks
 signature, token identity and current invitation, and hydrates an in-memory bearer
 token with no-store/private headers. POST `/auth/logout` requires the exact site
 Origin. API calls check membership immediately; copied asset cookies can retain

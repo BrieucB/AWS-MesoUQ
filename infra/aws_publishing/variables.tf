@@ -140,3 +140,9 @@ variable "site_signing_key_parameter_name" {
     error_message = "Use an absolute SSM parameter name."
   }
 }
+
+variable "remembered_browser_sessions_enabled" {
+  type        = bool
+  default     = false
+  description = "Owner-approved activation after reviewed source, dedicated client, authorizer and TTL checks. Native connector policy stays unchanged."
+}

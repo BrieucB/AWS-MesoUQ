@@ -43,14 +43,16 @@ no membership-management or signup HTTP endpoint. Disabling the invitation denie
 future API calls even before token expiry.
 
 CloudFront signed cookies protect every website asset. Only `/auth/login`,
-`/auth/callback`, GET `/auth/session` and POST `/auth/logout` form the public OAuth
+`/auth/callback`, GET `/auth/session`, POST `/auth/login`, POST `/auth/refresh` and POST `/auth/logout` form the public OAuth
 bootstrap; unknown auth routes return JSON 404 and never assets. State/nonce/PKCE,
 Cognito signature/issuer/client/token-use checks, current invitation checks and
 fixed redirect destinations protect login. The regional signer reads its private
 RSA2048 PKCS8 PEM from separately provisioned SSM Standard SecureString; Terraform
-and the repository contain no private key. Signed cookies and encrypted HttpOnly
-session cookies expire within five minutes, bounded by access-token expiry. The
-portal keeps hydrated access tokens in memory. Session hydration has no CORS and
+and the repository contain no private key. Unchecked legacy sign-in keeps its
+five-minute encrypted session. Explicit remembered-browser sign-in uses an opaque
+HttpOnly cookie and encrypted server records with a 30-day maximum/seven-day idle
+end; signed asset grants remain at most five minutes. The portal keeps hydrated
+access tokens in memory. See [Remembered browser sessions](../../docs/remembered-browser-sessions.md). Session hydration has no CORS and
 rechecks membership; logout requires the exact Origin. API calls always check
 current membership. Asset-cookie revocation may take up to five minutes.
 

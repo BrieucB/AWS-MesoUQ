@@ -319,3 +319,16 @@ def test_http_reconciliation_receives_actual_lambda_time_budget(
 
     monkeypatch.setattr(handler, "application", lambda: App())
     assert handler.handler(configured, Context())["statusCode"] == 200
+
+
+def test_remembered_web_client_is_explicitly_pinned_without_changing_native_client(configured,monkeypatch):
+    monkeypatch.setenv("COGNITO_REMEMBERED_CLIENT_ID","remembered-web")
+    assert handler.handler(configured,None)["statusCode"]==200
+    request=copy.deepcopy(configured)
+    request["requestContext"]["authorizer"]["jwt"]["claims"]["client_id"]="remembered-web"
+    assert handler.handler(request,None)["statusCode"]==200
+    request["requestContext"]["authorizer"]["jwt"]["claims"]["client_id"]="other-web"
+    assert handler.handler(request,None)["statusCode"]==401
+    request["requestContext"]["authorizer"]["jwt"]["claims"]["client_id"]="remembered-web"
+    request["requestContext"]["authorizer"]["jwt"]["claims"]["token_use"]="id"
+    assert handler.handler(request,None)["statusCode"]==401
