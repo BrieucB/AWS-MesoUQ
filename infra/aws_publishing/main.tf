@@ -187,8 +187,8 @@ resource "aws_cognito_user_pool_client" "remembered_web" {
   user_pool_id                         = aws_cognito_user_pool.users.id
   generate_secret                      = false
   allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows                   = ["code"]
-  allowed_oauth_scopes                  = ["openid", "email", "profile"]
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_scopes                 = ["openid", "email", "profile"]
   supported_identity_providers         = ["COGNITO"]
   callback_urls                        = ["https://${aws_cloudfront_distribution.web.domain_name}/auth/callback"]
   logout_urls                          = ["https://${aws_cloudfront_distribution.web.domain_name}/auth/login"]
@@ -238,20 +238,20 @@ resource "aws_lambda_function" "backend" {
   # to allocate reserved concurrency. API throttles and job admission still apply.
   environment {
     variables = {
-      BENCHMARK_POLICIES           = jsonencode({ for id, project in var.projects : id => project.benchmark_policy if project.benchmark_policy != null })
-      STATE_TABLE                  = aws_dynamodb_table.state.name
-      DATA_BUCKET                  = aws_s3_bucket.data.id
-      EVENT_QUEUE_URL              = aws_sqs_queue.events.url
-      COGNITO_ISSUER               = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.users.id}"
-      COGNITO_CLIENT_ID            = aws_cognito_user_pool_client.browser.id
-      COGNITO_REMEMBERED_CLIENT_ID = aws_cognito_user_pool_client.remembered_web.id
+      BENCHMARK_POLICIES               = jsonencode({ for id, project in var.projects : id => project.benchmark_policy if project.benchmark_policy != null })
+      STATE_TABLE                      = aws_dynamodb_table.state.name
+      DATA_BUCKET                      = aws_s3_bucket.data.id
+      EVENT_QUEUE_URL                  = aws_sqs_queue.events.url
+      COGNITO_ISSUER                   = "https://cognito-idp.${var.region}.amazonaws.com/${aws_cognito_user_pool.users.id}"
+      COGNITO_CLIENT_ID                = aws_cognito_user_pool_client.browser.id
+      COGNITO_REMEMBERED_CLIENT_ID     = aws_cognito_user_pool_client.remembered_web.id
       SITE_REMEMBERED_SESSIONS_ENABLED = tostring(var.remembered_browser_sessions_enabled)
-      ARCHIVE_MAINTENANCE_RULE_ARN = aws_cloudwatch_event_rule.archive_maintenance.arn
-      AWS_ACCOUNT_ID               = data.aws_caller_identity.current.account_id
-      SITE_BASE_URL                = "https://${aws_cloudfront_distribution.web.domain_name}"
-      SITE_PUBLIC_KEY_ID           = aws_cloudfront_public_key.site.id
-      SITE_SIGNING_KEY_PARAMETER   = var.site_signing_key_parameter_name
-      COGNITO_DOMAIN               = "https://${aws_cognito_user_pool_domain.users.domain}.auth.${var.region}.amazoncognito.com"
+      ARCHIVE_MAINTENANCE_RULE_ARN     = aws_cloudwatch_event_rule.archive_maintenance.arn
+      AWS_ACCOUNT_ID                   = data.aws_caller_identity.current.account_id
+      SITE_BASE_URL                    = "https://${aws_cloudfront_distribution.web.domain_name}"
+      SITE_PUBLIC_KEY_ID               = aws_cloudfront_public_key.site.id
+      SITE_SIGNING_KEY_PARAMETER       = var.site_signing_key_parameter_name
+      COGNITO_DOMAIN                   = "https://${aws_cognito_user_pool_domain.users.domain}.auth.${var.region}.amazoncognito.com"
     }
   }
   depends_on = [aws_cloudwatch_log_group.backend, aws_iam_role_policy.backend]
