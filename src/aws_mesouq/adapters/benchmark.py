@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import subprocess
+import sys
+import threading
 import time
 
 CLOCK_POLICY = "allocation_deadline_v1"
@@ -111,21 +115,201 @@ def _clock_record(manifest_path, clock):
             os.close(parent)
 
 
+CLEANUP_SECONDS = 4.
+TERM_GRACE_SECONDS = 1.
+GROUP_PROOF_SECONDS = .25
+GROUP_PROOF_BYTES = 65536
+GROUP_PROOF_ROWS = 1024
+
+
+class ProcessGroupCleanupError(RuntimeError):
+    """An owned group could not be safely proved stopped within its deadline."""
+
+
+def _require_process_supervision():
+    # Explicit SIG_IGN/custom reapers can release a PID behind this supervisor.
+    required = ("waitpid", "waitstatus_to_exitcode", "killpg", "getpgid", "getsid")
+    if (sys.platform not in ("linux", "darwin") or
+            any(not callable(getattr(os, name, None)) for name in required) or
+            not getattr(os, "WNOHANG", 0) or
+            threading.current_thread() is not threading.main_thread() or
+            signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
+        raise ProcessGroupCleanupError("Owned process supervision requires Linux/macOS, waitpid and default SIGCHLD")
+
+
+def _cleanup_remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProcessGroupCleanupError("Scientific process-group cleanup exceeded its four-second limit")
+    return remaining
+
+
+def _owned_live_group(process):
+    _require_process_supervision()
+    pid = process.pid
+    if type(pid) is not int or pid <= 1 or process.returncode is not None:
+        raise ProcessGroupCleanupError("Cannot signal a process group after its owned leader was reaped")
+    try:
+        found, status = os.waitpid(pid, os.WNOHANG)
+        if found == pid:
+            process.returncode = os.waitstatus_to_exitcode(status)
+            raise ProcessGroupCleanupError("Owned leader already exited; group identity is ambiguous")
+        if (found, status) != (0, 0) or os.getpgid(pid) != pid or os.getsid(pid) != pid:
+            raise ProcessGroupCleanupError("Owned child does not identify its private process group and session")
+    except OSError as error:
+        raise ProcessGroupCleanupError("Cannot prove live child ownership before a group signal") from error
+
+
+def _capture_group_metadata(command, *, timeout, env):
+    """Read at most 64 KiB plus one overflow byte; bound and reap the ps child."""
+    deadline = time.monotonic() + timeout
+    read_deadline = deadline - min(.05, timeout / 3)
+    process = None
+    selected = None
+    output = bytearray()
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=env, start_new_session=True)
+        selected = selectors.DefaultSelector()
+        selected.register(process.stdout, selectors.EVENT_READ, "output")
+        selected.register(process.stderr, selectors.EVENT_READ, "error")
+        while selected.get_map():
+            remaining = read_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            events = selected.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in events:
+                maximum = min(4096, GROUP_PROOF_BYTES + 1 - len(output)) if key.data == "output" else 1
+                block = os.read(key.fileobj.fileno(), maximum)
+                if not block:
+                    selected.unregister(key.fileobj)
+                    continue
+                if key.data == "error":
+                    raise ProcessGroupCleanupError("Process-group metadata reported an error")
+                output.extend(block)
+                if len(output) > GROUP_PROOF_BYTES:
+                    raise ProcessGroupCleanupError("Process-group metadata exceeded its hard read limit")
+        remaining = read_deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        code = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(command, code, bytes(output), b"")
+    finally:
+        if selected is not None:
+            selected.close()
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                stream.close()
+            if process.returncode is None:
+                process.kill()
+                try:
+                    process.wait(timeout=max(0., deadline - time.monotonic()))
+                except subprocess.TimeoutExpired as error:
+                    raise ProcessGroupCleanupError("Metadata child did not stop within its bounded query") from error
+
+
+def _group_quiescent(pgid, deadline):
+    remaining = _cleanup_remaining(deadline)
+    if remaining <= .1:
+        raise ProcessGroupCleanupError("Insufficient cleanup time for bounded group metadata")
+    # Apple -g selects PGID; procps -g selects SID, so Linux uses its documented
+    # negative numeric PGID selector. Never request command lines or environments.
+    select_group = ["-g", str(pgid)] if sys.platform == "darwin" else ["-" + str(pgid)]
+    # procps3.3.15 consumes every argument after a numeric PGID as an ID.
+    # Keep all format options before the trailing group selector.
+    command = ["/bin/ps", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "uid=", *select_group]
+    environment = dict(os.environ)
+    for name in ("PS_FORMAT", "PS_PERSONALITY", "CMD_ENV", "POSIXLY_CORRECT", "UNIX95", "I_WANT_A_BROKEN_PS"):
+        environment.pop(name, None)
+    environment["LC_ALL"] = "C"
+    if sys.platform == "linux":
+        environment["PS_PERSONALITY"] = "linux"
+    else:
+        # Apple legacy mode ignores -g and can treat the PGID as a PID list.
+        environment["COMMAND_MODE"] = "unix2003"
+    try:
+        result = _capture_group_metadata(command,
+                                         timeout=min(GROUP_PROOF_SECONDS, remaining - .1),
+                                         env=environment)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessGroupCleanupError("Bounded process-group metadata is unavailable") from error
+    _cleanup_remaining(deadline)
+    output, errors = result.stdout, result.stderr
+    if (not isinstance(output, bytes) or not isinstance(errors, bytes) or errors or
+            len(output) > GROUP_PROOF_BYTES or result.returncode not in (0, 1)):
+        raise ProcessGroupCleanupError("Unknown, denied or oversized process-group metadata")
+    if not output.strip():
+        # Empty/nonzero ps output alone is not a trusted absence proof.
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError as error:
+            raise ProcessGroupCleanupError("Empty group metadata does not prove group absence") from error
+        raise ProcessGroupCleanupError("Empty group metadata does not prove group absence")
+    if result.returncode != 0:
+        raise ProcessGroupCleanupError("Partial process-group metadata cannot prove cleanup")
+    try:
+        rows = output.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise ProcessGroupCleanupError("Invalid process-group metadata encoding") from error
+    if not 1 <= len(rows) <= GROUP_PROOF_ROWS:
+        raise ProcessGroupCleanupError("Unbounded process-group metadata rows")
+    seen, quiescent = set(), True
+    for row in rows:
+        fields = row.split()
+        if len(fields) != 4:
+            raise ProcessGroupCleanupError("Unknown process-group metadata fields")
+        pid, group, state, uid = fields
+        if (not re.fullmatch(r"[1-9][0-9]{0,15}", pid) or
+                not re.fullmatch(r"[1-9][0-9]{0,15}", group) or
+                not re.fullmatch(r"0|[1-9][0-9]{0,15}", uid) or
+                int(group) != pgid or int(uid) != os.geteuid() or pid in seen or
+                not re.fullmatch(r"[DIRSTtWXZUI][+<=>AEILNOSTVWlrs]*", state)):
+            raise ProcessGroupCleanupError("Unknown or foreign process-group metadata")
+        seen.add(pid)
+        quiescent = quiescent and state.startswith("Z")
+    return quiescent
+
+
+def _signal_owned_group(process, signum, deadline):
+    _cleanup_remaining(deadline)
+    if process.returncode is not None:
+        raise ProcessGroupCleanupError("Owned leader was reaped before the last group signal")
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        return False
+    except PermissionError as error:
+        if sys.platform != "darwin" or error.errno != errno.EPERM:
+            raise
+        # Darwin can return EPERM for an existing zombie-only group. A live or
+        # unknown group must retain its failure; leader exit alone is no proof.
+        if not _group_quiescent(process.pid, deadline):
+            raise
+        return False
+    return True
+
+
 def _stop_group(process):
-    # The parent may have exited while a descendant still owns the group.
+    deadline = time.monotonic() + CLEANUP_SECONDS
+    _owned_live_group(process)
+    active = _signal_owned_group(process, signal.SIGTERM, deadline)
+    if active:
+        # Do not wait/poll here: an unreaped owned leader pins the PID/PGID even
+        # if it exits while a TERM-resistant grandchild is still executing.
+        time.sleep(min(TERM_GRACE_SECONDS, _cleanup_remaining(deadline)))
+        active = _signal_owned_group(process, signal.SIGKILL, deadline)
+        while active and not _group_quiescent(process.pid, deadline):
+            time.sleep(min(.02, _cleanup_remaining(deadline)))
+    # All group signals are finished before releasing the owned PID.
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait(timeout=2)
+        process.wait(timeout=_cleanup_remaining(deadline))
+    except subprocess.TimeoutExpired as error:
+        raise ProcessGroupCleanupError("Owned leader could not be reaped within the cleanup deadline") from error
+    _cleanup_remaining(deadline)
 
 
 class AdapterInterrupted(RuntimeError):
@@ -139,6 +323,7 @@ class AdapterInterrupted(RuntimeError):
 def run_science(command, repository, watchdog_deadline):
     deadline = watchdog_deadline if isinstance(watchdog_deadline, _Deadline) else _Deadline(watchdog_deadline)
     _remaining(deadline)
+    _require_process_supervision()
     process = None
     launching = True
     stopping = False
