@@ -33,7 +33,7 @@ def metadata():
         "user_pool":{"UserPool":{"Id":"pool","MfaConfiguration":"ON"}},
         "entry_function_code":(Path(__file__).resolve().parents[1]/"infra/aws_publishing/functions/remembered-entry.js").read_text(),
         "entry_function":{"ETag":"function-before","FunctionSummary":{
-            "FunctionMetadata":{"Stage":"LIVE","FunctionARN":"arn:aws:cloudfront::000000000000:function:remembered-entry"},
+            "FunctionMetadata":{"Stage":"LIVE","FunctionARN":"arn:aws:cloudfront::000000000000:function/remembered-entry"},
             "FunctionConfig":{"Runtime":"cloudfront-js-1.0"}}},
         "distribution":{"ETag":"distribution-before","Distribution":{"Id":"FIXTURE","Status":"Deployed",
             "DistributionConfig":{"DefaultRootObject":"index.html",
@@ -110,3 +110,12 @@ class SessionReleaseTests(unittest.TestCase):
             else:
                 value["distribution"]["Distribution"]["DistributionConfig"]["DefaultCacheBehavior"]["TrustedKeyGroups"]["Enabled"]=False
             with self.assertRaises(ValueError):release.prepare(value)
+
+
+    def test_rejects_malformed_or_cross_account_cloudfront_function_arn(self):
+        for arn in ("arn:aws:cloudfront::000000000000:function:remembered-entry",
+                    "arn:aws:cloudfront::111111111111:function/remembered-entry"):
+            value=metadata()
+            value["entry_function"]["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]=arn
+            with self.assertRaisesRegex(ValueError,"existing account"):
+                release.prepare(value)

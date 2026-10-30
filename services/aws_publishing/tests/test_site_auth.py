@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlsplit, urlencode
 import jwt
 import pytest
 from cryptography.exceptions import InvalidSignature
+from cryptography.fernet import InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -263,3 +264,16 @@ def test_token_exchange_rejects_expired_code_without_provider_body(monkeypatch):
             "one-use-code", "verifier", "https://private.cloudfront.net/auth/callback"
         )
     assert "sensitive" not in str(caught.value)
+
+
+def test_sealed_cookie_rejects_appended_data_for_every_base64_padding_length(auth):
+    tokens=[auth.seal({"expires_at":2000,"padding":"x"*size}) for size in (0,16,32)]
+    assert len({len(value)-len(value.rstrip("=")) for value in tokens})==3
+    for value in tokens:
+        assert auth.unseal(value)["expires_at"]==2000
+        for suffix in ("tamper","=","A","AA"):
+            with pytest.raises((ValueError,InvalidToken)):
+                auth.unseal(value+suffix)
+    for value in ("é"*20,"x"*8193):
+        with pytest.raises(ValueError):
+            auth.unseal(value)

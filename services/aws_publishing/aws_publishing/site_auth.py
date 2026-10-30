@@ -6,6 +6,7 @@ The signing private key exists only in regional memory and owner-managed SSM.
 """
 
 import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -180,7 +181,19 @@ class SiteAuth:
         ).decode()
 
     def unseal(self, value):
-        payload = json.loads(self.cipher.decrypt(value.encode()))
+        # Fernet authenticates decoded bytes, while permissive base64 decoders
+        # can ignore text appended after padding. Cookies have one canonical
+        # bounded representation; reject altered encodings before decrypting.
+        if not isinstance(value,str) or len(value)>8192:
+            raise ValueError("Invalid sealed cookie encoding")
+        try:
+            encoded=value.encode("ascii")
+            decoded=base64.b64decode(encoded,altchars=b"-_",validate=True)
+        except (binascii.Error,UnicodeError):
+            raise ValueError("Invalid sealed cookie encoding") from None
+        if base64.urlsafe_b64encode(decoded)!=encoded:
+            raise ValueError("Invalid sealed cookie encoding")
+        payload = json.loads(self.cipher.decrypt(encoded))
         if payload["expires_at"] <= self.clock():
             raise ValueError("Expired site session")
         return payload
