@@ -6,8 +6,16 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import pytest
 from aws_mesouq.connector import ssh_session as sessions
+
+@pytest.fixture
+def tmp_path():
+    # macOS runner TMPDIR can exceed the Unix socket limit before this test starts.
+    with tempfile.TemporaryDirectory(prefix="mesouq-mux-", dir=Path("/tmp").resolve()) as directory:
+        yield Path(directory)
+
 
 class Clock:
     def __init__(self, value=10000.0):
@@ -656,3 +664,203 @@ def test_legacy_or_unsafe_endpoint_ledger_is_denied(tmp_path, schema, endpoint):
     with pytest.raises(sessions.SSHSessionError, match='unsafe_state'):
         with store.locked():
             pytest.fail('unsafe endpoint ledger was trusted')
+
+
+@pytest.mark.parametrize('returncode', [-9, -15])
+def test_signaled_mux_client_latches_shared_fatal_circuit(tmp_path, fake_ssh, returncode):
+    guard = tmp_path / 'guard'
+    with sessions.SSHSession('karolina', guard) as owner:
+        with sessions.SSHSession('karolina', guard, borrow_only=True) as borrower:
+            fake_ssh.rpc_codes = [returncode, 0]
+            with pytest.raises(sessions.SSHSessionError, match='client_error'):
+                owner.run_bytes(['squeue'])
+            with pytest.raises(sessions.SSHSessionError, match='client_error'):
+                borrower.run_bytes(['sacct'])
+            assert fake_ssh.rpc_codes == [0]
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['circuit'] == 'client_error'
+    assert state['active'] is not None and len(fake_ssh.masters) == 1
+
+
+@pytest.mark.parametrize('returncode', [1, 127, 254])
+def test_positive_remote_nonzero_remains_nonfatal(tmp_path, fake_ssh, returncode):
+    with sessions.SSHSession('karolina', tmp_path / 'guard') as owner:
+        fake_ssh.rpc_codes = [returncode, 0]
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            owner.run_bytes(['remote-probe'])
+        assert failure.value.returncode == returncode
+        assert owner.snapshot()['circuit'] is None
+        assert owner.run_bytes(['true']) == b'ok'
+
+
+def test_resolution_delay_refreshes_and_reprunes_before_durable_reservation(tmp_path, fake_ssh, monkeypatch):
+    clock, guard = Clock(), tmp_path / 'guard'
+    sessions.record_external_attempt(guard, 6405.0, clock=clock)
+    sessions.record_external_attempt(guard, 6406.0, clock=clock)
+    original_run = fake_ssh.run
+    original_resolution = sessions.socket.getaddrinfo
+    original_popen = fake_ssh.popen
+    reservations = []
+    def delayed_configuration(command, **kwargs):
+        result = original_run(command, **kwargs)
+        if '-G' in command:
+            clock.value += 2
+        return result
+    def delayed_resolution(*arguments):
+        result = original_resolution(*arguments)
+        clock.value += 3
+        return result
+    def launch(command, **kwargs):
+        path = Path(command[command.index('-S') + 1]).parent / 'attempts.json'
+        reservations.append(json.loads(path.read_text())['attempts'])
+        return original_popen(command, **kwargs)
+    monkeypatch.setattr(sessions.subprocess, 'run', delayed_configuration)
+    monkeypatch.setattr(sessions.socket, 'getaddrinfo', delayed_resolution)
+    monkeypatch.setattr(sessions.subprocess, 'Popen', launch)
+    with sessions.SSHSession('karolina', guard, clock=clock):
+        pass
+    assert reservations == [[10007.0]]
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['attempts'] == [10007.0]
+    assert state['counters']['admitted'] == 3 and len(fake_ssh.masters) == 1
+
+
+@pytest.mark.parametrize('changed_time', [9999.0, float('nan'), float('inf')])
+def test_clock_is_revalidated_after_resolution_before_admission(tmp_path, fake_ssh, monkeypatch, changed_time):
+    clock, guard = Clock(), tmp_path / 'guard'
+    original = sessions._resolve
+    def resolve(*arguments):
+        result = original(*arguments)
+        clock.value = changed_time
+        return result
+    monkeypatch.setattr(sessions, '_resolve', resolve)
+    with pytest.raises(sessions.SSHSessionError, match='clock_rollback'):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    _assert_unadmitted(guard, fake_ssh)
+
+
+def test_authenticated_ready_time_conservatively_bounds_rolling_physical_starts(tmp_path, fake_ssh, monkeypatch):
+    clock, guard = Clock(), tmp_path / 'guard'
+    original = sessions._check
+    ready_times = []
+    def delayed_ready(*arguments):
+        clock.value += 20
+        result = original(*arguments)
+        if result:
+            ready_times.append(clock.value)
+        return result
+    monkeypatch.setattr(sessions, '_check', delayed_ready)
+    for reservation in (10000.0, 10021.0, 10042.0):
+        clock.value = reservation
+        with sessions.SSHSession('karolina', guard, clock=clock):
+            pass
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert ready_times == [10020.0, 10041.0, 10062.0]
+    assert state['attempts'] == ready_times
+    clock.value = 13600.0
+    with pytest.raises(sessions.SSHSessionError, match='attempt_budget_exhausted'):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    assert len(fake_ssh.masters) == 3
+    clock.value = 13620.0
+    with sessions.SSHSession('karolina', guard, clock=clock):
+        pass
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['attempts'] == [10041.0, 10062.0, 13640.0]
+    assert state['counters']['admitted'] == 4 and state['counters']['denied'] == 1
+
+
+def test_failed_start_is_settled_after_proven_dead_recovery_without_reset(tmp_path, fake_ssh, monkeypatch):
+    clock, guard = Clock(), tmp_path / 'guard'
+    sessions.record_external_attempt(guard, 10000.0, clock=clock)
+    clock.value = 10001.0
+    sessions.record_external_attempt(guard, 10001.0, clock=clock)
+    clock.value = 10002.0
+    original_popen, original_check = fake_ssh.popen, sessions._check
+    def delayed_failed_launch(command, **kwargs):
+        master = original_popen(command, **kwargs)
+        clock.value += 20
+        return master
+    fake_ssh.failed_start = True
+    monkeypatch.setattr(sessions.subprocess, 'Popen', delayed_failed_launch)
+    with pytest.raises(sessions.SSHSessionError, match='connect_timeout'):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    before = json.loads((guard / 'attempts.json').read_text())
+    assert before['attempts'] == [10000.0, 10001.0, 10002.0]
+    assert before['active'] is not None
+    clock.value = 13602.0
+    monkeypatch.setattr(sessions, '_alive', lambda pid: False)
+    def prove_dead(*arguments):
+        clock.value += 5
+        return False
+    monkeypatch.setattr(sessions, '_check', prove_dead)
+    sessions.recover(guard, clock=clock)
+    recovered = json.loads((guard / 'attempts.json').read_text())
+    assert recovered['attempts'] == [10000.0, 10001.0, 13607.0]
+    assert recovered['counters'] == before['counters']
+    assert recovered['active'] is None and recovered['circuit'] is None
+    fake_ssh.failed_start = False
+    monkeypatch.setattr(sessions.subprocess, 'Popen', original_popen)
+    monkeypatch.setattr(sessions, '_check', original_check)
+    for now in (13607.0, 13608.0):
+        clock.value = now
+        with sessions.SSHSession('karolina', guard, clock=clock):
+            pass
+    clock.value = 13609.0
+    with pytest.raises(sessions.SSHSessionError, match='attempt_budget_exhausted'):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['attempts'] == [13607.0, 13607.0, 13608.0]
+    assert state['counters']['admitted'] == 5 and state['counters']['denied'] == 1
+    assert len(fake_ssh.masters) == 3
+
+
+def test_interrupted_pre_ready_cleanup_settles_after_owned_master_reap(tmp_path, fake_ssh, monkeypatch):
+    clock, guard = Clock(), tmp_path / 'guard'
+    original_terminate = Master.terminate
+    def interrupt_before_ready(*arguments):
+        clock.value += 12
+        raise KeyboardInterrupt
+    def delayed_reap(master):
+        clock.value += 8
+        original_terminate(master)
+    monkeypatch.setattr(sessions, '_check', interrupt_before_ready)
+    monkeypatch.setattr(Master, 'terminate', delayed_reap)
+    with pytest.raises(KeyboardInterrupt):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['attempts'] == [10020.0]
+    assert state['active'] is None and state['circuit'] is None
+    assert state['counters']['admitted'] == 1
+    assert fake_ssh.masters[0].poll() is not None
+
+
+def test_interrupted_unknown_spawn_retains_blocking_tombstone(tmp_path, fake_ssh, monkeypatch):
+    clock, guard = Clock(), tmp_path / 'guard'
+    def interrupted_spawn(*arguments, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(sessions.subprocess, 'Popen', interrupted_spawn)
+    with pytest.raises(KeyboardInterrupt):
+        sessions.SSHSession('karolina', guard, clock=clock)
+    state = json.loads((guard / 'attempts.json').read_text())
+    assert state['attempts'] == [10000.0] and state['active']['master_pid'] is None
+    assert state['circuit'] == 'client_error'
+    with pytest.raises(sessions.SSHSessionError, match='uncertain_master_identity'):
+        sessions.recover(guard, clock=clock)
+    assert fake_ssh.masters == []
+
+
+def test_external_attempt_import_cannot_reorder_an_active_reservation(tmp_path, fake_ssh):
+    clock, guard = Clock(), tmp_path / 'guard'
+    with sessions.SSHSession('karolina', guard, clock=clock):
+        before = json.loads((guard / 'attempts.json').read_text())
+        with pytest.raises(sessions.SSHSessionError, match='session_still_owned'):
+            sessions.record_external_attempt(guard, clock.value, clock=clock)
+        assert json.loads((guard / 'attempts.json').read_text()) == before
+
+
+def test_excess_control_path_is_denied_before_configuration_or_launch(tmp_path, fake_ssh):
+    guard = tmp_path / ("d" * 100)
+    with pytest.raises(sessions.SSHSessionError, match="control_path_too_long"):
+        sessions.SSHSession("karolina", guard)
+    assert fake_ssh.masters == [] and fake_ssh.config_calls == 0
+    assert fake_ssh.resolutions == []

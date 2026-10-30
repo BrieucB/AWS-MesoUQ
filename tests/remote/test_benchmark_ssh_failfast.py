@@ -60,8 +60,9 @@ def test_archive_failure_stops_the_archive_loop(error):
         worker.sweep()
     assert seen == ["a"]
 
-@pytest.mark.parametrize("kind", ["benchmark", "calibration"])
-def test_entrypoint_guard_failure_is_sanitized_and_closes_without_browser_login(tmp_path, monkeypatch, capsys, kind):
+@pytest.mark.parametrize("kind,site", [("benchmark", "karolina"), ("calibration", "karolina"), ("calibration", "vega")])
+def test_entrypoint_guard_failure_is_sanitized_and_closes_without_browser_login(tmp_path, monkeypatch, capsys, kind, site):
+    monkeypatch.setenv("MESOUQ_SITE", site)
     from aws_mesouq.connector import transport as transport_module
     from aws_mesouq.connector import auth, slurm, api, journal
     import aws_mesouq.benchmark_worker as benchmark
@@ -100,7 +101,7 @@ def test_entrypoint_guard_failure_is_sanitized_and_closes_without_browser_login(
         monkeypatch.setattr(cli, "Transport", Blocked)
         monkeypatch.setattr(cli, "browser_login", lambda *a: pytest.fail("must not authenticate"))
         monkeypatch.setattr(cli, "Journal", lambda *a: pytest.fail("must not open journal before preflight"))
-        result = cli.main(shared + ["--site", "karolina", "--expected-user", "fixture", "--expected-host", "fixture.cluster",
+        result = cli.main(shared + ["--site", site, "--expected-user", "fixture", "--expected-host", "fixture.cluster",
                                    "--run-root", str(tmp_path / "run"), "--repository", str(tmp_path / "repository"),
                                    "--model-registry", str(tmp_path / "models.json")])
     assert result == 2 and closed == [True]

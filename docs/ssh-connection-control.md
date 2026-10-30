@@ -93,6 +93,10 @@ schema. These transport files are independent of the enrolled connector journal.
 The durable ledger admits at most three successful or failed new attempts in any
 rolling3600-second interval. A cross-process lifetime lock permits one master.
 Reservations are fsynced before spawning SSH; normal restarts retain allowance.
+Attempt times are conservatively settled after authenticated readiness. Failed or
+uncertain records are extended only after recovery proves the previous processes
+dead; interrupted pre-ready cleanup settles after its owned master is reaped.
+Slow configuration, DNS, scheduling, or spawn timing cannot shorten the allowance.
 Corruption, deleted initialized state, clock rollback and uncertain owner/master
 state fail closed. No token bucket, process-local counter or file deletion is a
 substitute for this ledger.

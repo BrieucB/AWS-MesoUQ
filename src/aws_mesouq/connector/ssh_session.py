@@ -109,15 +109,18 @@ class _Store:
         finally:
             os.close(bootstrap)
 
+    def current_time(self, state, *, minimum=0.0):
+        now = self.clock()
+        if type(now) not in (int, float) or not math.isfinite(now) or now < max(state["watermark"], minimum):
+            raise SSHSessionError("clock_rollback")
+        return float(now)
+
     @contextmanager
     def locked(self):
         fd = _lock_file(self.directory / "state.lock")
         try:
             state = self.read()
-            now = self.clock()
-            if type(now) not in (int, float) or not math.isfinite(now) or now < state["watermark"]:
-                raise SSHSessionError("clock_rollback")
-            yield state, float(now)
+            yield state, self.current_time(state)
         finally:
             os.close(fd)
 
@@ -185,6 +188,13 @@ class _Store:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+def _settle_attempt(state, now):
+    # Active reservation stays last: external imports are forbidden while active.
+    if not state["attempts"]:
+        raise SSHSessionError("unsafe_state")
+    state["attempts"][-1] = now
+
 
 def _endpoint(value):
     if type(value) is not dict or set(value) != {'address', 'family'}:
@@ -444,6 +454,12 @@ class SSHSession:
             self.target, self.endpoint, command = _resolve(self.host, self.store.socket)
             if os.path.lexists(self.store.socket):
                 raise SSHSessionError("orphaned_control_socket")
+            now = self.store.current_time(state, minimum=now)
+            recent = [x for x in state["attempts"] if x > now - WINDOW_SECONDS]
+            if len(recent) >= MAX_ATTEMPTS:
+                state["counters"]["denied"] += 1
+                self.store.save(state, now)
+                raise SSHSessionError("attempt_budget_exhausted")
             self.id = uuid.uuid4().hex
             state["attempts"] = recent + [now]
             state["counters"]["admitted"] += 1
@@ -464,6 +480,7 @@ class SSHSession:
                     raise SSHSessionError(category)
                 if _check(self.store, self.target):
                     with self.store.locked() as (state, now):
+                        _settle_attempt(state, now)
                         state["active"]["ready"] = True
                         self.store.save(state, now)
                     return
@@ -505,6 +522,10 @@ class SSHSession:
                 state["circuit"] = "client_error"
                 self.store.save(state, max(now, self.store.clock()))
                 raise SSHSessionError("client_error") from error
+            if result.returncode < 0:
+                state["circuit"] = "client_error"
+                self.store.save(state, max(now, self.store.clock()))
+                raise SSHSessionError("client_error")
             if result.returncode == 255:
                 state["circuit"] = "connection_lost"
                 self.store.save(state, max(now, self.store.clock()))
@@ -546,12 +567,17 @@ class SSHSession:
                 self._stop_master()
                 active = state["active"]
                 if active is not None and active["id"] == self.id:
+                    if self._master is None and state["circuit"] is None:
+                        state["circuit"] = "client_error"
                     if was_dead and state["circuit"] is None:
                         state["circuit"] = "connection_lost"
                     if state["circuit"] is None:
                         if os.path.lexists(self.store.socket):
                             _socket_private(self.store.socket)
                             self.store.socket.unlink()
+                        if not active["ready"]:
+                            now = self.store.current_time(state, minimum=now)
+                            _settle_attempt(state, now)
                         state["active"] = None
                     self.store.save(state, now)
         finally:
@@ -598,6 +624,9 @@ def recover(directory, *, clock=time.time):
             if os.path.lexists(store.socket):
                 _socket_private(store.socket)
                 store.socket.unlink()
+            if active is not None:
+                now = store.current_time(state, minimum=now)
+                _settle_attempt(state, now)
             state["active"] = None
             state["circuit"] = None
             store.save(state, now)

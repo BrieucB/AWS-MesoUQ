@@ -10,9 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from aws_mesouq.connector.connector import Connector, LeaseExpired
+from aws_mesouq.connector.connector import Connector, LeaseExpired, StaleEvent
 from aws_mesouq.connector.journal import Journal
-from aws_mesouq.connector.slurm import Slurm
+from aws_mesouq.connector.slurm import SUBMISSION_HELPER, Slurm
+from aws_mesouq.connector.ssh_session import SSHSessionError
 from aws_mesouq.connector.transport import Transport, absolute_path, safe_id
 from aws_mesouq.connector.api import API, NoRedirect
 
@@ -776,3 +777,75 @@ def test_different_event_cannot_consume_pending_acknowledgment(session):
     assert len(session.api.events) == before
     assert entry['pending_event']['event_id'] == 'uncertain-heartbeat'
     assert not entry.get('terminal')
+
+
+@pytest.mark.parametrize('notification_failure', [None, OSError, StaleEvent])
+def test_sweep_stops_on_fatal_ssh_submission_even_when_unknown_notification_fails(session, monkeypatch, notification_failure):
+    s = session
+    fatal = SSHSessionError('connection_lost')
+    failed, submissions, after_failure, claims, unknown = [False], [], [], [], []
+    original_request = s.api.request
+    def request(method, path, payload=None):
+        if path == '/v1/connector/claim':
+            claims.append(list(payload.get('exclude_job_ids', [])))
+        if payload and payload.get('type') == 'submission_unknown':
+            unknown.append(dict(payload))
+            if notification_failure is not None:
+                raise notification_failure('Unknown submission notification unavailable')
+        return original_request(method, path, payload)
+    monkeypatch.setattr(s.api, 'request', request)
+    monkeypatch.setattr(s.slurm, 'submit', Slurm.submit.__get__(s.slurm, Slurm))
+    for name in ('identity', 'run', 'write', 'read', 'private_root_probe',
+                 'archive_prepare', 'archive_copy', 'archive_verify', 'check_files', 'read_beneath'):
+        original = getattr(s.transport, name)
+        def operation(*args, _name=name, _original=original, **kwargs):
+            if failed[0]:
+                after_failure.append(_name)
+            if _name == 'run' and len(args[0]) >= 5 and args[0][3] == SUBMISSION_HELPER:
+                submissions.append(list(args[0]))
+                failed[0] = True
+                raise fatal
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(s.transport, name, operation)
+    with pytest.raises(SSHSessionError) as error:
+        s.connector.sweep()
+    assert error.value is fatal
+    assert claims == [[]]
+    assert len(submissions) == 1 and after_failure == []
+    assert len(unknown) == 1
+    persisted = json.loads(s.journal.path.read_text())['jobs']['job-1']
+    assert persisted['phase'] == 'submission_attempted'
+    assert 'slurm_job_id' not in persisted and not persisted.get('terminal')
+    if notification_failure is not None:
+        assert persisted['pending_event']['type'] == 'submission_unknown'
+        assert persisted['pending_event']['event_id'] == unknown[0]['event_id']
+    else:
+        assert 'pending_event' not in persisted
+        assert s.job['status'] == 'submission_unknown'
+
+
+def test_sweep_preserves_fatal_staging_ssh_error_without_cloud_failure_transition(session, monkeypatch):
+    s = session
+    fatal = SSHSessionError('connection_lost')
+    claims, remote_calls, failed_notifications = [], [], []
+    original_request = s.api.request
+    def request(method, path, payload=None):
+        if path == '/v1/connector/claim':
+            claims.append(list(payload.get('exclude_job_ids', [])))
+        if payload and payload.get('type') == 'failed':
+            failed_notifications.append(dict(payload))
+            raise StaleEvent('Cloud state changed while reporting staging failure')
+        return original_request(method, path, payload)
+    def fail_remote(argv, **kwargs):
+        remote_calls.append(list(argv))
+        raise fatal
+    monkeypatch.setattr(s.api, 'request', request)
+    monkeypatch.setattr(s.transport, 'run', fail_remote)
+    with pytest.raises(SSHSessionError) as error:
+        s.connector.sweep()
+    assert error.value is fatal
+    assert claims == [[]] and len(remote_calls) == 1
+    assert failed_notifications == [] and s.slurm.submit_count == 0
+    persisted = json.loads(s.journal.path.read_text())['jobs']['job-1']
+    assert persisted['phase'] == 'staging'
+    assert 'pending_event' not in persisted and not persisted.get('terminal')

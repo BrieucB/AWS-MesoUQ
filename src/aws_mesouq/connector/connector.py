@@ -11,6 +11,7 @@ import shlex
 import uuid
 
 from .transport import absolute_path, safe_id, safe_relative
+from .ssh_session import SSHSessionError
 from .signing import device_identity, sign_archive, sign_result
 from aws_mesouq.contracts import CANONICAL_PROFILE, validate_result
 
@@ -634,7 +635,7 @@ class Connector:
             self.journal.save()
             try:
                 self.stage(job, entry)
-            except StaleEvent:
+            except (StaleEvent, SSHSessionError):
                 raise
             except Exception as exc:
                 if entry.get("pending_event"):
@@ -670,6 +671,15 @@ class Connector:
             try:
                 entry["slurm_job_id"] = self.slurm.submit(entry["run_dir"] + "/submit.sh")
                 self.journal.save()
+            except SSHSessionError:
+                # Submission may have committed; keep reconciliation without
+                # allowing notification failure to hide the fatal SSH error.
+                try:
+                    if not entry.get("pending_event"):
+                        self.event(job_id, "submission_unknown", detail={"reason": "Submission acknowledgement unavailable; reconciliation required"})
+                except Exception:
+                    pass
+                raise
             except Exception:
                 if entry.get("pending_event"):
                     raise
