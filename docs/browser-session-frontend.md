@@ -70,7 +70,13 @@ in its evidence. The test uses its own temporary profile and loopback fixtures. 
 real trusted browser input, passive renewal, file/units retention, cold entry and
 cross-tab logout. Its screenshot and JSON evidence explicitly identify synthetic
 data. It never logs in to AWS, Cognito or an HPC service. All fixture files are
-excluded from the production build.
+excluded from the production build. The driver uses ordinary unnamed WebDriver
+content execution for its test-only page globals. A named Marionette sandbox has
+Xray wrappers that hide properties added by page scripts; this must not be
+mistaken for a missing app fixture. Native ElementClick still supplies the trusted
+foreground event, and all preview, idle-policy and logout assertions remain.
+See [Mozilla's Marionette script documentation](https://firefox-source-docs.mozilla.org/python/marionette_driver.html)
+and its [content-command implementation](https://github.com/mozilla/gecko-dev/blob/master/remote/marionette/actors/MarionetteCommandsChild.sys.mjs).
 
 Live authentication, the remembered opt-in and expiry behavior still require
 the reviewed backend/frontend release and a separate production browser check.

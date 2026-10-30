@@ -40,7 +40,12 @@ try:
         if result[2]:raise RuntimeError(str(result[2]))
         return result[3]
     def value(result):return result.get("value",result) if isinstance(result,dict) else result
-    def execute(js):return value(command("WebDriver:ExecuteScript",{"script":js,"args":[],"newSandbox":False,"sandbox":"default"}))
+    def execute(js):
+        # The unnamed WebDriver content sandbox sees page-owned fixture globals.
+        # A named "default" sandbox uses Xrays and hides window expandos. This is
+        # the ordinary content realm, never the elevated "system" sandbox.
+        # https://firefox-source-docs.mozilla.org/python/marionette_driver.html
+        return value(command("WebDriver:ExecuteScript",{"script":js,"args":[]}))
     def wait(js):
         for _ in range(100):
             result=execute("return "+js)
@@ -94,6 +99,7 @@ try:
     (output/"session-browser-evidence.json").write_text(json.dumps({
         "synthetic_fixture_only":True,"live_authentication_verified":False,"aws_or_hpc_calculation_submitted":False,
         "firefox_binary":str(firefox),
+        "marionette_script_context":"unnamed content sandbox",
         "passive_refresh_preserves_units_and_file_preview":True,"passive_refresh_does_not_extend_idle":True,
         "trusted_browser_input_touches_idle_only":True,"no_browser_auth_storage":True,
         "cold_entry_resumes_with_passive_post":True,"cross_tab_logout_clears_private_view":True,
