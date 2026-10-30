@@ -270,6 +270,7 @@ class SiteAuth:
         document = (
             '<!doctype html><html lang="en"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="referrer" content="same-origin">'
             '<title>Sign in · MesoUQ</title><main><h1>Sign in to MesoUQ</h1>'
             '<p>Private project · Invited MFA accounts</p>'
             '<form method="post" action="/auth/login">'
