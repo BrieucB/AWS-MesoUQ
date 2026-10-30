@@ -94,3 +94,8 @@ Sources: [Apple ps manual](https://github.com/apple-oss-distributions/adv_cmds/b
 [Apple XNU group signalling](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
 
 Apple compatibility-mode sources: [ps option parsing](https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/ps.c) and [COMMAND_MODE handling](https://github.com/apple-oss-distributions/Libc/blob/main/gen/get_compat.c).
+
+For procps3.3.15, the numeric process-group selector must follow all format
+options: its [trailing-ID parser](https://github.com/procps-ng/procps/blob/v3.3.15/ps/parser.c#L995)
+consumes every remaining token as a PID/PGID/SID. Exact PGID validation remains
+strict; unrelated group rows are rejected rather than filtered away.

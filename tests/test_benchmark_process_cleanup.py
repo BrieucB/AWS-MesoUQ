@@ -314,3 +314,27 @@ def test_actual_darwin_selector_sees_descendant_despite_legacy_parent_mode(real_
     adapter._stop_group(real_group.process)
     readable, _, _ = select.select([real_group.alive_read], [], [], .5)
     assert readable and os.read(real_group.alive_read, 1) == b""
+
+def test_old_procps_selector_comes_after_all_format_options(cleanup, monkeypatch):
+    monkeypatch.setattr(adapter, "sys", SimpleNamespace(platform="linux"), raising=False)
+    cleanup.eperm = False
+    metadata = adapter._capture_group_metadata
+    def old_procps(command, **kwargs):
+        # procps3.3.15 parse_trailing_pids treats ALL remaining tokens as IDs.
+        numeric = command.index("-4242")
+        if numeric != len(command) - 1:
+            return SimpleNamespace(returncode=1, stdout=b"",
+                                   stderr=b"error: process ID list syntax error\n")
+        return metadata(command, **kwargs)
+    monkeypatch.setattr(adapter, "_capture_group_metadata", old_procps)
+    adapter._stop_group(cleanup.process)
+    assert cleanup.events[-1] == "reap"
+
+
+def test_linux_group_proof_rejects_foreign_pgid_instead_of_filtering_it(cleanup, monkeypatch):
+    monkeypatch.setattr(adapter, "sys", SimpleNamespace(platform="linux"), raising=False)
+    cleanup.eperm = False
+    cleanup.outputs = [SimpleNamespace(returncode=0, stdout=b"4242 4242 Z 1000\n4243 5000 R 1000\n", stderr=b"")]
+    with pytest.raises(RuntimeError):
+        adapter._stop_group(cleanup.process)
+    assert "reap" not in cleanup.events

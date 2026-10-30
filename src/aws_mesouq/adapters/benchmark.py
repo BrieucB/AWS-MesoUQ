@@ -217,7 +217,9 @@ def _group_quiescent(pgid, deadline):
     # Apple -g selects PGID; procps -g selects SID, so Linux uses its documented
     # negative numeric PGID selector. Never request command lines or environments.
     select_group = ["-g", str(pgid)] if sys.platform == "darwin" else ["-" + str(pgid)]
-    command = ["/bin/ps", *select_group, "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "uid="]
+    # procps3.3.15 consumes every argument after a numeric PGID as an ID.
+    # Keep all format options before the trailing group selector.
+    command = ["/bin/ps", "-o", "pid=", "-o", "pgid=", "-o", "stat=", "-o", "uid=", *select_group]
     environment = dict(os.environ)
     for name in ("PS_FORMAT", "PS_PERSONALITY", "CMD_ENV", "POSIXLY_CORRECT", "UNIX95", "I_WANT_A_BROKEN_PS"):
         environment.pop(name, None)
