@@ -119,8 +119,9 @@ Source implementation does not authorize any AWS or security change.
    back the exact configuration and source/image identity.
 7. Test the reviewed viewer association after approved activation before
    declaring cold root/index reload supported. Keep the public /auth/login entry
-   available as the safe fallback. Publish the matching frontend, perform one
-   explicit remembered sign-in, then
+   available as the safe fallback. Use the
+   [remembered website publication profile](remembered-website-publication.md) to
+   publish the matching frontend, then perform one explicit remembered sign-in and
    verify renewal beyond five and fifteen minutes, cold entry, form/draft
    preservation, idle/absolute boundaries, invitation denial and cross-tab logout.
 
