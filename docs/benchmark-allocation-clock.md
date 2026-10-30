@@ -72,11 +72,15 @@ bounded grace period and SIGKILL. A TERM-resistant descendant therefore still
 receives escalation when its leader exits. Only after the final group signal
 and bounded confirmation of no live members does the supervisor reap its child.
 
-Darwin can report EPERM for a group containing only zombies. This is accepted
+Darwin can report EPERM for a group containing only zombies. Only Darwin EPERM
+can use the quiescent-group fallback; EACCES and non-Darwin denials remain errors.
+The fallback is accepted
 only when bounded exact-group metadata proves every member is a zombie, or a
 zero-signal probe proves that the group no longer exists. Live members, foreign
 ownership, malformed/partial/oversized output, missing tools and denied metadata
-remain failures. Process metadata requests contain PID, PGID, state and UID;
+remain failures. Metadata reads stop at 64KiB plus one overflow byte, and the
+isolated metadata child is killed/reaped within its own query budget.
+Process metadata requests contain PID, PGID, state and UID;
 they contain neither command lines nor environments.
 
 The selectors intentionally differ: Apple ps uses `-g PGID`, whereas procps uses

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import stat
 import subprocess
@@ -158,6 +160,56 @@ def _owned_live_group(process):
         raise ProcessGroupCleanupError("Cannot prove live child ownership before a group signal") from error
 
 
+def _capture_group_metadata(command, *, timeout, env):
+    """Read at most 64 KiB plus one overflow byte; bound and reap the ps child."""
+    deadline = time.monotonic() + timeout
+    read_deadline = deadline - min(.05, timeout / 3)
+    process = None
+    selected = None
+    output = bytearray()
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=env, start_new_session=True)
+        selected = selectors.DefaultSelector()
+        selected.register(process.stdout, selectors.EVENT_READ, "output")
+        selected.register(process.stderr, selectors.EVENT_READ, "error")
+        while selected.get_map():
+            remaining = read_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            events = selected.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in events:
+                maximum = min(4096, GROUP_PROOF_BYTES + 1 - len(output)) if key.data == "output" else 1
+                block = os.read(key.fileobj.fileno(), maximum)
+                if not block:
+                    selected.unregister(key.fileobj)
+                    continue
+                if key.data == "error":
+                    raise ProcessGroupCleanupError("Process-group metadata reported an error")
+                output.extend(block)
+                if len(output) > GROUP_PROOF_BYTES:
+                    raise ProcessGroupCleanupError("Process-group metadata exceeded its hard read limit")
+        remaining = read_deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        code = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(command, code, bytes(output), b"")
+    finally:
+        if selected is not None:
+            selected.close()
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                stream.close()
+            if process.returncode is None:
+                process.kill()
+                try:
+                    process.wait(timeout=max(0., deadline - time.monotonic()))
+                except subprocess.TimeoutExpired as error:
+                    raise ProcessGroupCleanupError("Metadata child did not stop within its bounded query") from error
+
+
 def _group_quiescent(pgid, deadline):
     remaining = _cleanup_remaining(deadline)
     if remaining <= .1:
@@ -173,9 +225,9 @@ def _group_quiescent(pgid, deadline):
     if sys.platform == "linux":
         environment["PS_PERSONALITY"] = "linux"
     try:
-        result = subprocess.run(command, capture_output=True,
-                                timeout=min(GROUP_PROOF_SECONDS, remaining - .1),
-                                env=environment)
+        result = _capture_group_metadata(command,
+                                         timeout=min(GROUP_PROOF_SECONDS, remaining - .1),
+                                         env=environment)
     except (OSError, subprocess.SubprocessError) as error:
         raise ProcessGroupCleanupError("Bounded process-group metadata is unavailable") from error
     _cleanup_remaining(deadline)
@@ -225,7 +277,9 @@ def _signal_owned_group(process, signum, deadline):
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         return False
-    except PermissionError:
+    except PermissionError as error:
+        if sys.platform != "darwin" or error.errno != errno.EPERM:
+            raise
         # Darwin can return EPERM for an existing zombie-only group. A live or
         # unknown group must retain its failure; leader exit alone is no proof.
         if not _group_quiescent(process.pid, deadline):

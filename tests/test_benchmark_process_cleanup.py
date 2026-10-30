@@ -27,7 +27,7 @@ def cleanup(monkeypatch):
         assert pgid == process.pid
         events.append(signum)
         if signum == signal.SIGKILL and state.eperm:
-            raise PermissionError(1, "synthetic denied group")
+            raise PermissionError(state.permission_errno, "synthetic denied group")
         if signum == 0 and state.absent:
             raise ProcessLookupError()
     def probe(pid, flags):
@@ -46,7 +46,7 @@ def cleanup(monkeypatch):
             raise value
         return value
     state = SimpleNamespace(clock=clock, events=events, process=process, eperm=True,
-                            absent=False, ps_calls=[], ps_elapsed=.01,
+                            absent=False, permission_errno=1, ps_calls=[], ps_elapsed=.01,
                             outputs=[SimpleNamespace(returncode=0, stdout=b"4242 4242 Z 1000\n", stderr=b"")])
     monkeypatch.setattr(adapter.time, "monotonic", lambda: clock.now)
     monkeypatch.setattr(adapter.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds))
@@ -56,7 +56,8 @@ def cleanup(monkeypatch):
     monkeypatch.setattr(adapter.os, "geteuid", lambda: 1000)
     monkeypatch.setattr(adapter.os, "killpg", send)
     monkeypatch.setattr(adapter.signal, "getsignal", lambda signum: signal.SIG_DFL)
-    monkeypatch.setattr(adapter.subprocess, "run", ps)
+    monkeypatch.setattr(adapter, "sys", SimpleNamespace(platform="darwin"), raising=False)
+    monkeypatch.setattr(adapter, "_capture_group_metadata", ps, raising=False)
     return state
 
 
@@ -183,6 +184,7 @@ def test_cleanup_has_one_four_second_budget_including_metadata(cleanup):
 
 @pytest.mark.parametrize("platform,selector", [("linux", "-4242"), ("darwin", "-g")])
 def test_exact_platform_group_selector_never_requests_commands(cleanup, monkeypatch, platform, selector):
+    cleanup.eperm = False
     monkeypatch.setattr(adapter, "sys", SimpleNamespace(platform=platform), raising=False)
     adapter._stop_group(cleanup.process)
     command, kwargs = cleanup.ps_calls[0]
@@ -235,3 +237,48 @@ def test_term_resistant_descendant_dies_even_after_leader_exits(tmp_path, repeat
             process.kill()
             process.wait(timeout=2)
         os.close(alive_read)
+
+@pytest.mark.parametrize("platform,error_number", [
+    ("linux", 1), ("darwin", 13), ("darwin", None),
+])
+def test_only_darwin_eperm_can_use_quiescent_proof(cleanup, monkeypatch, platform, error_number):
+    monkeypatch.setattr(adapter, "sys", SimpleNamespace(platform=platform), raising=False)
+    cleanup.permission_errno = error_number
+    with pytest.raises(PermissionError):
+        adapter._stop_group(cleanup.process)
+    assert not cleanup.ps_calls
+
+
+@pytest.mark.parametrize("kind", ["overflow", "stderr", "timeout"])
+def test_metadata_reader_is_hard_bounded_and_reaps_its_child(tmp_path, monkeypatch, kind):
+    real_popen = subprocess.Popen
+    real_read = os.read
+    children = []
+    observed = {"stdout_bytes": 0}
+    descriptors = set()
+    def popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        children.append(process)
+        descriptors.add(process.stdout.fileno())
+        return process
+    def read(fd, size):
+        block = real_read(fd, size)
+        if fd in descriptors:
+            observed["stdout_bytes"] += len(block)
+        return block
+    monkeypatch.setattr(adapter.subprocess, "Popen", popen)
+    monkeypatch.setattr(adapter.os, "read", read)
+    code = {
+        "overflow": "import os,time;os.write(1,b'x'*100000);time.sleep(30)",
+        "stderr": "import os,time;os.write(2,b'!');time.sleep(30)",
+        "timeout": "import time;time.sleep(30)",
+    }[kind]
+    started = adapter.time.monotonic()
+    with pytest.raises((RuntimeError, subprocess.TimeoutExpired)):
+        adapter._capture_group_metadata([sys.executable, "-c", code], timeout=.25,
+                                        env=dict(os.environ))
+    assert adapter.time.monotonic() - started < .5
+    assert len(children) == 1 and children[0].returncode is not None
+    assert observed["stdout_bytes"] <= 65537
+    if kind == "overflow":
+        assert observed["stdout_bytes"] == 65537
