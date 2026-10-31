@@ -292,7 +292,7 @@ run "secure_public_bootstrap_has_api_only_nonforwarding_fallback" {
         item.target_origin_id == "regional-auth" &&
         item.allowed_methods == toset(["GET", "HEAD"]) &&
         (item.origin_request_policy_id == null || item.origin_request_policy_id == "") &&
-        length(item.trusted_key_groups) == 0 &&
+        length(coalesce(item.trusted_key_groups, toset([]))) == 0 &&
         one(item.function_association).function_arn == "arn:aws:cloudfront::000000000000:function/synthetic-public-entry-v1"
       ]) &&
       aws_cloudfront_distribution.web.ordered_cache_behavior[2].target_origin_id == "regional-auth" &&
