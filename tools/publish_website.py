@@ -22,7 +22,9 @@ BENCHMARK_ORDER = (*BENCHMARK_NEW_KEYS, "src/app.js", "index.html")
 REMEMBERED_BASE_KEYS = (*BENCHMARK_BASE_KEYS, *BENCHMARK_NEW_KEYS)
 REMEMBERED_NEW_KEYS = ("src/site-session.js",)
 REMEMBERED_ORDER = (*REMEMBERED_NEW_KEYS, "src/client.js", "src/style.css", "src/app.js")
+PRIVATE_ENTRY_KEYS = (*REMEMBERED_BASE_KEYS, *REMEMBERED_NEW_KEYS)
 PROFILES = {
+    "private-entry": (PRIVATE_ENTRY_KEYS, (), ("src/app.js",)),
     "posterior": (BASE_KEYS, (ORDER[0],), ORDER),
     "benchmark": (BENCHMARK_BASE_KEYS, BENCHMARK_NEW_KEYS, BENCHMARK_ORDER),
     "remembered-session": (REMEMBERED_BASE_KEYS, REMEMBERED_NEW_KEYS, REMEMBERED_ORDER),
@@ -127,6 +129,8 @@ def publish(dist, baseline_dist, bucket, expected_role_arn, aws=None, profile="p
         if key not in order and key != CONFIG:
             require(target[key] == baseline[key], "unexpected-build-delta")
     require(all(target[key] != baseline[key] for key in order if key not in new_keys), "expected-build-delta-missing")
+    if profile == "private-entry":
+        require(target[CONFIG] == baseline[CONFIG], "unexpected-build-delta")
     verify_identity(aws, expected_role_arn)
     with tempfile.TemporaryDirectory(prefix="mesouq-static-") as temporary:
         scratch = Path(temporary)

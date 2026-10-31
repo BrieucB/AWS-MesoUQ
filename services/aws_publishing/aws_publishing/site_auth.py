@@ -340,9 +340,19 @@ class SiteAuth:
                     try:
                         session = self.remembered.refresh(jar[REMEMBERED].value,activity=False)
                         return self.response(302,cookies=[self._remember_cookie(jar[REMEMBERED].value,session),
-                            *self.edge(session["expires_at"],remembered=True)],location=self.base+"/")
+                            *self.edge(session["expires_at"],remembered=True)],location=self.base+"/app")
                     except SessionExpired:
                         pass
+                elif REMEMBERED not in jar and SESSION in jar:
+                    # An unremembered session can recover its original short grant,
+                    # never obtain a longer session or bypass an existing family.
+                    try:
+                        session = self._legacy_session(jar)
+                    except (ValueError, KeyError, TypeError, InvalidToken, jwt.PyJWTError):
+                        pass
+                    else:
+                        return self.response(302,cookies=self.edge(session["expires_at"]),
+                                             location=self.base+"/app")
                 return self._login_page()
             if path == "/auth/login" and method == "POST":
                 self._origin(headers)
@@ -391,7 +401,7 @@ class SiteAuth:
                     return self.response(302,cookies=[
                         cookie(FLOW,"",0),cookie(INTENT,"",0),cookie(SESSION,"",0),
                         self._remember_cookie(sid,remembered_session),
-                        *self.edge(remembered_session["expires_at"],remembered=True)],location=self.base+"/")
+                        *self.edge(remembered_session["expires_at"],remembered=True)],location=self.base+"/app")
                 expires = min(now + TTL, int(access["exp"]))
                 if expires <= now:
                     raise ValueError("Expired token")
@@ -408,7 +418,7 @@ class SiteAuth:
                         cookie(SESSION, session, expires - now),
                         *self.edge(expires),
                     ],
-                    location=self.base + "/",
+                    location=self.base + "/app",
                 )
             if path == "/auth/session" and method == "GET":
                 if REMEMBERED in jar:
