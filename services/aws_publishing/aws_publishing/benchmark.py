@@ -48,6 +48,25 @@ def public_campaign(campaign):
     return result
 
 
+def _matches_gpu_allocation_policy(accounting, stage, kind, expected_gpus):
+    """Accept a zero allocation only for an attested, requested queued cancellation."""
+    gpu = accounting["allocated_gpus"]
+    if type(gpu) is not int or type(expected_gpus) is not int or expected_gpus != 1:
+        return False
+    if gpu == expected_gpus:
+        return "preallocation_cancellation" not in accounting
+    proof = accounting.get("preallocation_cancellation")
+    return (
+        gpu == 0 and kind == "cancelled" and stage["status"] == "cancelling"
+        and accounting["state"] == "CANCELLED"
+        and accounting["elapsed_seconds"] == 0 and accounting["cpu_seconds"] == 0
+        and isinstance(proof, dict) and set(proof) == {"start", "allocated_cpus", "allocated_tres"}
+        and proof["start"] is None
+        and type(proof["allocated_cpus"]) is int and proof["allocated_cpus"] == 0
+        and proof["allocated_tres"] == ""
+    )
+
+
 def stage_costs(campaign):
     def total(kinds):
         timings = [s.get("result", {}).get("timing", s.get("timing", {"wall_seconds": 0, "cpu_seconds": 0, "gpu_seconds": 0} if s["status"] == "blocked" or s["status"] == "cancelled" and not s.get("slurm_job_id") else None)) for s in campaign["stages"] if s["kind"] in kinds]
@@ -393,17 +412,17 @@ class BenchmarkRoutes:
                 self.settle_budget(campaign, stage, body, kind)
             if kind in ("succeeded", "failed", "cancelled") and not stage.get("method_group") and body.get("scheduler_accounting") is not None:
                 accounting = body["scheduler_accounting"]
-                keys(accounting, ("source", "site", "slurm_job_id", "state", "elapsed_seconds", "allocated_gpus", "cpu_seconds"))
+                keys(accounting, ("source", "site", "slurm_job_id", "state", "elapsed_seconds", "allocated_gpus", "cpu_seconds"), ("preallocation_cancellation",))
                 if accounting["source"] != "sacct" or accounting["site"] != "karolina" or accounting["slurm_job_id"] != stage.get("slurm_job_id") or accounting["state"] not in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"):
                     raise ValueError("Separate-cost stages require matching native terminal accounting")
                 if kind == "succeeded" and accounting["state"] != "COMPLETED":
                     raise ValueError("Successful stage requires COMPLETED Slurm accounting")
                 number(accounting["elapsed_seconds"], "allocated elapsed seconds", 0, 10000000)
                 number(accounting["cpu_seconds"], "allocated CPU seconds", 0, 1e12)
-                if type(accounting["allocated_gpus"]) is not int or accounting["allocated_gpus"] != 1:
+                if not _matches_gpu_allocation_policy(accounting, stage, kind, 1):
                     raise ValueError("Separate-cost stage must account for its allocated GPU")
                 reported = body.get("result", {}).get("timing") if kind == "succeeded" else body.get("timing")
-                if not isinstance(reported, dict) or reported.get("wall_seconds") != accounting["elapsed_seconds"] or reported.get("gpu_seconds") != accounting["elapsed_seconds"] or reported.get("cpu_seconds") != accounting["cpu_seconds"]:
+                if not isinstance(reported, dict) or reported.get("wall_seconds") != accounting["elapsed_seconds"] or reported.get("gpu_seconds") != accounting["elapsed_seconds"] * accounting["allocated_gpus"] or reported.get("cpu_seconds") != accounting["cpu_seconds"]:
                     raise ValueError("Separate stage timing must match native allocation accounting")
                 stage["scheduler_accounting"] = copy.deepcopy(accounting)
             if kind == "succeeded":
@@ -526,14 +545,14 @@ class BenchmarkRoutes:
             actual = 0
             stage["timing"] = {"wall_seconds": 0, "cpu_seconds": 0, "gpu_seconds": 0}
         else:
-            keys(accounting, ("source", "site", "slurm_job_id", "state", "elapsed_seconds", "allocated_gpus", "cpu_seconds"))
+            keys(accounting, ("source", "site", "slurm_job_id", "state", "elapsed_seconds", "allocated_gpus", "cpu_seconds"), ("preallocation_cancellation",))
             if accounting["source"] != "sacct" or accounting["site"] != "karolina" or accounting["slurm_job_id"] != stage.get("slurm_job_id") or accounting["state"] not in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"):
                 raise ValueError("Method reservation requires matching native terminal Slurm accounting")
             if kind == "succeeded" and accounting["state"] != "COMPLETED":
                 raise ValueError("Successful stage requires COMPLETED Slurm accounting")
             number(accounting["elapsed_seconds"], "allocated elapsed seconds", 0, 10000000)
             number(accounting["cpu_seconds"], "allocated CPU seconds", 0, 1e12)
-            if type(accounting["allocated_gpus"]) is not int or accounting["allocated_gpus"] != reservation["allocated_gpus"]:
+            if not _matches_gpu_allocation_policy(accounting, stage, kind, reservation["allocated_gpus"]):
                 raise ValueError("Slurm GPU count does not match the approved reservation")
             actual = accounting["elapsed_seconds"] * accounting["allocated_gpus"]
             if actual > reservation["gpu_seconds"]:
