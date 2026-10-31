@@ -146,3 +146,16 @@ variable "remembered_browser_sessions_enabled" {
   default     = false
   description = "Owner-approved activation after reviewed source, dedicated client, authorizer and TTL checks. Native connector policy stays unchanged."
 }
+
+
+# Reflect verified staged publication; never use broad apply as a release shortcut.
+variable "secure_private_alias_enabled" {
+  type        = bool
+  default     = false
+  description = "Reflect the verified stage-A private alias after guarded publication."
+}
+variable "secure_public_entry_enabled" {
+  type        = bool
+  default     = false
+  description = "Reflect verified stage-C redirects after application and native proof."
+}

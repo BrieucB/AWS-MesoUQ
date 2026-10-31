@@ -6,17 +6,21 @@ import {setTimeout as pause} from 'node:timers/promises';
 const config={apiBaseUrl:'https://api.example.test',cognitoDomain:'https://identity.example.test',clientId:'public-client',redirectUri:'https://portal.example.test/auth/callback',logoutUri:'https://portal.example.test/auth/login',uploadOrigins:[]};
 const response=(data,status=200)=>({ok:status>=200&&status<300,status,json:async()=>data});
 let sequence=0;
-async function launch({sessionStatus=200,logoutFailure=false,remembered=false,refreshStatus=200,delayRefresh=false}={}){
-  const listeners={},requests=[],redirects=[],timers=[],storageWrites=[];
+async function launch({sessionStatus=200,logoutFailure=false,remembered=false,refreshStatus=200,delayRefresh=false,pathname='/',search='',hash='',meStatus=200,delayMe=false}={}){
+  const listeners={},requests=[],redirects=[],timers=[],storageWrites=[],historyReplacements=[];
   const element={innerHTML:'',addEventListener:(name,handler)=>listeners[name]=handler};
   const originals={setTimeout:globalThis.setTimeout,setInterval:globalThis.setInterval};
-  let generation=0,finishRefresh;
+  let generation=0,finishRefresh,finishMe;
   const born=Math.floor(Date.now()/1000),absolute=born+30*86400,idle=born+7*86400;
   const session=()=>({access_token:generation?'renewed-memory-token':'memory-only-session-token',expires_at:Math.min(Math.floor(Date.now()/1000)+300,idle,absolute),
     ...(remembered?{renewable:true,absolute_expires_at:absolute,idle_expires_at:idle,generation}:{})});
   globalThis.document={querySelector:selector=>selector==='#app'?element:null,hidden:false};
-  globalThis.location={origin:'https://portal.example.test',search:'',pathname:'/',assign:url=>redirects.push(String(url))};
-  globalThis.history={replaceState:()=>{}};
+  globalThis.location={origin:'https://portal.example.test',search,pathname,hash,assign:url=>redirects.push(String(url))};
+  globalThis.history={replaceState:(_state,_title,target)=>{
+    historyReplacements.push(String(target));
+    const current=new URL(String(target),location.origin+location.pathname+location.search+location.hash);
+    Object.assign(location,{pathname:current.pathname,search:current.search,hash:current.hash});
+  }};
   globalThis.sessionStorage={removeItem:()=>{},setItem:(...args)=>storageWrites.push(args),getItem:()=>{throw Error('Protected bootstrap must not read OAuth/browser-token storage');}};
   globalThis.setTimeout=(callback,duration)=>{timers.push({callback,duration});return 123;};globalThis.setInterval=()=>124;
   globalThis.fetch=async(path,options={})=>{
@@ -30,7 +34,10 @@ async function launch({sessionStatus=200,logoutFailure=false,remembered=false,re
     if(path==='runtime-config.json')return response(config);
     if(path==='presets/indentation-v1.json')return response(preset);
     if(path==='/auth/logout'){if(logoutFailure)throw Error('Synthetic network failure');return response({logout_url:config.cognitoDomain+'/logout?'+new URLSearchParams({client_id:config.clientId,logout_uri:location.origin+'/auth/login'})});}
-    if(String(path).endsWith('/v1/me'))return response({subject:'researcher',email:'session@example.test',roles:[]});
+    if(String(path).endsWith('/v1/me')){
+      if(delayMe)await new Promise(resolve=>finishMe=resolve);
+      return response(meStatus===200?{subject:'researcher',email:'session@example.test',roles:[]}:{error:{message:'Synthetic authorization denial'}},meStatus);
+    }
     if(String(path).endsWith('/v1/projects'))return response({projects:[{id:'p',name:'Research project',role:'member'}]});
     if(String(path).endsWith('/jobs'))return response({jobs:[]});
     if(String(path).endsWith('/models'))return response({models:[]});
@@ -38,10 +45,10 @@ async function launch({sessionStatus=200,logoutFailure=false,remembered=false,re
   };
   await import(new URL('../src/app.js?bootstrap-test='+sequence++,import.meta.url));
   const wait=async predicate=>{for(let i=0;i<100&&!predicate();i++)await pause(2);assert.ok(predicate());};
-  return {element,requests,redirects,timers,storageWrites,wait,
+  return {element,requests,redirects,timers,storageWrites,historyReplacements,wait,
     click:action=>listeners.click({target:{closest:()=>({dataset:{action},disabled:false})}}),
     change:(id,value,files)=>listeners.change({target:{id,value,files}}),
-    finishRefresh:()=>finishRefresh?.(),
+    finishRefresh:()=>finishRefresh?.(),finishMe:()=>finishMe?.(),
     restore:()=>{globalThis.setTimeout=originals.setTimeout;globalThis.setInterval=originals.setInterval;}};
 }
 test('missing auth cookie redirects to public bootstrap before loading protected runtime/API data',async()=>{
@@ -120,3 +127,48 @@ test('logout wins over an in-flight remembered refresh and its late response can
     assert.equal(harness.redirects.length,1);assert.equal(harness.storageWrites.length,0);
   }finally{harness.restore();}
 });
+
+test('private entry normalizes only after passive bootstrap and successful API authorization, preserving URL suffix verbatim',async()=>{
+  const search='?scenario=high%2Fnoise&repeat=one&repeat=two&empty=',hash='#local%2Fview?raw=1';
+  const harness=await launch({pathname:'/app',search,hash,remembered:true,sessionStatus:401,delayMe:true});try{
+    await harness.wait(()=>harness.requests.some(r=>r.path.endsWith('/v1/me')));
+    assert.deepEqual(harness.historyReplacements,[]);
+    assert.equal(location.pathname,'/app');
+    harness.finishMe();
+    await harness.wait(()=>harness.element.innerHTML.includes('Configure your analysis'));
+    assert.deepEqual(harness.historyReplacements,['/'+search+hash]);
+    assert.equal(location.pathname,'/');assert.equal(location.search,search);assert.equal(location.hash,hash);
+    assert.deepEqual(JSON.parse(harness.requests.find(r=>r.path==='/auth/refresh').options.body),{activity:false});
+    assert.deepEqual(harness.redirects,[]);assert.equal(harness.storageWrites.length,0);
+    for(const asset of ['src/app.js','runtime-config.json','presets/indentation-v1.json']){
+      assert.equal(new URL(asset,'https://portal.example.test/app').pathname,'/'+asset);
+    }
+  }finally{harness.restore();}
+});
+test('private-entry normalization reads the current URL after existing OAuth query cleanup',async()=>{
+  const harness=await launch({pathname:'/app',search:'?code=one-use&state=secret-state&other=discarded',hash:'#discarded-by-existing-cleanup'});try{
+    await harness.wait(()=>harness.element.innerHTML.includes('Configure your analysis'));
+    assert.deepEqual(harness.historyReplacements,['/app','/']);
+    assert.equal(location.pathname,'/');assert.equal(location.search,'');assert.equal(location.hash,'');
+    assert.deepEqual(harness.redirects,[]);assert.equal(harness.storageWrites.length,0);
+  }finally{harness.restore();}
+});
+for(const pathname of ['/','/app/','/APP','/unrelated']){
+  test('authorized bootstrap leaves unrelated route unchanged: '+pathname,async()=>{
+    const search='?view=retained%2Fexact',hash='#retained%2Ffragment';
+    const harness=await launch({pathname,search,hash});try{
+      await harness.wait(()=>harness.element.innerHTML.includes('Configure your analysis'));
+      assert.deepEqual(harness.historyReplacements,[]);
+      assert.equal(location.pathname,pathname);assert.equal(location.search,search);assert.equal(location.hash,hash);
+    }finally{harness.restore();}
+  });
+}
+for(const options of [{sessionStatus:401},{sessionStatus:403},{meStatus:403}]){
+  test('private-entry URL is never normalized when authentication or API authorization fails: '+JSON.stringify(options),async()=>{
+    const harness=await launch({pathname:'/app',search:'?view=private',hash:'#local',...options});try{
+      await harness.wait(()=>harness.redirects.length>0||harness.element.innerHTML.includes('Active invitation required')||harness.element.innerHTML.includes('Synthetic authorization denial'));
+      assert.deepEqual(harness.historyReplacements,[]);
+      assert.equal(location.pathname,'/app');assert.equal(location.search,'?view=private');assert.equal(location.hash,'#local');
+    }finally{harness.restore();}
+  });
+}

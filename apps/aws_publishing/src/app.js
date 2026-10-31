@@ -170,6 +170,9 @@ async function boot(){
     const controller=siteSession;
     state.api=new Api(state.config,session.token,fetch,{expiresAt:session.expiresAt,renewable:!!session.renewable,onUnauthorized:expireSiteSession,ensureSession:options=>controller.ensure(options)});
     state.me=await state.api.request('/v1/me');
+    // Only a fully authorized private entry becomes the public bookmark.
+    // Read after OAuth-query cleanup; keep remaining search/hash byte-for-byte.
+    if(location.pathname==='/app')history.replaceState(null,'','/'+location.search+location.hash);
     state.projects=(await state.api.request('/v1/projects')).projects||[];
     state.project=state.projects[0]?.id||'';
     if(state.project)await loadProject();
