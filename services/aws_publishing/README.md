@@ -42,6 +42,17 @@ invited users through the operator-controlled flow and require TOTP MFA. There i
 no membership-management or signup HTTP endpoint. Disabling the invitation denies
 future API calls even before token expiry.
 
+Successful callbacks and remembered-browser recovery enter the private exact
+`/app` alias. The frontend replaces that URL with `/` in browser history only
+after session bootstrap and API identity authorization; it preserves any remaining
+query and fragment after the existing OAuth-query cleanup. The private alias must
+be published before these redirects, and public root/index bootstrap routing is a
+separate guarded release. A valid unremembered session can recover its existing
+signed grant through `/auth/login` without extending its expiry or exchanging a
+token. A present remembered-browser identifier always takes precedence, including
+invalid, revoked or temporarily disabled identifiers: it never falls back to an
+unremembered session.
+
 CloudFront signed cookies protect every website asset. Only `/auth/login`,
 `/auth/callback`, GET `/auth/session`, POST `/auth/login`, POST `/auth/refresh` and POST `/auth/logout` form the public OAuth
 bootstrap; unknown auth routes return JSON 404 and never assets. State/nonce/PKCE,

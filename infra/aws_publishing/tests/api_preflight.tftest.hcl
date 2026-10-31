@@ -237,3 +237,76 @@ run "remembered_activation_adds_only_the_reviewed_viewer_entry_association" {
     error_message = "Activation must add the pinned viewer hook while preserving native signed grants and private asset method rules."
   }
 }
+
+override_resource {
+  override_during = plan
+  target          = aws_cloudfront_function.private_entry
+  values          = { arn = "arn:aws:cloudfront::000000000000:function/synthetic-private-entry-v1" }
+}
+override_resource {
+  override_during = plan
+  target          = aws_cloudfront_function.public_entry
+  values          = { arn = "arn:aws:cloudfront::000000000000:function/synthetic-public-entry-v1" }
+}
+
+run "secure_entry_defaults_only_create_unassociated_identities" {
+  command = plan
+  assert {
+    condition = (
+      !var.secure_private_alias_enabled && !var.secure_public_entry_enabled &&
+      aws_cloudfront_distribution.web.default_root_object == "index.html" &&
+      length(aws_cloudfront_distribution.web.ordered_cache_behavior) == 1 &&
+      aws_cloudfront_distribution.web.ordered_cache_behavior[0].path_pattern == "/auth/*"
+    )
+    error_message = "New function identities must remain unassociated until staged publication."
+  }
+}
+run "secure_private_alias_preserves_native_s3_boundary" {
+  command = plan
+  variables {
+    secure_private_alias_enabled = true
+  }
+  assert {
+    condition = (
+      one(aws_cloudfront_distribution.web.default_cache_behavior[0].function_association).function_arn == "arn:aws:cloudfront::000000000000:function/synthetic-private-entry-v1" &&
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].trusted_key_groups) > 0 &&
+      aws_cloudfront_distribution.web.default_cache_behavior[0].target_origin_id == "private-web" &&
+      aws_cloudfront_distribution.web.default_cache_behavior[0].allowed_methods == toset(["GET", "HEAD"]) &&
+      aws_cloudfront_distribution.web.default_root_object == "index.html" &&
+      length(aws_cloudfront_distribution.web.ordered_cache_behavior) == 1
+    )
+    error_message = "Stage A may replace only the hook; native signed S3 protection stays enabled."
+  }
+}
+run "secure_public_bootstrap_has_api_only_nonforwarding_fallback" {
+  command = plan
+  variables {
+    secure_private_alias_enabled = true
+    secure_public_entry_enabled  = true
+  }
+  assert {
+    condition = (
+      aws_cloudfront_distribution.web.default_root_object == "" &&
+      [for item in aws_cloudfront_distribution.web.ordered_cache_behavior : item.path_pattern] == ["/", "/index.html", "/auth/*"] &&
+      alltrue([for item in slice(aws_cloudfront_distribution.web.ordered_cache_behavior, 0, 2) :
+        item.target_origin_id == "regional-auth" &&
+        item.allowed_methods == toset(["GET", "HEAD"]) &&
+        (item.origin_request_policy_id == null || item.origin_request_policy_id == "") &&
+        length(coalesce(item.trusted_key_groups, toset([]))) == 0 &&
+        one(item.function_association).function_arn == "arn:aws:cloudfront::000000000000:function/synthetic-public-entry-v1"
+      ]) &&
+      aws_cloudfront_distribution.web.ordered_cache_behavior[2].target_origin_id == "regional-auth" &&
+      aws_cloudfront_distribution.web.ordered_cache_behavior[2].allowed_methods == toset(["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"]) &&
+      aws_apigatewayv2_route.site_auth.route_key == "ANY /auth/{proxy+}" &&
+      length(aws_cloudfront_distribution.web.default_cache_behavior[0].trusted_key_groups) > 0
+    )
+    error_message = "Only exact public bootstrap paths may use the API fallback; auth and private S3 protections remain."
+  }
+}
+run "secure_public_requires_private_alias" {
+  command = plan
+  variables {
+    secure_public_entry_enabled = true
+  }
+  expect_failures = [aws_cloudfront_distribution.web]
+}

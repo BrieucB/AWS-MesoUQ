@@ -62,9 +62,25 @@ resource "aws_cloudfront_function" "remembered_entry" {
   publish = true
   code    = file("${path.module}/functions/remembered-entry.js")
 }
+# Separate immutable identities: create/publish first, then associate through
+# staged metadata-planner ETag guards. Never hot-edit an attached hook.
+resource "aws_cloudfront_function" "private_entry" {
+  name    = "${var.name}-private-entry-v1"
+  runtime = "cloudfront-js-1.0"
+  comment = "Private signed /app alias; native authorization stays authoritative"
+  publish = true
+  code    = file("${path.module}/functions/private-entry.js")
+}
+resource "aws_cloudfront_function" "public_entry" {
+  name    = "${var.name}-public-entry-v1"
+  runtime = "cloudfront-js-1.0"
+  comment = "Constant public bootstrap redirect with auth API-only fallback"
+  publish = true
+  code    = file("${path.module}/functions/public-entry.js")
+}
 resource "aws_cloudfront_distribution" "web" {
   enabled             = true
-  default_root_object = "index.html"
+  default_root_object = var.secure_public_entry_enabled ? "" : "index.html"
   price_class         = "PriceClass_100"
   origin {
     domain_name              = aws_s3_bucket.web.bucket_regional_domain_name
@@ -81,6 +97,23 @@ resource "aws_cloudfront_distribution" "web" {
       origin_ssl_protocols   = ["TLSv1.2"]
     }
   }
+  # Activate only after native signed-alias and application deployment proofs.
+  dynamic "ordered_cache_behavior" {
+    for_each = var.secure_public_entry_enabled ? ["/", "/index.html"] : []
+    content {
+      path_pattern               = ordered_cache_behavior.value
+      target_origin_id           = "regional-auth"
+      viewer_protocol_policy     = "redirect-to-https"
+      allowed_methods            = ["GET", "HEAD"]
+      cached_methods             = ["GET", "HEAD"]
+      cache_policy_id            = aws_cloudfront_cache_policy.web.id
+      response_headers_policy_id = aws_cloudfront_response_headers_policy.web.id
+      function_association {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.public_entry.arn
+      }
+    }
+  }
   ordered_cache_behavior {
     path_pattern               = "/auth/*"
     target_origin_id           = "regional-auth"
@@ -93,10 +126,10 @@ resource "aws_cloudfront_distribution" "web" {
   }
   default_cache_behavior {
     dynamic "function_association" {
-      for_each = var.remembered_browser_sessions_enabled ? [1] : []
+      for_each = var.remembered_browser_sessions_enabled || var.secure_private_alias_enabled ? [1] : []
       content {
         event_type   = "viewer-request"
-        function_arn = aws_cloudfront_function.remembered_entry.arn
+        function_arn = var.secure_private_alias_enabled ? aws_cloudfront_function.private_entry.arn : aws_cloudfront_function.remembered_entry.arn
       }
     }
     trusted_key_groups         = [aws_cloudfront_key_group.site.id]
@@ -115,6 +148,12 @@ resource "aws_cloudfront_distribution" "web" {
   }
   viewer_certificate { cloudfront_default_certificate = true }
   tags = local.tags
+  lifecycle {
+    precondition {
+      condition     = !var.secure_public_entry_enabled || var.secure_private_alias_enabled
+      error_message = "Public entry requires the private alias and staged native proof; use the guarded planner."
+    }
+  }
 }
 resource "aws_s3_bucket_policy" "web" {
   bucket = aws_s3_bucket.web.id

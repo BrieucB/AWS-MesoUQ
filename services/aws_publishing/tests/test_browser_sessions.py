@@ -205,6 +205,7 @@ def sign_in(portal,remember):
     callback["rawQueryString"]=urlencode({"code":"one-use","state":query["state"][0]})
     result=auth.handle(callback)
     assert result["statusCode"]==302
+    assert result["headers"]["location"]==auth.base+"/app"
     return result,query
 
 
@@ -234,7 +235,7 @@ def test_cold_entry_resumes_without_oauth_or_mfa_and_refresh_response_hides_sid(
     auth,provider,_,now=portal
     result,_=sign_in(portal,True);sid=values(result)[REMEMBERED];now[0]+=850
     resumed=auth.handle(event("/auth/login",cookies=[REMEMBERED+"="+sid]))
-    assert resumed["statusCode"]==302 and resumed["headers"]["location"]==auth.base+"/"
+    assert resumed["statusCode"]==302 and resumed["headers"]["location"]==auth.base+"/app"
     assert provider.refresh_calls==["refresh-private"]
     refreshed=auth.handle(event("/auth/refresh","POST",[REMEMBERED+"="+sid],json.dumps({"activity":False})))
     assert refreshed["statusCode"]==200
@@ -379,3 +380,29 @@ def test_transient_jwks_transport_failure_does_not_revoke_family(family,monkeypa
     with pytest.raises(RefreshUnavailable):service.refresh(sid,activity=False)
     monkeypatch.setattr(provider,"verify",verify)
     assert service.refresh(sid,activity=False)["renewable"] is True
+
+
+@pytest.mark.parametrize("sid_state", ["invalid", "revoked", "disabled"])
+def test_present_bad_remembered_sid_never_downgrades_to_valid_legacy(portal, monkeypatch, sid_state):
+    auth, provider, legacy, _ = portal
+    remembered, _ = sign_in(portal, True)
+    sid = values(remembered)[REMEMBERED]
+    unchecked, _ = sign_in(portal, False)
+    sealed = values(unchecked)[SESSION]
+    if sid_state == "invalid":
+        sid = "invalid-remembered-lookup"
+    elif sid_state == "revoked":
+        auth.remembered.revoke(sid)
+    else:
+        auth.remembered_enabled = False
+    def no_legacy_validation(*args, **kwargs):
+        pytest.fail("An existing remembered SID must never downgrade to legacy")
+    monkeypatch.setattr(legacy, "verify", no_legacy_validation)
+    result = auth.handle(event("/auth/login", cookies=[
+        REMEMBERED + "=" + sid, SESSION + "=" + sealed]))
+    assert result["statusCode"] == 200
+    assert "location" not in result["headers"]
+    assert not any(c.startswith("CloudFront-") or c.startswith(SESSION + "=")
+                   for c in result["cookies"])
+    assert not provider.refresh_calls
+    assert not legacy.refresh_calls
