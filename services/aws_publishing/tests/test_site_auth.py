@@ -610,6 +610,8 @@ def test_real_browser_secure_entry_callback_reload_and_private_denial(tmp_path, 
         "real_aws_cognito_hpc_or_business_requests": False,
         "owner_credentials_or_session_state_inspected": False,
         "mode": mode,
+        "checkpoints": [],
+        "completed": False,
     }
     authorized = [True]
     born = int(time.time())
@@ -864,14 +866,22 @@ def test_real_browser_secure_entry_callback_reload_and_private_denial(tmp_path, 
 
         sock.settimeout(5)
         receive()
-        command("WebDriver:NewSession", {"capabilities": {"alwaysMatch": {"acceptInsecureCerts": True}}})
+        # Raw Marionette takes the capability dictionary directly, unlike the
+        # W3C HTTP endpoint. Assert negotiation before using the loopback TLS cert.
+        session = command("WebDriver:NewSession", {"acceptInsecureCerts": True})
+        assert session["capabilities"]["acceptInsecureCerts"] is True
+        observed["accept_insecure_loopback_certificate_negotiated"] = True
+        observed["checkpoints"].append("session_capability_confirmed")
         command("WebDriver:SetWindowRect", {"width": 1440, "height": 1000, "x": 0, "y": 0})
         command("WebDriver:Navigate", {"url": auth.base + "/auth/login"})
         wait("!!document.querySelector('form[action=\"/auth/login\"]')")
+        observed["checkpoints"].append("login_page_loaded")
         if remember:
             click('input[name="remember"]')
+        observed["checkpoints"].append("login_form_submission_started")
         click('form[action="/auth/login"] button[type="submit"]')
         wait("document.body.innerText.includes('Configure your analysis')")
+        observed["checkpoints"].append("authorized_app_rendered")
         assert execute("return location.pathname") == "/"
         assert any(r["path"] == "/app" for r in requests)
         provider = remembered if remember else legacy
@@ -924,6 +934,7 @@ def test_real_browser_secure_entry_callback_reload_and_private_denial(tmp_path, 
                          "apps/aws_publishing/src/app.js"]
         }
         observed["request_method_path_trace"] = requests
+        observed["completed"] = True
         (output / "browser-evidence.json").write_text(json.dumps(observed, indent=2, sort_keys=True) + "\n")
         (output / "browser-evidence.md").write_text(
             "# Synthetic secure-entry browser proof\n\n"
@@ -932,7 +943,25 @@ def test_real_browser_secure_entry_callback_reload_and_private_denial(tmp_path, 
             "This complements, but does not establish, native CloudFront authorization.\n\n"
             "![Authorized app after callback, reload and URL preservation](authorized-entry.png)\n")
     finally:
+        # Preserve the achieved boundary even on a red source or setup failure;
+        # an unrelated TLS/driver error must never count as a product regression.
+        observed["fixture_failures"] = failures
+        observed["request_method_path_trace"] = requests
+        observed["source_sha256"] = {
+            name: hashlib.sha256((repo / name).read_bytes()).hexdigest()
+            for name in ["services/aws_publishing/aws_publishing/site_auth.py",
+                         "apps/aws_publishing/src/app.js"]
+        }
+        (output / "browser-attempt.private.json").write_text(
+            json.dumps(observed, indent=2, sort_keys=True) + "\n")
         if sock is not None:
+            try:
+                png = base64.b64decode(command("WebDriver:TakeScreenshot",
+                                      {"id": None, "highlights": [], "full": True}), validate=True)
+                assert png.startswith(b"\x89PNG\r\n\x1a\n")
+                (output / "boundary-state.png").write_bytes(png)
+            except Exception:
+                pass
             try:
                 command("Marionette:Quit", {"flags": ["eForceQuit"]})
             except Exception:
