@@ -467,19 +467,36 @@ os.close(fd)
         job = entry.get("job_id") or entry["claim"]["stage"].get("slurm_job_id")
         if not job:
             return None
-        output = self._slow(entry, self.transport.run, ["sacct", "--noheader", "--parsable2", "--user", self.slurm.user, "--jobs", job, "--format=JobIDRaw,JobName%128,User%128,State,ElapsedRaw,AllocTRES%512,CPUTimeRAW"])
+        output = self._slow(entry, self.transport.run, [
+            "sacct", "--noheader", "--parsable2", "--user", self.slurm.user, "--jobs", job,
+            "--format=JobIDRaw,JobName%128,User%128,State,ElapsedRaw,AllocTRES%512,CPUTimeRAW,Start,AllocCPUS",
+        ])
+        matches = []
         for line in output.splitlines():
             parts = line.strip().split("|")
             if len(parts) >= 7 and parts[0] == job and parts[1] == entry["marker"] and parts[2] == self.slurm.user:
-                state = parts[3].split()[0].rstrip("+")
-                if state not in NATIVE_TERMINAL:
-                    return None
-                tres = dict(item.split("=", 1) for item in parts[5].split(",") if "=" in item)
-                gpu = int(tres.get("gres/gpu", 0))
-                if gpu != 1:
-                    raise ValueError("Native allocated GPU count differs from the one-GPU stage policy")
-                return native_accounting(job_id=job, state=state, elapsed_seconds=int(parts[4]), allocated_gpus=gpu, cpu_seconds=int(parts[6]))
-        return None
+                matches.append(parts)
+        if len(matches) > 1:
+            raise ValueError("Ambiguous native allocation accounting for the owned stage")
+        if not matches:
+            return None
+        parts = matches[0]
+        state = parts[3].split()[0].rstrip("+")
+        if state not in NATIVE_TERMINAL:
+            return None
+        tres = dict(item.split("=", 1) for item in parts[5].split(",") if "=" in item)
+        gpu = int(tres.get("gres/gpu", 0))
+        elapsed, cpu = int(parts[4]), int(parts[6])
+        preallocation = None
+        if gpu != 1:
+            if (gpu != 0 or state != "CANCELLED" or len(parts) != 9 or parts[7] != "None"
+                    or parts[8] != "0" or parts[5] != "" or elapsed != 0 or cpu != 0):
+                raise ValueError("Native allocated GPU count differs from the one-GPU stage policy")
+            preallocation = {"start": None, "allocated_cpus": 0, "allocated_tres": ""}
+        return native_accounting(
+            job_id=job, state=state, elapsed_seconds=elapsed, allocated_gpus=gpu, cpu_seconds=cpu,
+            preallocation_cancellation=preallocation,
+        )
 
     def receipt(self, entry):
         campaign, stage = entry["claim"]["campaign"], entry["claim"]["stage"]

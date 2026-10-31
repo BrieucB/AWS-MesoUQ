@@ -512,3 +512,69 @@ def test_module_cli_help_exits_before_authentication(tmp_path):
     assert 'usage:' in result.stdout
     assert '--operator-config' in result.stdout and '--ssh-host' in result.stdout
     assert result.stderr == '' and set(tmp_path.iterdir()) == {hooks}
+
+
+def test_queued_native_cancellation_releases_reservation_without_resubmission(session, monkeypatch):
+    session.worker.sweep()
+    entry = entries(session)[0]
+    original_run = session.cluster.run
+
+    def queued_run(argv, **kwargs):
+        if argv[0] == "sacct" and "--jobs" in argv:
+            job = session.cluster.jobs[entry["job_id"]]
+            return f"{job['id']}|{job['marker']}|fixtureuser|{job['state']}|0||0|None|0\n"
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(session.cluster, "run", queued_run)
+    session.app.handle("POST", f"/v1/projects/p/benchmarks/{session.campaign['id']}/cancel", {"sub": "alice"}, {})
+    session.worker.sweep()
+    session.worker.sweep()
+    campaign = session.store.state["benchmark_campaigns"][session.campaign["id"]]
+    stage = next(s for s in campaign["stages"] if s["id"] == "cases")
+    assert campaign["status"] == stage["status"] == "cancelled"
+    assert stage["slurm_job_id"] == entry["job_id"] == "101" and stage["attempt"] == 1
+    assert stage["timing"] == {"wall_seconds": 0, "cpu_seconds": 0, "gpu_seconds": 0}
+    assert stage["scheduler_accounting"]["preallocation_cancellation"] == {
+        "start": None, "allocated_cpus": 0, "allocated_tres": "",
+    }
+    assert campaign["budget_ledger"]["hnpe"]["settled_gpu_seconds"] == 0
+    assert campaign["budget_ledger"]["hnpe"]["reservations"] == {}
+    assert entry["cloud_terminal"] and session.cluster.submit_count == 1
+    assert session.cluster.cancelled == ["101"]
+    assert session.journal.data["archive_device"] == session.original_identity
+
+
+@pytest.mark.parametrize("change", [
+    {3: "COMPLETED"}, {3: "FAILED"}, {4: "1"}, {4: "-1"}, {5: "cpu=0"},
+    {5: "gres/gpu=2"}, {6: "1"}, {7: "Unknown"}, {7: ""}, {7: "2026-10-31T18:00:00"},
+    {8: "1"}, {8: ""}, {"truncate": 7}, {"duplicate": True},
+])
+def test_zero_gpu_accounting_rejects_missing_ambiguous_or_allocated_evidence(session, monkeypatch, change):
+    session.worker.sweep()
+    entry = entries(session)[0]
+    fields = [entry["job_id"], entry["marker"], "fixtureuser", "CANCELLED by 123", "0", "", "0", "None", "0"]
+    for index, value in change.items():
+        if type(index) is int:
+            fields[index] = value
+    if "truncate" in change:
+        fields = fields[:change["truncate"]]
+    row = "|".join(fields) + "\n"
+    if change.get("duplicate"):
+        row += row
+    original_run = session.cluster.run
+    monkeypatch.setattr(session.cluster, "run", lambda argv, **kwargs:
+                        row if argv[0] == "sacct" and "--jobs" in argv else original_run(argv, **kwargs))
+    with pytest.raises(ValueError):
+        session.worker.accounting(entry)
+
+
+@pytest.mark.parametrize("response", ["", "999|wrong|other|CANCELLED|0||0|None|0\n"])
+def test_missing_or_unowned_accounting_stays_unknown(session, monkeypatch, response):
+    session.worker.sweep()
+    entry = entries(session)[0]
+    original_run = session.cluster.run
+    monkeypatch.setattr(session.cluster, "run", lambda argv, **kwargs:
+                        response if argv[0] == "sacct" and "--jobs" in argv else original_run(argv, **kwargs))
+    assert session.worker.accounting(entry) is None
+    ledger = session.store.state["benchmark_campaigns"][session.campaign["id"]]["budget_ledger"]["hnpe"]
+    assert ledger["reservations"] and ledger["settled_gpu_seconds"] == 0

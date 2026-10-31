@@ -109,6 +109,11 @@ class BenchmarkClient:
         return self.api.request("POST", "/v1/benchmark-connector/archive", body)
 
 
-def native_accounting(*, job_id, state, elapsed_seconds, allocated_gpus, cpu_seconds):
-    """Use actual sacct AllocTRES/ElapsedRaw/CPUTimeRAW, never requested resources."""
-    return {"source": "sacct", "site": "karolina", "slurm_job_id": str(job_id), "state": state, "elapsed_seconds": elapsed_seconds, "allocated_gpus": allocated_gpus, "cpu_seconds": cpu_seconds}
+def native_accounting(*, job_id, state, elapsed_seconds, allocated_gpus, cpu_seconds,
+                      preallocation_cancellation=None):
+    """Use actual sacct allocation evidence, never requested resources."""
+    accounting = {"source": "sacct", "site": "karolina", "slurm_job_id": str(job_id), "state": state,
+                  "elapsed_seconds": elapsed_seconds, "allocated_gpus": allocated_gpus, "cpu_seconds": cpu_seconds}
+    if preallocation_cancellation is not None:
+        accounting["preallocation_cancellation"] = copy.deepcopy(preallocation_cancellation)
+    return accounting

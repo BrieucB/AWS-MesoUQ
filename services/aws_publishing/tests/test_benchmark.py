@@ -379,3 +379,105 @@ def test_typed_gateway_dispatch_preserves_jwt_preflight(lab, monkeypatch):
     bad["controls"]["hnpe"]["width"] = 63
     payload["body"] = json.dumps(bad)
     assert handler.handler(payload, None)["statusCode"] == 400
+
+
+def _queued_cancellation_claim(lab, separate):
+    campaign = create(lab)
+    if separate:
+        finish_cases(lab)
+        body = {
+            "project_id": "p", "connector_id": "c1", "site": "karolina", "request_id": "queued-reference",
+            "campaign_id": campaign["id"],
+            "exclude_stage_ids": [s["id"] for s in campaign["stages"] if s["id"] != "reference"],
+        }
+        body["signature"] = base64.b64encode(lab[4].sign(claim_signing_bytes("alice", body))).decode()
+        claimed = request(lab, "POST", "/v1/benchmark-connector/claim", body)[1]
+        assert claimed["stage"]["id"] == "reference"
+    else:
+        claimed = claim(lab, "queued-cases")
+    start(lab, claimed)
+    return campaign, claimed
+
+
+def _preallocation_accounting():
+    return {
+        "source": "sacct", "site": "karolina", "slurm_job_id": "12", "state": "CANCELLED",
+        "elapsed_seconds": 0, "allocated_gpus": 0, "cpu_seconds": 0,
+        "preallocation_cancellation": {"start": None, "allocated_cpus": 0, "allocated_tres": ""},
+    }
+
+
+@pytest.mark.parametrize("separate", [False, True], ids=["method-reservation", "separate-reference"])
+def test_owned_queued_cancellation_settles_actual_zero_and_replays_once(lab, separate):
+    campaign, claimed = _queued_cancellation_claim(lab, separate)
+    prior = copy.deepcopy(lab[1].state["benchmark_campaigns"][campaign["id"]]["budget_ledger"])
+    request(lab, "POST", f"/v1/projects/p/benchmarks/{campaign['id']}/cancel", {})
+    timing = {"wall_seconds": 0, "cpu_seconds": 0, "gpu_seconds": 0}
+    first = send(lab, claimed, "queued-cancelled", "cancelled", timing=timing,
+                 scheduler_accounting=_preallocation_accounting())
+    after_first = copy.deepcopy(lab[1].state["benchmark_campaigns"][campaign["id"]])
+    second = send(lab, claimed, "queued-cancelled", "cancelled", timing=timing,
+                  scheduler_accounting=_preallocation_accounting())
+    assert first[0] == second[0] == 200
+    saved = lab[1].state["benchmark_campaigns"][campaign["id"]]
+    assert saved == after_first
+    stage = next(s for s in saved["stages"] if s["id"] == claimed["stage"]["id"])
+    assert saved["status"] == stage["status"] == "cancelled"
+    assert stage["slurm_job_id"] == "12" and stage["attempt"] == 1
+    assert stage["scheduler_accounting"] == _preallocation_accounting()
+    assert stage["timing"] == timing
+    assert saved["budget_ledger"]["hnpe"]["settled_gpu_seconds"] == prior["hnpe"]["settled_gpu_seconds"]
+    assert saved["budget_ledger"]["hnpe"]["reservations"] == {}
+
+
+@pytest.mark.parametrize("separate", [False, True], ids=["method-reservation", "separate-reference"])
+@pytest.mark.parametrize("mutation", [
+    "missing-proof", "unknown-start", "actual-start", "allocated-cpus", "bool-cpus", "allocated-tres",
+    "extra-proof-field", "nonzero-elapsed", "nonzero-cpu", "bool-gpu", "two-gpus", "wrong-job",
+    "wrong-native-state", "failed-event", "without-owner-cancellation", "one-gpu-with-zero-proof",
+])
+def test_zero_allocation_exception_cannot_weaken_native_accounting(lab, separate, mutation):
+    campaign, claimed = _queued_cancellation_claim(lab, separate)
+    if mutation != "without-owner-cancellation":
+        request(lab, "POST", f"/v1/projects/p/benchmarks/{campaign['id']}/cancel", {})
+    accounting = _preallocation_accounting()
+    proof = accounting["preallocation_cancellation"]
+    kind = "cancelled"
+    if mutation == "missing-proof":
+        del accounting["preallocation_cancellation"]
+    elif mutation == "unknown-start":
+        proof["start"] = "Unknown"
+    elif mutation == "actual-start":
+        proof["start"] = "2026-10-31T18:00:00"
+    elif mutation == "allocated-cpus":
+        proof["allocated_cpus"] = 1
+    elif mutation == "bool-cpus":
+        proof["allocated_cpus"] = False
+    elif mutation == "allocated-tres":
+        proof["allocated_tres"] = "cpu=0"
+    elif mutation == "extra-proof-field":
+        proof["extra"] = 0
+    elif mutation == "nonzero-elapsed":
+        accounting["elapsed_seconds"] = 1
+    elif mutation == "nonzero-cpu":
+        accounting["cpu_seconds"] = 1
+    elif mutation == "bool-gpu":
+        accounting["allocated_gpus"] = False
+    elif mutation == "two-gpus":
+        accounting["allocated_gpus"] = 2
+    elif mutation == "wrong-job":
+        accounting["slurm_job_id"] = "99"
+    elif mutation == "wrong-native-state":
+        accounting["state"] = "FAILED"
+    elif mutation == "failed-event":
+        kind = "failed"
+    elif mutation == "one-gpu-with-zero-proof":
+        accounting["allocated_gpus"] = 1
+    before = copy.deepcopy(lab[1].state["benchmark_campaigns"][campaign["id"]])
+    with pytest.raises(APIError):
+        send(lab, claimed, "bad-zero", kind,
+             timing={"wall_seconds": 0, "cpu_seconds": 0, "gpu_seconds": 0},
+             scheduler_accounting=accounting)
+    after = lab[1].state["benchmark_campaigns"][campaign["id"]]
+    assert after["budget_ledger"] == before["budget_ledger"]
+    assert after["stages"] == before["stages"]
