@@ -564,9 +564,15 @@ class AuthBroker:
                     pass
                 conn.close()
             deadline = time.monotonic() + timeout
+            join_failed = False
             for thread in [self._accept_thread, *handlers]:
-                if thread is not None and thread is not threading.current_thread():
-                    thread.join(max(0, deadline - time.monotonic()))
+                if (thread is not None and thread is not threading.current_thread()
+                        and thread.ident is not None):
+                    try:
+                        thread.join(max(0, deadline - time.monotonic()))
+                    except RuntimeError:
+                        # Complete resource cleanup even if a thread cannot join.
+                        join_failed = True
             if self._dirfd is not None:
                 try:
                     info = os.stat("a.sock", dir_fd=self._dirfd, follow_symlinks=False)
@@ -588,10 +594,10 @@ class AuthBroker:
                         pass
                 os.close(self._dirfd)
                 self._dirfd = None
-            if any(thread.is_alive() for thread in handlers):
-                raise BrokerError("controller_shutdown_incomplete")
             if self._vault is not None:
                 self._vault.clear()
+            if join_failed or any(thread.is_alive() for thread in handlers):
+                raise BrokerError("controller_shutdown_incomplete")
 
     def __enter__(self) -> "AuthBroker":
         return self.start()

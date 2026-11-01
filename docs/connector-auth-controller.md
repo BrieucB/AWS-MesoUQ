@@ -162,3 +162,5 @@ Darwin peer identity uses libc getpeereid for effective UID/GID and LOCAL_PEERPI
 References: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html and https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/un.h .
 
 Startup SIGINT/SIGTERM interrupts the callback wait, closes the callback and broker listeners, and exits before a worker can start. After startup, the same signals request the normal graceful shutdown. The underlying authentication module is unchanged.
+
+Broker cleanup tolerates an interrupted accept-thread start and releases the socket, directory descriptor and token vault even when thread joining fails. Hosted signal fixtures bind real loopback listeners without reverse-DNS timing and use short private Unix-socket paths.

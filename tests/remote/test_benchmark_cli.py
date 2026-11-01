@@ -338,6 +338,12 @@ ready, closed, launched, journal = map(pathlib.Path, PATHS)
 servers = []
 real_server = auth.HTTPServer
 class CallbackServer(real_server):
+    def server_bind(self):
+        # Real TCP binding; reverse-DNS is outside this signal/cleanup fixture.
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         servers.append(self)

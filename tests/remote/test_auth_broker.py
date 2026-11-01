@@ -395,31 +395,33 @@ def test_socket_modes_and_credential_free_status(rig, tmp_path, capsys):
 
 @pytest.mark.parametrize("kind", ["file", "socket", "symlink"])
 def test_existing_socket_path_is_refused_without_login_or_removal(tmp_path, kind):
-    directory = tmp_path / "private"
-    directory.mkdir(mode=0o700)
-    path = directory / "a.sock"
-    sock = None
-    if kind == "file":
-        path.write_text("preserve")
-    elif kind == "socket":
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(path))
-        path.chmod(0o600)
-    else:
-        other = tmp_path / "preserve"
-        other.write_text("preserve")
-        path.symlink_to(other)
-    calls = []
-    broker = AuthBroker(lambda: calls.append(True), private_socket_dir=directory)
-    try:
-        with pytest.raises(BrokerError):
-            broker.start()
-        assert calls == []
-        assert os.path.lexists(path)
-    finally:
-        broker.close()
-        if sock is not None:
-            sock.close()
+    import tempfile
+    # Keep the fixture within Darwin sun_path independently of pytest root size.
+    with tempfile.TemporaryDirectory(prefix=".amq-existing-", dir=Path("/tmp").resolve()) as short:
+        directory = Path(short)
+        path = directory / "a.sock"
+        sock = None
+        if kind == "file":
+            path.write_text("preserve")
+        elif kind == "socket":
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(str(path))
+            path.chmod(0o600)
+        else:
+            other = tmp_path / "preserve"
+            other.write_text("preserve")
+            path.symlink_to(other)
+        calls = []
+        broker = AuthBroker(lambda: calls.append(True), private_socket_dir=directory)
+        try:
+            with pytest.raises(BrokerError, match="socket_already_exists"):
+                broker.start()
+            assert calls == []
+            assert os.path.lexists(path)
+        finally:
+            broker.close()
+            if sock is not None:
+                sock.close()
 
 
 def test_unsafe_ancestor_and_symlink_directory_refused_before_login(tmp_path):
@@ -545,3 +547,67 @@ def test_owner_interrupt_at_startup_gate_kills_only_owned_worker(rig, monkeypatc
     assert supervisor._process is None
     assert broker.safe_status()["worker_active"] is False
     assert endpoint.login_calls == 1
+
+
+def test_cancel_before_accept_thread_start_releases_socket_descriptor_and_vault(monkeypatch):
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory(prefix=".amq-unstarted-", dir=Path("/tmp").resolve()) as short:
+        broker = AuthBroker(lambda: SimpleNamespace(token=lambda **_kw: "qa-synthetic-access-value"),
+                            private_socket_dir=Path(short))
+        start = threading.Thread.start
+        def interrupt(thread, *args, **kwargs):
+            if thread.name == "mesouq-auth-controller":
+                raise KeyboardInterrupt()
+            return start(thread, *args, **kwargs)
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(threading.Thread, "start", interrupt)
+                with pytest.raises(KeyboardInterrupt):
+                    broker.start()
+            assert broker._dirfd is None
+            assert not os.path.lexists(Path(short) / "a.sock")
+            assert broker._vault._session is None
+            assert broker._vault._cached is None
+        finally:
+            # On the deliberately broken old source, process-local fixture cleanup
+            # must not mask the original join-before-start regression.
+            if broker._listener is not None:
+                broker._listener.close()
+            if broker._dirfd is not None:
+                os.close(broker._dirfd)
+                broker._dirfd = None
+            if broker._vault is not None:
+                broker._vault.clear()
+
+def test_join_failure_still_releases_socket_descriptor_and_vault(monkeypatch):
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory(prefix=".amq-join-", dir=Path("/tmp").resolve()) as short:
+        broker = AuthBroker(lambda: SimpleNamespace(token=lambda **_kw: "qa-synthetic-access-value"),
+                            private_socket_dir=Path(short))
+        broker.start()
+        thread = broker._accept_thread
+        join = thread.join
+        try:
+            with monkeypatch.context() as patch:
+                def failed_join(*_args, **_kwargs):
+                    raise RuntimeError("synthetic-join-error-must-not-leak")
+                patch.setattr(thread, "join", failed_join)
+                with pytest.raises(BrokerError, match="controller_shutdown_incomplete") as caught:
+                    broker.close()
+            assert "synthetic-join-error" not in str(caught.value)
+            assert broker._dirfd is None
+            assert not os.path.lexists(Path(short) / "a.sock")
+            assert broker._vault._session is None and broker._vault._cached is None
+        finally:
+            broker._running = False
+            if broker._listener is not None:
+                broker._listener.close()
+            if broker._dirfd is not None:
+                os.close(broker._dirfd)
+                broker._dirfd = None
+            if broker._vault is not None:
+                broker._vault.clear()
+            join(timeout=2)
+        assert not thread.is_alive()
