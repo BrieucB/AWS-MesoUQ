@@ -153,6 +153,8 @@ export class AccuracyLab{
       if(!validRawResult(raw,limit)||!data.result||typeof data.result!=='object'||Array.isArray(data.result)||!Array.isArray(data.artifacts))throw Error('The full scientific result download metadata is unavailable or invalid.');
       const listed=data.artifacts.find(item=>item.id===raw.id);
       if(listed&&['id','name','media_type','sha256','size_bytes','kind'].some(key=>listed[key]!==raw[key]))throw Error('Conflicting full scientific result download metadata.');
+      if(!data.accounting||typeof data.accounting!=='object'||Array.isArray(data.accounting))throw Error('The final authoritative accounting is unavailable or invalid.');
+      this.detail={...this.detail,accounting:clone(data.accounting)};
       this.result=data.result;this.rawResultArtifact=clone(raw);this.artifacts=data.artifacts;this.figures=[];
       const seen=new Set();const candidates=this.artifacts.filter(item=>item.media_type==='image/png'&&!seen.has(item.id)&&seen.add(item.id));
       this.abort?.abort();this.abort=new AbortController();const signal=this.abort.signal;

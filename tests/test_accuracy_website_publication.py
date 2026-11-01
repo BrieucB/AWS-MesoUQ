@@ -97,3 +97,16 @@ class AccuracyPublicationTests(unittest.TestCase):
         self.assertIn("--profile accuracy",WORKFLOW)
         self.assertIn("cancel-in-progress: false",WORKFLOW)
         self.assertNotIn("s3:DeleteObject",WORKFLOW)
+
+    def test_session_can_distinguish_absent_new_modules_without_broader_object_writes(self):
+        # S3 HeadObject returns403 for absent keys unless ListBucket is permitted.
+        raw=WORKFLOW.split("PUBLICATION_SESSION_POLICY: >-",1)[1].split("\n        run: |",1)[0]
+        policy=json.loads("\n".join(line.strip() for line in raw.splitlines()))
+        allowed=[row for row in policy["Statement"] if row.get("Effect")=="Allow"]
+        listing=[row for row in allowed if row["Action"]=="s3:ListBucket"]
+        self.assertEqual(len(listing),1)
+        self.assertEqual(listing[0]["Resource"],"arn:aws:s3:::${{ env.WEBSITE_BUCKET }}")
+        self.assertNotIn("Condition",listing[0])
+        self.assertEqual({row["Action"] for row in allowed},{"s3:ListBucket","s3:GetObject","s3:PutObject"})
+        write=next(row for row in allowed if row["Action"]=="s3:PutObject")
+        self.assertEqual(set(write["Resource"]),{"arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/"+key for key in ORDER})

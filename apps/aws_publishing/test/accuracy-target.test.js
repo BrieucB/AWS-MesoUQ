@@ -55,7 +55,7 @@ test('foreign private-download hosts are rejected before any file request',async
 test('artifact descriptor cannot exceed the published source limit',async()=>{const s=downloadSetup();s.lab.capabilities.max_artifact_bytes=1;await s.lab.downloadArtifact(s.artifact.id);assert.equal(s.calls.length,0);assert.equal(s.downloads.length,0);});
 test('late artifact metadata after project reset cannot initiate a file fetch',async()=>{const gate=deferred(),s=downloadSetup({deferredMetadata:gate});const pending=s.lab.downloadArtifact(s.artifact.id);s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});gate.resolve({artifact:s.artifact,url:'https://files.example.test/data'});await pending;assert.equal(s.getFetchCalls(),0);assert.equal(s.downloads.length,0);});
 test('source scientific results and figure access use only the accuracy route',async()=>{const png=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1kAAAAASUVORK5CYII=','base64')),sha=createHash('sha256').update(png).digest('hex');const artifact={id:'b'.repeat(32),name:'metrics-posterior-marginals.png',size_bytes:png.length,sha256:sha,media_type:'image/png'};
-  const s=setup(async url=>url.endsWith('/results')?{result:{scientific_status:'terminal_unmet',qualification:{source_only:true}},raw_result_artifact:{id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'},artifacts:[artifact]}:{artifact,url:'https://files.example.test/figure'});
+  const s=setup(async url=>url.endsWith('/results')?{result:{scientific_status:'terminal_unmet',qualification:{source_only:true}},accounting:copy(campaign.accounting),raw_result_artifact:{id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'},artifacts:[artifact]}:{artifact,url:'https://files.example.test/figure'});
   s.lab.detail=copy(campaign);s.lab.fetcher=async()=>new Response(png,{status:200,headers:{'content-type':'image/png','content-length':String(png.length)}});
   await s.lab.loadResults();assert.equal(s.lab.result.scientific_status,'terminal_unmet');assert.equal(s.lab.figures[0].status,'ready');assert.match(s.lab.figures[0].src,/^data:image\/png;base64,/);assert.ok(s.calls.every(([url])=>url.includes('/benchmark-accuracy/')));
 });
@@ -121,7 +121,7 @@ after(async()=>{if(process.env.ACCURACY_UI_REQUEST_CAPTURE)await writeFile(proce
 function sourceResultSetup({rawInList=false}={}){
   const s=downloadSetup(),original=s.api.request;
   const summary={schema:'source-display-summary.v1',scientific_status:'terminal_unmet',methods:{hnpe:{verdict:{status:'unmet',observed_attainment:false}}}};
-  const response={result:summary,raw_result_artifact:copy(s.artifact),artifacts:rawInList?[copy(s.artifact)]:[]};
+  const response={result:summary,accounting:copy(campaign.accounting),raw_result_artifact:copy(s.artifact),artifacts:rawInList?[copy(s.artifact)]:[]};
   s.api.request=async(...args)=>{if(args[0].endsWith('/results')){s.calls.push(args);return copy(response);}return original(...args);};
   return {...s,summary,response};
 }
@@ -151,7 +151,7 @@ test('conflicting curated and full result descriptors are rejected',async()=>{
 test('a late source-summary response cannot restore a previous project full download',async()=>{
   const gate=deferred(),s=setup(()=>gate.promise);s.lab.detail=copy(campaign);
   const pending=s.lab.loadResults();s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});
-  gate.resolve({result:{schema:'summary'},raw_result_artifact:sourceResultSetup().artifact,artifacts:[]});await pending;
+  gate.resolve({result:{schema:'summary'},accounting:copy(campaign.accounting),raw_result_artifact:sourceResultSetup().artifact,artifacts:[]});await pending;
   assert.equal(s.lab.result,null);assert.equal(s.lab.rawResultArtifact,null);assert.deepEqual(s.downloads,[]);
 });
 test('full result action calls the checked downloader and respects busy state',async()=>{
@@ -197,4 +197,28 @@ test('opening an incomplete campaign clears the previous summary and full-result
   const s=partialArtifactSetup();s.lab.result={schema:'previous-summary'};s.lab.rawResultArtifact=copy(s.artifact);
   await s.lab.open(cid);assert.equal(s.lab.result,null);assert.equal(s.lab.rawResultArtifact,null);
   assert.deepEqual(s.lab.artifacts,[s.artifact]);assert.deepEqual(s.lab.figures,[]);
+});
+
+test('final authoritative accounting replaces the detail snapshot when results load',async()=>{
+  const final=copy(campaign.accounting);final.methods.hnpe={allocated_gpu_seconds:321,cpu_seconds:5136,reserved_gpu_seconds:0,unknown_allocations:0,budget_exceeded:true};
+  const raw={id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'};
+  const s=setup(async()=>({result:{scientific_status:'terminal_unmet'},raw_result_artifact:raw,artifacts:[],accounting:final}));
+  s.lab.detail=copy(campaign);await s.lab.loadResults();
+  assert.deepEqual(s.lab.detail.accounting,final);assert.ok(s.lab.detailView().includes(accuracyAccounting(final)));
+  assert.equal(s.lab.detail.budget_exceeded,undefined);assert.equal(s.lab.result.scientific_status,'terminal_unmet');
+});
+test('invalid final accounting cannot expose a completed result with stale costs',async()=>{
+  for(const accounting of [undefined,null,[],7]){
+    const raw={id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'};
+    const s=setup(async()=>({result:{scientific_status:'terminal_unmet'},raw_result_artifact:raw,artifacts:[],accounting}));
+    s.lab.detail=copy(campaign);await s.lab.loadResults();
+    assert.match(s.lab.error,/final authoritative accounting/i);assert.equal(s.lab.result,null);assert.equal(s.lab.rawResultArtifact,null);
+    assert.deepEqual(s.lab.detail.accounting,campaign.accounting);
+  }
+});
+test('late final accounting cannot change another campaign context',async()=>{
+  const gate=deferred(),s=setup(()=>gate.promise),raw={id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'};
+  s.lab.detail=copy(campaign);const pending=s.lab.loadResults();s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});
+  gate.resolve({result:{scientific_status:'terminal_unmet'},raw_result_artifact:raw,artifacts:[],accounting:campaign.accounting});await pending;
+  assert.equal(s.lab.detail,null);assert.equal(s.lab.result,null);
 });

@@ -126,6 +126,11 @@ jobs:
               "Statement": [
                 {
                   "Effect": "Allow",
+                  "Action": "s3:ListBucket",
+                  "Resource": "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}"
+                },
+                {
+                  "Effect": "Allow",
                   "Action": "s3:GetObject",
                   "Resource": [
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/index.html",
