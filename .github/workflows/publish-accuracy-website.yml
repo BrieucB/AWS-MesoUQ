@@ -1,0 +1,179 @@
+name: Publish Benchmark Lab accuracy website
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_commit:
+        description: Exact source commit matching the current website baseline
+        required: true
+        default: 'dace4a501cb539d61ecad42e592f36b8666f2cc1'
+        type: string
+      expected_source_commit:
+        description: Exact reviewed main commit to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-website-publication
+  cancel-in-progress: false
+
+jobs:
+  website:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: aws-publishing
+    steps:
+      - name: Validate dispatch and mask private destination
+        shell: bash
+        env:
+          PUBLICATION_ROLE_INPUT: ${{ secrets.AWS_WEBSITE_PUBLICATION_ROLE_ARN }}
+          WEBSITE_BUCKET_INPUT: ${{ secrets.AWS_WEBSITE_BUCKET }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          try:
+              if os.environ['GITHUB_REF'] != 'refs/heads/main' or os.environ['GITHUB_EVENT_NAME'] != 'workflow_dispatch':
+                  raise ValueError()
+              with open(os.environ['GITHUB_EVENT_PATH']) as event_file:
+                  inputs = json.load(event_file)['inputs']
+              role = os.environ['PUBLICATION_ROLE_INPUT']
+              bucket = os.environ['WEBSITE_BUCKET_INPUT']
+              baseline = inputs['baseline_commit']
+              source = inputs['expected_source_commit']
+              if any(not isinstance(value, str) for value in (role, bucket, baseline, source)):
+                  raise ValueError()
+              match = re.fullmatch(r'arn:aws:iam::([0-9]{12}):role/(?:[A-Za-z0-9_+=,.@-]+/)*[A-Za-z0-9_+=,.@-]+', role)
+              if match is None:
+                  raise ValueError()
+              if (not re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', bucket)
+                      or '..' in bucket or '.-' in bucket or '-.' in bucket
+                      or re.fullmatch(r'[0-9]+(?:\.[0-9]+){3}', bucket)):
+                  raise ValueError()
+              if (not re.fullmatch(r'[a-f0-9]{40}', baseline)
+                      or not re.fullmatch(r'[a-f0-9]{40}', source)
+                      or source != os.environ['GITHUB_SHA']
+                      or baseline != 'dace4a501cb539d61ecad42e592f36b8666f2cc1'):
+                  raise ValueError()
+              for value in (role, match[1], bucket):
+                  print('::add-mask::' + value, flush=True)
+              with open(os.environ['GITHUB_ENV'], 'a') as environment:
+                  for name, value in (('PUBLICATION_ROLE_ARN', role), ('WEBSITE_BUCKET', bucket), ('BASELINE_COMMIT', baseline)):
+                      environment.write(name + '=' + value + '\n')
+          except Exception:
+              sys.exit('Website publication inputs are missing or invalid; inspect them privately.')
+          PY
+      - name: Checkout the exact main source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Test bounded publication offline
+        shell: bash
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*website*.py' -v
+      - name: Validate ancestry and build only public frontend sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$BASELINE_COMMIT" "$GITHUB_SHA"
+          mkdir -p "$RUNNER_TEMP/website-current" "$RUNNER_TEMP/website-baseline"
+          git archive "$GITHUB_SHA" apps/aws_publishing src/aws_mesouq/presets/indentation-v1.json | tar -x -C "$RUNNER_TEMP/website-current"
+          git archive "$BASELINE_COMMIT" apps/aws_publishing src/aws_mesouq/presets/indentation-v1.json | tar -x -C "$RUNNER_TEMP/website-baseline"
+          cd "$RUNNER_TEMP/website-current/apps/aws_publishing"
+          npm test
+          npm run build
+          cd "$RUNNER_TEMP/website-baseline/apps/aws_publishing"
+          npm run build
+          cd "$GITHUB_WORKSPACE"
+          AWS_MESOUQ_WEBSITE_CURRENT_DIST="$RUNNER_TEMP/website-current/apps/aws_publishing/dist" \
+          AWS_MESOUQ_WEBSITE_BASELINE_DIST="$RUNNER_TEMP/website-baseline/apps/aws_publishing/dist" \
+            python3 tests/test_private_entry_website_publication.py PrivateEntryBuildTests -v
+      - name: Checkout the pinned official AWS credential client
+        id: aws_action
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: aws-actions/configure-aws-credentials
+          ref: e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+          path: .publication-tools/aws-credentials
+          persist-credentials: false
+      - name: Set up Node 24 for the pinned official credential client
+        id: aws_node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Obtain ephemeral website-only publication credentials privately
+        shell: bash
+        env:
+          PUBLICATION_REGION: ${{ secrets.AWS_REGION }}
+          PUBLICATION_SESSION_POLICY: >-
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": [
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/index.html",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/app.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/client.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/defaults.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/plots.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/style.css",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/curve-editor.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/presets/indentation-v1.json",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/runtime-config.json",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/posterior.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-figures.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-accuracy.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.css",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/site-session.js"
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": [
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-accuracy.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.css",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/app.js"
+                  ]
+                }
+              ]
+            }
+        run: |
+          python3 tools/private_aws_action.py --action-directory .publication-tools/aws-credentials --phase configure
+      - name: Publish the conditional static delta and verify all live assets
+        shell: bash
+        env:
+          AWS_EC2_METADATA_DISABLED: 'true'
+          AWS_CLI_AUTO_PROMPT: 'off'
+          AWS_PAGER: ''
+        run: |
+          python3 tools/publish_website.py --profile accuracy \
+            --dist "$RUNNER_TEMP/website-current/apps/aws_publishing/dist" \
+            --baseline-dist "$RUNNER_TEMP/website-baseline/apps/aws_publishing/dist" \
+            --bucket "$WEBSITE_BUCKET" \
+            --expected-role-arn "$PUBLICATION_ROLE_ARN"
+      - name: Clear ephemeral AWS credentials
+        if: always() && steps.aws_action.outcome == 'success' && steps.aws_node.outcome == 'success'
+        shell: bash
+        run: |
+          python3 tools/private_aws_action.py --action-directory .publication-tools/aws-credentials --phase cleanup
