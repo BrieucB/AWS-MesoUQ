@@ -251,12 +251,16 @@ def _emit(stream, value):
     stream.flush()
 
 
-def run_controller_loop(controller, *, input_fd, output, stop):
+def run_controller_loop(controller, *, input_fd, output, stop, startup_complete=None):
     """Bounded owner stdin. EOF detaches control; it does not drop auth or kill jobs."""
     buffer = bytearray()
     detached = False
     discard = False
+    if stop.is_set():
+        return 0
     _emit(output, controller.start())
+    if startup_complete is not None:
+        startup_complete.set()
     while not stop.is_set():
         if detached:
             stop.wait(0.2)
@@ -312,12 +316,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     _validate_runtime(parser, args)
     stop = threading.Event()
+    startup_complete = threading.Event()
+    shutdown_signal = None
     previous = {}
-    for selected in (signal.SIGTERM, signal.SIGINT):
-        previous[selected] = signal.signal(selected, lambda *_unused: stop.set())
     controller = None
     transport_guard = None
+    def request_stop(signum, _frame):
+        nonlocal shutdown_signal
+        shutdown_signal = signum
+        stop.set()
+        if mode == "controller" and not startup_complete.is_set():
+            # Unwind the real callback-server context and broker listeners.
+            # A cancelled authentication must never start a worker later.
+            raise KeyboardInterrupt
     try:
+        for selected in (signal.SIGTERM, signal.SIGINT):
+            previous[selected] = signal.signal(selected, request_stop)
         if mode == "managed-worker":
             return run_managed_worker(args, stop=stop)
         arguments = _runtime_arguments(args)
@@ -337,8 +351,10 @@ def main(argv=None):
         controller = Controller(WorkerSupervisor(broker, specification),
                                 specification_loader=load)
         return run_controller_loop(controller, input_fd=sys.stdin.fileno(),
-                                   output=sys.stdout, stop=stop)
-    except (KeyboardInterrupt, SystemExit):
+                                   output=sys.stdout, stop=stop, startup_complete=startup_complete)
+    except KeyboardInterrupt:
+        return 128 + (shutdown_signal or signal.SIGINT)
+    except SystemExit:
         raise
     except Exception:
         _emit(sys.stdout, {"controller_blocked": True, "error_code": "controller_start_failed"})

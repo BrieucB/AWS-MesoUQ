@@ -160,3 +160,5 @@ any installed private connector runtime.
 Darwin peer identity uses libc getpeereid for effective UID/GID and LOCAL_PEERPID for PID; no Python socket method or UID-only fallback is used. Package leaf opens are nonblocking, so a FIFO cannot hang owner upgrade validation or the child startup gate.
 
 References: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/getpeereid.3.html and https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/un.h .
+
+Startup SIGINT/SIGTERM interrupts the callback wait, closes the callback and broker listeners, and exits before a worker can start. After startup, the same signals request the normal graceful shutdown. The underlying authentication module is unchanged.

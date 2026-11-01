@@ -316,3 +316,84 @@ def test_invalid_owner_upgrade_preserves_live_worker_and_auth(cli_rig):
     assert status["worker_state"] == "running"
     assert status["controller_error"] == "worker_restart_failed"
     assert rig.login == ["login"]
+
+
+@pytest.mark.parametrize("shutdown_signal", [signal.SIGINT, signal.SIGTERM])
+def test_startup_signals_close_real_callback_listener_and_never_launch_worker(tmp_path, shutdown_signal):
+    import socket
+    ready = tmp_path / "startup-ready.json"
+    closed = tmp_path / "startup-closed.json"
+    launched = tmp_path / "worker-launched"
+    journal = tmp_path / "synthetic-journal"
+    journal.mkdir(mode=0o700)
+    (journal / "journal.json").write_text('{"synthetic":true}')
+    source_root = str(Path(cli.__file__).resolve().parents[1])
+    code = """
+import json, pathlib, sys
+from types import SimpleNamespace
+sys.path.insert(0, SOURCE_ROOT)
+from aws_mesouq import benchmark_cli as cli
+from aws_mesouq.connector import auth
+ready, closed, launched, journal = map(pathlib.Path, PATHS)
+servers = []
+real_server = auth.HTTPServer
+class CallbackServer(real_server):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        servers.append(self)
+auth.HTTPServer = CallbackServer
+def browser_open(_url):
+    ready.write_text(json.dumps({"port":servers[-1].server_address[1]}))
+    return True
+auth.webbrowser.open = browser_open
+def forbidden_token_request(*_args, **_kwargs):
+    raise AssertionError("Unexpected synthetic token exchange")
+auth.token_request = forbidden_token_request
+specification = SimpleNamespace(validate=lambda:None)
+cli.approved_worker = lambda *_args, **_kwargs: specification
+class Supervisor:
+    def __init__(self, broker, spec):
+        self.broker, self._spec = broker, spec
+    def start_worker(self):
+        launched.write_text("unexpected")
+    def safe_status(self):
+        return {**self.broker.safe_status(),"worker_pid":None,"worker_exit_code":None}
+    def close(self):
+        socket_path = str(self.broker._socket_path) if self.broker._socket_path else None
+        self.broker.close()
+        closed.write_text(json.dumps({"socket_path":socket_path}))
+cli.WorkerSupervisor = Supervisor
+raise SystemExit(cli.main([
+    "controller","--api-url","https://api.example.invalid","--project","p",
+    "--operator-config",str(journal/"not-read-operator.json"),
+    "--journal",str(journal),"--local-cluster","--oauth-domain","https://issuer.invalid",
+    "--client-id","synthetic","--callback-port","0",
+    "--worker-package",str(journal),"--worker-manifest",str(journal/"not-read-manifest.json"),
+    "--worker-binding","0"*64]))
+""".replace("SOURCE_ROOT", repr(source_root)).replace(
+        "PATHS", repr([str(ready), str(closed), str(launched), str(journal)]))
+    process = subprocess.Popen([sys.executable, "-I", "-B", "-c", code],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    try:
+        wait_for(lambda: ready.exists() or process.poll() is not None)
+        assert ready.exists(), process.communicate(timeout=1)
+        port = json.loads(ready.read_text())["port"]
+        process.send_signal(shutdown_signal)
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            pytest.fail("Startup authentication ignored shutdown while awaiting its callback")
+        assert process.returncode == 128 + shutdown_signal, (stdout, stderr)
+        assert closed.is_file()
+        socket_path = json.loads(closed.read_text())["socket_path"]
+        assert socket_path and not Path(socket_path).exists()
+        assert not Path(socket_path).parent.exists()
+        assert not launched.exists()
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            assert probe.connect_ex(("127.0.0.1", port)) != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=3)
