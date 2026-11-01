@@ -545,12 +545,26 @@ def dependency_spec_fixture(tmp_path, environment):
 
 
 def dependency_v2_fixture(tmp_path, entry, environment):
+    # The pytest toolcache may be user-owned/writable. Probe the real protected
+    # system runtime instead; Karolina's default /usr/bin/python3 is only 3.6.
+    interpreter = ("/usr/bin/python3.11" if Path("/usr/bin/python3.11").is_file()
+                   else "/usr/bin/python3")
+    system_probe = subprocess.run([interpreter, "-I", "-S", "-B", "-c",
+        "import json,os,sys;"
+        "root=os.path.dirname(os.path.realpath(os.__file__));"
+        "print(json.dumps({'version':list(sys.version_info[:2]),"
+        "'stdlib_paths':[root,os.path.join(root,'lib-dynload')]}))"],
+        check=True, capture_output=True, timeout=30)
+    system = json.loads(system_probe.stdout)
+    assert system["version"] >= [3, 11], "Native fixture requires system Python >= 3.11"
     spec = dependency_spec_fixture(tmp_path, environment)
+    spec["python"]["requested_executable"] = interpreter
+    spec["stdlib_paths"] = system["stdlib_paths"]
     command = ("import json,sys;"
         "p=sys.argv[1];d={'__name__':'__metadata_fixture__','__file__':p};"
         "exec(compile(open(p,'rb').read(),p,'exec',dont_inherit=True),d);"
         "print(json.dumps(d['isolated_dependency_snapshot'](json.load(sys.stdin))))")
-    result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", command, str(entry)],
+    result = subprocess.run([interpreter, "-I", "-S", "-B", "-c", command, str(entry)],
         input=native.canonical(spec), check=False, capture_output=True, timeout=30)
     if result.returncode:
         def path_metadata(path):
@@ -563,7 +577,7 @@ def dependency_v2_fixture(tmp_path, entry, environment):
                 return {"path": str(path), "error": type(error).__name__}
         pytest.fail("Isolated dependency fixture failed: " + json.dumps({
             "returncode": result.returncode,
-            "interpreter": path_metadata(sys.executable),
+            "interpreter": path_metadata(interpreter),
             "stdlib": [path_metadata(path) for path in spec["stdlib_paths"]],
             "stdout_tail": result.stdout[-2048:].decode("utf-8", errors="replace"),
             "stderr_tail": result.stderr[-4096:].decode("utf-8", errors="replace")},
@@ -582,7 +596,7 @@ def executable_profile_fixture(tmp_path):
     environment = private(tmp_path / "environment.sh", b":\n")
     dependencies = dependency_v2_fixture(tmp_path, entry, environment)
     dep_path = private(tmp_path / "dependency-manifest.json", native.canonical(dependencies))
-    operator.update(python_bin=sys.executable,
+    operator.update(python_bin=dependencies["spec"]["python"]["requested_executable"],
         python_sha256=dependencies["observation"]["python"]["sha256"],
         dependency_overlays=[row["path"] for row in dependencies["spec"]["overlays"]],
         environment_script=str(environment), environment_sha256=digest(environment.read_bytes()),
@@ -1248,13 +1262,25 @@ def test_dependency_v2_honest_site_free_prefix_and_raw_metadata(tmp_path):
     python = manifest["observation"]["python"]
     assert python["site_disabled"] is True and python["isolated"] is True
     assert python["prefix"] == python["base_prefix"]
-    assert python["requested_executable"] == sys.executable
+    assert python["requested_executable"] == operator["python_bin"]
+    assert operator["python_bin"] in ("/usr/bin/python3.11", "/usr/bin/python3")
+    assert [int(part) for part in python["version"].split(".")[:2]] >= [3, 11]
     row = manifest["observation"]["distributions"][0]
     assert row["name"] == "benchmark-demo"
     assert row["metadata_sha256"] == digest(b"Name: benchmark-demo\r\nVersion: 1.0\r\n")
     assert row["record_sha256"] == digest(b"demo.py,,4\r\n")
     assert row["site_index"] == 0
     native._verify_profile(context, operator, allocated=True)
+
+
+@requires_linux_native
+def test_standard_library_guard_rejects_writable_hosted_style_directory(tmp_path):
+    hosted = private_fixture_directory(tmp_path / "writable-hosted-stdlib")
+    hosted.chmod(0o777)
+    assert hosted.stat().st_mode & 0o7777 == 0o777
+    with pytest.raises(native.NativeContractError,
+                       match="permissions changed|directory authority changed"):
+        native._dependency_directory(hosted, private=False)
 
 
 @requires_linux_native
