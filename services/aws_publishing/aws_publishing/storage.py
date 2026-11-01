@@ -6,16 +6,7 @@ import hashlib
 import json
 import threading
 
-BUCKETS = (
-    "identities",
-    "projects",
-    "jobs",
-    "artifacts",
-    "models",
-    "requests",
-    "events",
-    "benchmark_campaigns",
-)
+BUCKETS = ('identities', 'projects', 'jobs', 'artifacts', 'models', 'requests', 'events', 'benchmark_campaigns', 'accuracy_campaigns', 'accuracy_tasks', 'accuracy_allocations')
 
 
 def empty():
@@ -39,6 +30,14 @@ class MemoryStore:
             if self.revision != revision:
                 raise Conflict()
             self.state, self.revision = copy.deepcopy(after), revision + 1
+
+    def records(self, bucket, prefix, *, limit=100, after=None, reverse=False):
+        if bucket not in BUCKETS or not isinstance(prefix, str) or type(reverse) is not bool or not 1 <= limit <= 100 or (after is not None and not after.startswith(prefix)):
+            raise ValueError("Invalid record page")
+        names = sorted((k for k in self.state[bucket] if k.startswith(prefix) and (after is None or (k < after if reverse else k > after))), reverse=reverse)
+        selected = names[:limit]
+        return [(k, copy.deepcopy(self.state[bucket][k])) for k in selected], (selected[-1] if len(names) > limit else None)
+
 
 
 class LazyRecords(dict):
@@ -90,7 +89,7 @@ class DynamoStore:
         for _ in range(12):
             revision, state = self._revision(), empty()
             for bucket in BUCKETS:
-                if bucket in ("events", "requests"):
+                if bucket in {"requests", "events", "accuracy_campaigns", "accuracy_tasks", "accuracy_allocations"}:
                     state[bucket] = LazyRecords(self.client, self.table, bucket)
                     continue
                 cursor = None
@@ -168,6 +167,26 @@ class DynamoStore:
             if any(r.get("Code") == "ConditionalCheckFailed" for r in reasons):
                 raise Conflict() from exc
             raise
+
+    def records(self, bucket, prefix, *, limit=100, after=None, reverse=False):
+        if bucket not in BUCKETS or not isinstance(prefix, str) or type(reverse) is not bool or not 1 <= limit <= 100 or (after is not None and not after.startswith(prefix)):
+            raise ValueError("Invalid record page")
+        arguments = dict(TableName=self.table, ConsistentRead=True,
+            KeyConditionExpression="pk = :pk AND begins_with(sk, :prefix)",
+            ExpressionAttributeValues={":pk": {"S": "STATE"}, ":prefix": {"S": bucket + ":" + prefix}},
+            Limit=limit, ScanIndexForward=not reverse)
+        if after is not None:
+            arguments["ExclusiveStartKey"] = {"pk": {"S": "STATE"}, "sk": {"S": bucket + ":" + after}}
+        response = self.client.query(**arguments)
+        rows = []
+        for item in response.get("Items", []):
+            name = item["sk"]["S"]
+            if not name.startswith(bucket + ":" + prefix):
+                raise ValueError("Record page escaped its owner prefix")
+            rows.append((name[len(bucket) + 1:], json.loads(item["payload"]["S"])))
+        last = response.get("LastEvaluatedKey")
+        return rows, (last["sk"]["S"][len(bucket) + 1:] if last else None)
+
 
 
 class MemoryObjects:

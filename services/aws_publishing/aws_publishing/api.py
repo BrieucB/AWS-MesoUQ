@@ -162,6 +162,11 @@ class Application:
             validate_result,
         )
 
+    def check_request_size(self, method, path, body):
+        """Default metadata cap; specialized protocols may use a bounded hook."""
+        if len(json.dumps(body, allow_nan=False).encode()) > 200_000:
+            fail(413, "request_too_large", "Request exceeds metadata size limit")
+
     def handle(self, method, path, claims=None, body=None, *, remaining_ms=None):
         if path == "/health" and method == "GET":
             return 200, {"status": "ok"}
@@ -169,8 +174,7 @@ class Application:
             fail(401, "unauthenticated", "Verified access token required")
         if body is None:
             body = {}
-        if len(json.dumps(body, allow_nan=False).encode()) > 200_000:
-            fail(413, "request_too_large", "Request exceeds metadata size limit")
+        self.check_request_size(method, path, body)
         for _ in range(8):
             revision, state = self.store.load()
             before = copy.deepcopy(state)
@@ -182,11 +186,11 @@ class Application:
                 method, path.rstrip("/"), claims["sub"], identity, body, state
             )
             if state == before:
-                self.finalize(state, remaining_ms=remaining_ms)
+                self.finalize_request(method, path.rstrip("/"), state, remaining_ms=remaining_ms)
                 return status, result
             try:
                 self.store.save(revision, before, state)
-                self.finalize(state, remaining_ms=remaining_ms)
+                self.finalize_request(method, path.rstrip("/"), state, remaining_ms=remaining_ms)
                 if self.notifications:
                     self.notifications.changed(revision + 1)
                 return status, result
@@ -197,6 +201,9 @@ class Application:
             "concurrent_update",
             "Concurrent update; retry with the same idempotency key",
         )
+
+    def finalize_request(self, method, path, state, *, remaining_ms=None):
+        return self.finalize(state, remaining_ms=remaining_ms)
 
     def archive_due(self, artifact):
         verified = artifact.get("archive_verified_at")
