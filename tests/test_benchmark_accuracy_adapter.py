@@ -19,14 +19,34 @@ _SPEC = importlib.util.spec_from_file_location("accuracy_adapter_under_test", _S
 native = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(native)
 
+# These functions execute only on Karolina/Linux; portable coordination stays tested.
+requires_linux_native = pytest.mark.skipif(
+    sys.platform != "linux", reason="Karolina native POSIX-ACL execution requires Linux")
+
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def private_fixture_directory(path):
+    # mkdir(parents=True) gives intermediate components ambient-umask modes.
+    # Build only missing fixture ancestors explicitly; retain existing nonleaf
+    # ancestors so deliberately unsafe negative fixtures remain meaningful.
+    path = Path(path)
+    missing = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    path.chmod(0o700)
+    return path
+
+
 def private(path, raw=b"content"):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    private_fixture_directory(path.parent)
     path.write_bytes(raw)
     path.chmod(0o600)
     return path
@@ -95,6 +115,7 @@ def test_stable_reader_retains_size_bound(tmp_path):
             pytest.fail("Oversized native leaf admitted")
 
 
+@requires_linux_native
 def test_immutable_identical_retry_conflict_and_private_bytes(tmp_path):
     tmp_path.chmod(0o700)
     path = tmp_path / "result.json"
@@ -108,6 +129,7 @@ def test_immutable_identical_retry_conflict_and_private_bytes(tmp_path):
     assert list(tmp_path.glob("pending-*")) == []
 
 
+@requires_linux_native
 def test_immutable_same_payload_concurrent_publication(tmp_path):
     tmp_path.chmod(0o700)
     path = tmp_path / "result.json"
@@ -367,6 +389,7 @@ def test_native_window_rejects_boolean_nonfinite_overfunded_or_injected_values(f
         native._validate_window(window, reservation)
 
 
+@requires_linux_native
 def test_immutable_exact_crash_alias_recovery_is_idempotent(tmp_path):
     final = private(tmp_path / "receipt.json", b"one")
     pending = tmp_path / ("pending-receipt.json-" + "a" * 32 + ".tmp")
@@ -377,6 +400,7 @@ def test_immutable_exact_crash_alias_recovery_is_idempotent(tmp_path):
     assert final.stat().st_nlink == 1
 
 
+@requires_linux_native
 def test_immutable_never_unlinks_unknown_or_foreign_alias(tmp_path):
     final = private(tmp_path / "receipt.json", b"one")
     foreign = tmp_path / "foreign-original.json"
@@ -496,7 +520,7 @@ def test_runtime_cache_policy_is_bound_outside_archived_campaign(tmp_path):
         assert Path(context["native_root"]) / "runtime-cache" in Path(path).parents
 
 
-def dependency_v2_fixture(tmp_path, entry, environment):
+def dependency_spec_fixture(tmp_path, environment):
     site = tmp_path / "dependencies" / "site"
     private(site / "benchmark_demo-1.0.dist-info/METADATA",
             b"Name: benchmark-demo\r\nVersion: 1.0\r\n")
@@ -517,6 +541,11 @@ def dependency_v2_fixture(tmp_path, entry, environment):
                      "normalization_receipt_path": str(normalization),
                      "normalization_receipt_sha256": digest(normalization.read_bytes())},
         "distribution_names": ["benchmark-demo"]}
+    return spec
+
+
+def dependency_v2_fixture(tmp_path, entry, environment):
+    spec = dependency_spec_fixture(tmp_path, environment)
     command = ("import json,sys;"
         "p=sys.argv[1];d={'__name__':'__metadata_fixture__','__file__':p};"
         "exec(compile(open(p,'rb').read(),p,'exec',dont_inherit=True),d);"
@@ -557,6 +586,7 @@ def executable_profile_fixture(tmp_path):
     return context, operator, dependencies
 
 
+@requires_linux_native
 def test_real_metadata_preflight_uses_no_scientific_package_import(tmp_path):
     context, operator, expected = executable_profile_fixture(tmp_path)
     before = {name for name in sys.modules if name == "meso_uq" or name.startswith("meso_uq.")}
@@ -566,6 +596,7 @@ def test_real_metadata_preflight_uses_no_scientific_package_import(tmp_path):
     assert after == before
 
 
+@requires_linux_native
 def test_dependency_preflight_rejects_reviewed_but_stale_distribution_version(tmp_path):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     manifest["observation"]["distributions"][0]["version"] = "stale-version"
@@ -577,6 +608,7 @@ def test_dependency_preflight_rejects_reviewed_but_stale_distribution_version(tm
         native._verify_profile(context, operator, allocated=True)
 
 
+@requires_linux_native
 def test_preflight_rejects_changed_environment_before_any_probe(tmp_path):
     context, operator, _ = executable_profile_fixture(tmp_path)
     private(Path(operator["environment_script"]), b"exit 55\n")
@@ -979,8 +1011,7 @@ def test_cancel_requires_explicit_true_even_when_slurm_ignores_callback_return(a
 
 def publication_projection_fixture(tmp_path):
     root = tmp_path / "campaign/output"
-    root.mkdir(parents=True)
-    root.chmod(0o700)
+    private_fixture_directory(root)
     def descriptor(name, kind=None, content_type="application/json", raw=b"{}"):
         path = private(root / name, raw)
         result = {"file": name, "sha256": digest(raw), "size_bytes": len(raw),
@@ -1125,6 +1156,7 @@ def test_allocated_supervision_uses_task_cwd_and_full_cache_policy():
     assert ast.unparse(call.args[1]) == "str(directory)"
     assert ast.unparse(call.args[1]) != "control['operator']['repository']"
 
+@requires_linux_native
 def test_private_directory_creation_clears_only_new_inherited_sgid(tmp_path):
     parent = tmp_path / "assigned"
     parent.mkdir()
@@ -1144,6 +1176,7 @@ def set_default_acl(path):
     return raw
 
 
+@requires_linux_native
 def test_mkdir_removes_only_new_inherited_acl_before_descendants(tmp_path):
     parent = tmp_path / "inheriting-parent"
     parent.mkdir()
@@ -1167,6 +1200,7 @@ def test_mkdir_removes_only_new_inherited_acl_before_descendants(tmp_path):
         os.umask(previous)
 
 
+@requires_linux_native
 def test_mkdir_refuses_existing_private_leaf_with_default_acl(tmp_path):
     leaf = tmp_path / "existing-private"
     leaf.mkdir()
@@ -1180,17 +1214,18 @@ def test_mkdir_refuses_existing_private_leaf_with_default_acl(tmp_path):
 def test_acl_unavailable_fails_closed(monkeypatch):
     def unknown(*args, **kwargs):
         raise OSError(native.errno.ENOTSUP, "Unsupported ACL observation")
-    monkeypatch.setattr(native.os, "getxattr", unknown)
+    monkeypatch.setattr(native.os, "getxattr", unknown, raising=False)
     with pytest.raises(native.NativeContractError, match="unavailable"):
         native._acl_absent(0, "system.posix_acl_default")
 
 
 def test_isolated_dependency_snapshot_requires_site_disabled_interpreter(tmp_path):
-    context, operator, manifest = executable_profile_fixture(tmp_path)
+    spec = dependency_spec_fixture(tmp_path, private(tmp_path / "environment.sh", b":\n"))
     with pytest.raises(native.NativeContractError, match="Python -I -S -B"):
-        native.isolated_dependency_snapshot(manifest["spec"])
+        native.isolated_dependency_snapshot(spec)
 
 
+@requires_linux_native
 def test_dependency_v2_honest_site_free_prefix_and_raw_metadata(tmp_path):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     assert manifest["schema"] == native.DEPENDENCY_SCHEMA
@@ -1206,12 +1241,14 @@ def test_dependency_v2_honest_site_free_prefix_and_raw_metadata(tmp_path):
     native._verify_profile(context, operator, allocated=True)
 
 
+@requires_linux_native
 def test_dependency_provenance_origin_is_not_an_active_admission_dependency(tmp_path):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     assert not Path(manifest["spec"]["overlays"][0]["origin"]).exists()
     native._verify_profile(context, operator, allocated=True)
 
 
+@requires_linux_native
 def test_dependency_probe_never_executes_pth_or_ambient_pythonpath(tmp_path, monkeypatch):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     site = Path(operator["dependency_overlays"][0])
@@ -1226,6 +1263,7 @@ def test_dependency_probe_never_executes_pth_or_ambient_pythonpath(tmp_path, mon
 
 
 @pytest.mark.parametrize("field", ["receipt", "normalization_receipt"])
+@requires_linux_native
 def test_dependency_provenance_receipt_replacement_rejects(tmp_path, field):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     private(Path(manifest["spec"]["snapshot"][field + "_path"]), b'{"changed":true}\n')
@@ -1233,6 +1271,7 @@ def test_dependency_provenance_receipt_replacement_rejects(tmp_path, field):
         native._verify_profile(context, operator, allocated=True)
 
 
+@requires_linux_native
 def test_dependency_reviewed_site_replacement_rejects(tmp_path):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     site = Path(operator["dependency_overlays"][0])
@@ -1247,7 +1286,9 @@ def test_dependency_reviewed_site_replacement_rejects(tmp_path):
 
 
 def test_dependency_portable_equivalence_keeps_shared_site_inode_and_modes(tmp_path):
-    context, operator, manifest = executable_profile_fixture(tmp_path)
+    # Pure comparison input; this synthetic observation attests no runtime.
+    manifest = {"observation": {"overlays": [{"device": 11, "inode": 22, "mode": 0o700}],
+                                "stdlib": [{"device": 33, "inode": 44, "mode": 0o755}]}}
     changed = deepcopy(manifest)
     for row in changed["observation"]["overlays"]:
         row["device"] += 1
@@ -1286,7 +1327,8 @@ def test_source_install_replaces_ambient_paths_and_sanitizes_child_environment(t
 @pytest.mark.parametrize("change", ["duplicate", "overlap", "origin-active", "legacy-active",
                                      "unknown-field", "unknown-provenance"])
 def test_dependency_spec_refuses_ambiguous_or_unsafe_search_roots(tmp_path, change):
-    context, operator, manifest = executable_profile_fixture(tmp_path)
+    manifest = {"spec": dependency_spec_fixture(
+        tmp_path, private(tmp_path / "environment.sh", b":\n"))}
     spec = deepcopy(manifest["spec"])
     first = spec["overlays"][0]
     if change == "duplicate":
@@ -1308,6 +1350,7 @@ def test_dependency_spec_refuses_ambiguous_or_unsafe_search_roots(tmp_path, chan
         native._dependency_spec(spec)
 
 
+@requires_linux_native
 def test_dependency_operator_cannot_reorder_or_inject_sites(tmp_path):
     context, operator, manifest = executable_profile_fixture(tmp_path)
     operator["dependency_overlays"] = ["/injected/site", *operator["dependency_overlays"]]
@@ -1328,6 +1371,7 @@ def test_effective_distribution_precedence_is_explicit_and_complete(tmp_path):
         native._effective_distribution_metadata(["missing"], [str(x) for x in sites])
 
 
+@requires_linux_native
 def test_dependency_directory_detects_reparented_same_leaf_symlink(tmp_path, monkeypatch):
     parent = tmp_path / "private"
     leaf = parent / "site"
@@ -1352,6 +1396,7 @@ def test_dependency_directory_detects_reparented_same_leaf_symlink(tmp_path, mon
     assert (moved / "site/marker").read_bytes() == b"content"
 
 
+@requires_linux_native
 def test_dependency_directory_rejects_inherited_acl_on_private_ancestor(tmp_path):
     parent = tmp_path / "private"
     leaf = parent / "site"
@@ -1361,7 +1406,7 @@ def test_dependency_directory_rejects_inherited_acl_on_private_ancestor(tmp_path
         native._dependency_directory(leaf, private=True)
 
 
-def real_protocol_native_control(tmp_path, monkeypatch, nonce):
+def real_protocol_native_control(tmp_path, monkeypatch, nonce, *, portable_record_sink=False):
     """Actual wire/protocol and prepare/load/main; stub only site/model boundaries."""
     from types import ModuleType
     from aws_mesouq import benchmark_accuracy_protocol as protocol
@@ -1446,9 +1491,26 @@ def real_protocol_native_control(tmp_path, monkeypatch, nonce):
         lambda control, clock: reached.append(control["manifest"]["request"]["idempotency_key"]) or 0)
     window = {"allocated_seconds": 60, "internal_seconds": 60,
               "runtime_clock_policy": "allocation_deadline_v1", "time": "00:01:00"}
-    preparation = native._prepare({"context": context, "operator": operator,
-                                  "claim": claim, "window": window})
-    path = Path(preparation["script_path"]).parent / "control.json"
+    records = []
+    if portable_record_sink:
+        # Explicit codec fixture, NOT a native filesystem/ACL success claim.
+        campaign, directory = native._paths(context, manifest)
+        control = {"schema": native.CONTROL_SCHEMA, "context": context,
+            "operator": operator, "manifest": manifest, "manifest_sha256": expected,
+            "marker": claim["task"]["marker"], "window": window,
+            "control_directory": str(directory), "campaign_directory": str(campaign),
+            "runtime_environment": native._runtime_environment(context, manifest)}
+        path = private(directory / "control.json", native.canonical(control))
+        def record_output(path, document):
+            records.append({"path": str(path), "document": deepcopy(document)})
+            return str(path)
+        # Only allocated-node metadata output I/O is a sink. No ACL primitive
+        # is faked successful; real Linux native counterparts remain above.
+        monkeypatch.setattr(native, "immutable_json", record_output)
+    else:
+        preparation = native._prepare({"context": context, "operator": operator,
+                                      "claim": claim, "window": window})
+        path = Path(preparation["script_path"]).parent / "control.json"
     control = native._load_control(str(path))
     assert control["manifest_sha256"] == expected
     assert control["manifest"]["request"]["idempotency_key"] == nonce
@@ -1457,17 +1519,20 @@ def real_protocol_native_control(tmp_path, monkeypatch, nonce):
     assert native.checksum(control) == digest(path.read_bytes())
     assert native.checksum(control) != protocol.checksum(control)
     assert nonce not in str(path)
-    return protocol, manifest, control, path, reached
+    result = (protocol, manifest, control, path, reached)
+    return (*result, records) if portable_record_sink else result
 
 
 @pytest.mark.parametrize("nonce", ["résumé", "new\nλ", "🔬-reference"],
                          ids=["accent", "newline-unicode", "astral"])
+@requires_linux_native
 def test_real_protocol_unicode_nonce_prepares_loads_and_reaches_native_entry(tmp_path, monkeypatch, nonce):
     protocol, manifest, control, path, reached = real_protocol_native_control(tmp_path, monkeypatch, nonce)
     assert native.main(["--execute-stage", str(path)]) == 0
     assert reached == [nonce]
 
 
+@requires_linux_native
 def test_native_entry_rejects_wrong_utf8_variant_of_protocol_manifest_hash(tmp_path, monkeypatch):
     protocol, manifest, control, path, reached = real_protocol_native_control(tmp_path, monkeypatch, "référence")
     control["manifest_sha256"] = native.checksum(manifest)
@@ -1477,6 +1542,7 @@ def test_native_entry_rejects_wrong_utf8_variant_of_protocol_manifest_hash(tmp_p
     assert reached == []
 
 
+@requires_linux_native
 def test_native_entry_keeps_real_wire_nonce_binding_check(tmp_path, monkeypatch):
     protocol, manifest, control, path, reached = real_protocol_native_control(tmp_path, monkeypatch, "étude")
     control["manifest"]["request"]["idempotency_key"] = "changed\nλ"
@@ -1484,3 +1550,65 @@ def test_native_entry_keeps_real_wire_nonce_binding_check(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="scientific/transport identity mismatch"):
         native.main(["--execute-stage", str(path)])
     assert reached == []
+
+
+@pytest.mark.parametrize("fixture_umask", [0o022, 0o002], ids=["default-022", "group-002"])
+@requires_linux_native
+def test_private_fixture_nested_parents_satisfy_real_guard_independent_of_umask(tmp_path, fixture_umask):
+    original = os.umask(fixture_umask)
+    try:
+        marker = private(tmp_path / "private-fixture" / "nested" / "site" / "marker")
+    finally:
+        os.umask(original)
+    observed = native._dependency_directory(marker.parent, private=True)
+    assert observed["path"] == str(marker.parent)
+    assert observed["uid"] == os.getuid()
+    for directory in (tmp_path / "private-fixture",
+                      tmp_path / "private-fixture/nested", marker.parent):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+
+
+def test_native_private_guard_missing_acl_primitive_fails_closed(tmp_path, monkeypatch):
+    root = private_fixture_directory(tmp_path / "private")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    monkeypatch.delattr(native.os, "getxattr", raising=False)
+    try:
+        with pytest.raises((AttributeError, native.NativeContractError)):
+            native._check_private_directory(fd)
+    finally:
+        os.close(fd)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("nonce", ["résumé", "new\nλ", "🔬-reference"],
+                         ids=["accent", "newline-unicode", "astral"])
+def test_portable_codec_identity_uses_real_protocol_with_explicit_record_sink(tmp_path, monkeypatch, nonce):
+    protocol, manifest, control, path, reached, records = real_protocol_native_control(
+        tmp_path, monkeypatch, nonce, portable_record_sink=True)
+    assert native.main(["--execute-stage", str(path)]) == 0
+    assert reached == [nonce]
+    assert len(records) == 2
+    assert Path(records[0]["path"]).name == "allocation-clock.json"
+    assert Path(records[1]["path"]).name.startswith("quota-check-")
+    assert records[1]["document"]["manifest_sha256"] == protocol.checksum(manifest)
+
+
+def test_portable_codec_rejects_wrong_protocol_hash_before_any_output(tmp_path, monkeypatch):
+    protocol, manifest, control, path, reached, records = real_protocol_native_control(
+        tmp_path, monkeypatch, "référence", portable_record_sink=True)
+    control["manifest_sha256"] = native.checksum(manifest)
+    private(path, native.canonical(control))
+    with pytest.raises(native.NativeContractError, match="manifest checksum changed"):
+        native.main(["--execute-stage", str(path)])
+    assert reached == [] and records == []
+
+
+def test_portable_codec_keeps_real_wire_nonce_binding_before_any_output(tmp_path, monkeypatch):
+    protocol, manifest, control, path, reached, records = real_protocol_native_control(
+        tmp_path, monkeypatch, "étude", portable_record_sink=True)
+    control["manifest"]["request"]["idempotency_key"] = "changed\nλ"
+    private(path, native.canonical(control))
+    with pytest.raises(ValueError, match="scientific/transport identity mismatch"):
+        native.main(["--execute-stage", str(path)])
+    assert reached == [] and records == []
