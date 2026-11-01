@@ -6,12 +6,14 @@ TokenSession factory. Refresh credentials never cross this Unix socket.
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 import errno
 import json
 import math
 import os
 from pathlib import Path
 import socket
+import signal
 import stat
 import struct
 import subprocess
@@ -216,6 +218,7 @@ class _TokenVault:
         self._clock = clock
         self._force_interval = force_interval
         self._lock = threading.Lock()
+        self._provider_lock = threading.Lock()
         self._cached: str | None = None
         self._epoch = 0
         self._last_force = -math.inf
@@ -225,36 +228,50 @@ class _TokenVault:
         self._last_error: str | None = None
 
     def get(self, *, force_refresh: bool, observed_epoch: int) -> tuple[str, int]:
-        with self._lock:
-            if self._auth_required or self._session is None:
-                raise SessionExpired("controller_authentication_required")
-            force = (
-                force_refresh
-                and observed_epoch == self._epoch
-                and self._clock() - self._last_force >= self._force_interval
-            )
-            self._provider_calls += 1
-            if force:
-                self._forced_calls += 1
-                self._last_force = self._clock()
+        # Serialize provider calls, never vault invalidation or safe status.
+        with self._provider_lock:
+            with self._lock:
+                if self._auth_required or self._session is None:
+                    raise SessionExpired("controller_authentication_required")
+                session = self._session
+                force = (
+                    force_refresh
+                    and observed_epoch == self._epoch
+                    and self._clock() - self._last_force >= self._force_interval
+                )
+                self._provider_calls += 1
+                if force:
+                    self._forced_calls += 1
+                    self._last_force = self._clock()
+            failure = None
+            token = None
             try:
-                token = self._session.token(force_refresh=force)
+                token = session.token(force_refresh=force)
             except SessionExpired:
-                self._auth_required = True
-                self._cached = None
-                self._last_error = "authentication_required"
-                raise SessionExpired("controller_authentication_required") from None
+                failure = "authentication_required"
             except Exception:
-                self._last_error = "token_provider_unavailable"
-                raise BrokerError("token_provider_unavailable") from None
-            if not _valid_token(token):
-                self._last_error = "invalid_provider_token"
-                raise BrokerError("invalid_provider_token")
-            if token != self._cached or force:
-                self._epoch += 1
-            self._cached = token
-            self._last_error = None
-            return token, self._epoch
+                failure = "token_provider_unavailable"
+            with self._lock:
+                # clear() is independent of provider I/O. A late completion
+                # cannot restore credentials or publish state after shutdown.
+                if self._session is not session:
+                    raise SessionExpired("controller_authentication_required")
+                if failure == "authentication_required":
+                    self._auth_required = True
+                    self._cached = None
+                    self._last_error = failure
+                    raise SessionExpired("controller_authentication_required") from None
+                if failure is not None:
+                    self._last_error = failure
+                    raise BrokerError(failure) from None
+                if not _valid_token(token):
+                    self._last_error = "invalid_provider_token"
+                    raise BrokerError("invalid_provider_token")
+                if token != self._cached or force:
+                    self._epoch += 1
+                self._cached = token
+                self._last_error = None
+                return token, self._epoch
 
     def status(self) -> dict:
         with self._lock:
@@ -271,6 +288,49 @@ class _TokenVault:
         with self._lock:
             self._cached = None
             self._session = None
+
+
+@contextmanager
+def _defer_owner_signals():
+    """Finish socket custody before delivering an owner cancellation.
+
+    Native masking is thread-local. A signal delivered to another unblocked
+    thread may still schedule its Python handler on main, so main also records
+    these two owner signals during the short custody interval.
+    """
+    tracked = (signal.SIGINT, signal.SIGTERM)
+    on_main = threading.current_thread() is threading.main_thread()
+    previous = {number: signal.getsignal(number) for number in tracked} if on_main else {}
+    pending = {}
+
+    def deferred(number, frame):
+        pending.setdefault(number, frame)  # At most one entry per tracked signal.
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(tracked))
+    try:
+        if on_main:
+            try:
+                signal.signal(signal.SIGINT, deferred)
+                signal.signal(signal.SIGTERM, deferred)
+                yield
+            finally:
+                try:
+                    signal.signal(signal.SIGINT, previous[signal.SIGINT])
+                finally:
+                    signal.signal(signal.SIGTERM, previous[signal.SIGTERM])
+        else:
+            yield
+    finally:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        finally:
+            for number, frame in pending.items():
+                handler = previous[number]
+                if callable(handler):
+                    handler(number, frame)
+                elif handler == signal.SIG_DFL:
+                    os.kill(os.getpid(), number)
+                # SIG_IGN keeps the caller's original ignore semantics.
 
 
 class AuthBroker:
@@ -352,12 +412,21 @@ class AuthBroker:
                     raise BrokerSecurityError("socket_already_exists")
                 self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 self._listener.set_inheritable(False)
-                self._listener.bind(str(self._socket_path))
-                # The leaf has been private before bind. No credential is
-                # available before this socket is restricted and verified.
-                os.chmod("a.sock", 0o600, dir_fd=self._dirfd)
-                info = _socket_metadata(self._dirfd, "a.sock")
-                self._socket_inode = (info.st_dev, info.st_ino)
+                # Record ownership before a pending owner cancellation can run.
+                # Restore exactly the caller's thread mask, including on errors.
+                with _defer_owner_signals():
+                    self._listener.bind(str(self._socket_path))
+                    info = os.stat("a.sock", dir_fd=self._dirfd, follow_symlinks=False)
+                    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid()
+                            or info.st_nlink != 1):
+                        raise BrokerSecurityError("unsafe_socket")
+                    self._socket_inode = (info.st_dev, info.st_ino)
+                    # No credential is available until this own socket is private
+                    # and its pathname still refers to the captured inode.
+                    os.chmod("a.sock", 0o600, dir_fd=self._dirfd)
+                    verified = _socket_metadata(self._dirfd, "a.sock")
+                    if self._socket_inode != (verified.st_dev, verified.st_ino):
+                        raise BrokerSecurityError("unsafe_socket")
                 self._listener.listen(MAX_CONNECTIONS)
                 self._listener.settimeout(0.2)
                 self._login_attempts += 1
@@ -507,13 +576,28 @@ class AuthBroker:
                     pass
                 conn.close()
                 continue
-            thread = threading.Thread(
-                target=self._handle, args=(conn,), name="mesouq-auth-rpc", daemon=True
-            )
+            thread = None
+            handler_owns_cleanup = False
             with self._threads_lock:
-                self._connections.add(conn)
-                self._handlers.add(thread)
-            thread.start()
+                if not self._stop.is_set():
+                    try:
+                        thread = threading.Thread(
+                            target=self._handle, args=(conn,),
+                            name="mesouq-auth-rpc", daemon=True)
+                        self._connections.add(conn)
+                        self._handlers.add(thread)
+                        thread.start()
+                        handler_owns_cleanup = True
+                    except Exception:
+                        # A wrapper may raise after the real thread has started.
+                        # In that case only _handle may release its owned slot.
+                        handler_owns_cleanup = thread is not None and thread.ident is not None
+                        if not handler_owns_cleanup:
+                            self._connections.discard(conn)
+                            self._handlers.discard(thread)
+            if not handler_owns_cleanup:
+                conn.close()
+                self._slots.release()
 
     def _handle(self, conn: socket.socket) -> None:
         try:

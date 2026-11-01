@@ -611,3 +611,224 @@ def test_join_failure_still_releases_socket_descriptor_and_vault(monkeypatch):
                 broker._vault.clear()
             join(timeout=2)
         assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("signal_name", ["SIGINT", "SIGTERM"])
+@pytest.mark.parametrize("foreign_replacement", [False, True])
+@pytest.mark.parametrize("via_unblocked_thread", [False, True])
+def test_real_signal_during_bind_cleans_only_owned_socket(signal_name, foreign_replacement, via_unblocked_thread):
+    import tempfile
+    script = r"""
+import json,os,signal,socket,stat,sys,threading,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from aws_mesouq.connector import auth_broker as module
+short=Path(sys.argv[2]);chosen=getattr(signal,sys.argv[3]);foreign_mode=sys.argv[4]=="1"
+via_peer=sys.argv[5]=="1";ready=threading.Event();finish=threading.Event()
+def peer_waiting():
+ signal.pthread_sigmask(signal.SIG_UNBLOCK,{signal.SIGINT,signal.SIGTERM})
+ ready.set();finish.wait(5)
+peer=threading.Thread(target=peer_waiting) if via_peer else None
+if peer is not None:
+ peer.start();assert ready.wait(2)
+def deliver():
+ if peer is not None:
+  signal.pthread_kill(peer.ident,chosen);time.sleep(0.05)
+ else:os.kill(os.getpid(),chosen)
+def interrupted(signum,frame):
+ raise KeyboardInterrupt()
+signal.signal(signal.SIGINT,interrupted);signal.signal(signal.SIGTERM,interrupted)
+before_mask=signal.pthread_sigmask(signal.SIG_BLOCK,set())
+broker=module.AuthBroker(lambda: (_ for _ in ()).throw(AssertionError("login reached")),private_socket_dir=short)
+original_bind=socket.socket.bind;original_metadata=module._socket_metadata
+foreign=None;foreign_inode=None;sent=False
+def binding(sock,address):
+ global sent
+ result=original_bind(sock,address)
+ if str(address)==str(short/"a.sock") and not foreign_mode and not sent:
+  sent=True;deliver()
+ return result
+def metadata(dirfd,name):
+ global foreign,foreign_inode,sent
+ if foreign_mode and not sent:
+  sent=True;os.unlink(name,dir_fd=dirfd)
+  foreign=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+  original_bind(foreign,str(short/name));os.chmod(name,0o600,dir_fd=dirfd)
+  info=os.stat(name,dir_fd=dirfd,follow_symlinks=False);foreign_inode=(info.st_dev,info.st_ino)
+  deliver()
+ return original_metadata(dirfd,name)
+socket.socket.bind=binding;module._socket_metadata=metadata
+cancelled=False
+try:
+ broker.start()
+except KeyboardInterrupt:
+ cancelled=True
+exists=os.path.lexists(short/"a.sock")
+foreign_preserved=False
+if foreign_mode and exists:
+ info=os.lstat(short/"a.sock");foreign_preserved=(info.st_dev,info.st_ino)==foreign_inode and stat.S_ISSOCK(info.st_mode)
+result={"loaded_source_sha256":__import__("hashlib").sha256(Path(module.__file__).read_bytes()).hexdigest(),"cancelled":cancelled,"socket_exists":exists,"foreign_preserved":foreign_preserved,
+ "descriptor_closed":broker._dirfd is None,"mask_restored":signal.pthread_sigmask(signal.SIG_BLOCK,set())==before_mask,
+ "login_attempts":broker._login_attempts}
+finish.set()
+if peer is not None:peer.join(2);assert not peer.is_alive()
+if foreign is not None:foreign.close()
+if exists:os.unlink(short/"a.sock")
+print(json.dumps(result))
+"""
+    with tempfile.TemporaryDirectory(prefix=".amq-sigbind-", dir=Path("/tmp").resolve()) as short:
+        run = subprocess.run([sys.executable, "-B", "-c", script, str(Path(sys.modules[AuthBroker.__module__].__file__).resolve().parents[2]), short,
+            signal_name, "1" if foreign_replacement else "0",
+            "1" if via_unblocked_thread else "0"], capture_output=True, text=True, timeout=10)
+    assert run.returncode == 0, run.stderr
+    result = json.loads(run.stdout)
+    expected = __import__("hashlib").sha256(Path(sys.modules[AuthBroker.__module__].__file__).read_bytes()).hexdigest()
+    assert result["loaded_source_sha256"] == expected
+    assert result["cancelled"] and result["descriptor_closed"] and result["mask_restored"]
+    assert result["login_attempts"] == 0
+    if foreign_replacement:
+        assert result["socket_exists"] and result["foreign_preserved"]
+    else:
+        assert result["socket_exists"] is False
+
+
+_RPC_CHILD = r"""
+import json,socket,struct,sys
+path=sys.argv[1];count=int(sys.argv[2]);sys.stdin.readline()
+results=[]
+for _ in range(count):
+ conn=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);conn.settimeout(3)
+ try:
+  conn.connect(path)
+  raw=json.dumps({"version":1,"operation":"token","generation":1,"force_refresh":False,"observed_epoch":0},separators=(",",":")).encode()
+  conn.sendall(struct.pack("!I",len(raw))+raw)
+  def read(n):
+   raw=b""
+   while len(raw)<n:
+    part=conn.recv(n-len(raw))
+    if not part:raise EOFError()
+    raw+=part
+   return raw
+  size=struct.unpack("!I",read(4))[0];response=json.loads(read(size))
+  results.append(response.get("ok") is True and isinstance(response.get("token"),str))
+ except (OSError,EOFError):
+  results.append(False)
+ finally:
+  conn.close()
+print(json.dumps({"accepted":results}))
+"""
+
+
+def _rpc_process(broker, count):
+    process = subprocess.Popen([sys.executable, "-I", "-c", _RPC_CHILD,
+        str(broker.socket_path), str(count)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True)
+    broker._bind_worker(process, 1, "0"*64)
+    process.stdin.write("registered\n");process.stdin.flush()
+    return process
+
+
+def _all_slots_available(broker):
+    acquired = 0
+    while broker._slots.acquire(blocking=False):
+        acquired += 1
+    for _ in range(acquired):
+        broker._slots.release()
+    return acquired == 8
+
+
+@pytest.mark.parametrize("late_result", ["token", "expired", "error"])
+def test_shutdown_does_not_wait_on_provider_lock_or_accept_late_credentials(late_result):
+    import tempfile
+    from types import SimpleNamespace
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    def provider(**_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            return "qa-startup-access"
+        entered.set()
+        assert release.wait(8), "synthetic provider release timeout"
+        if late_result == "expired":
+            raise SessionExpired("qa-provider-private-expired-text")
+        if late_result == "error":
+            raise RuntimeError("qa-provider-private-error-text")
+        return "qa-late-access-must-never-publish"
+    with tempfile.TemporaryDirectory(prefix=".amq-slow-provider-", dir=Path("/tmp").resolve()) as short:
+        broker = AuthBroker(lambda: SimpleNamespace(token=provider), private_socket_dir=Path(short))
+        process = None;closer = None;errors = []
+        try:
+            broker.start()
+            vault = broker._vault
+            process = _rpc_process(broker, 1)
+            assert entered.wait(3)
+            def closing():
+                try:
+                    broker.close(timeout=0.05)
+                except BrokerError as error:
+                    errors.append(error.args)
+            closer = threading.Thread(target=closing)
+            begin = time.monotonic();closer.start();closer.join(0.6)
+            assert not closer.is_alive(), "shutdown blocked on provider I/O"
+            assert time.monotonic()-begin < 0.6
+            assert errors == [("controller_shutdown_incomplete",)]
+            assert vault._session is None and vault._cached is None
+            assert vault.status()["authenticated"] is False
+            assert broker._dirfd is None and not os.path.lexists(Path(short)/"a.sock")
+            release.set()
+            stdout, stderr = process.communicate(timeout=5)
+            assert process.returncode == 0 and json.loads(stdout)["accepted"] == [False]
+            deadline = time.monotonic()+3
+            while time.monotonic()<deadline:
+                if not broker._handlers and not broker._connections and _all_slots_available(broker):
+                    break
+                time.sleep(0.01)
+            assert not broker._handlers and not broker._connections and _all_slots_available(broker)
+            assert vault._session is None and vault._cached is None
+            assert not vault.status()["authenticated"]
+            assert "qa-late-access" not in stdout+stderr
+        finally:
+            release.set()
+            if closer is not None:closer.join(3)
+            if process is not None and process.poll() is None:
+                process.kill();process.communicate(timeout=3)
+            broker.close(timeout=2)
+
+
+@pytest.mark.parametrize("failure_timing", ["before_start", "after_start"])
+def test_handler_start_failure_releases_owned_resources_and_accepts_next_rpc(monkeypatch, failure_timing):
+    import tempfile
+    from types import SimpleNamespace
+    with tempfile.TemporaryDirectory(prefix=".amq-thread-resource-", dir=Path("/tmp").resolve()) as short:
+        broker = AuthBroker(lambda: SimpleNamespace(token=lambda **_kw: "qa-thread-test-access"),
+            private_socket_dir=Path(short))
+        process = None;failed = threading.Event()
+        original = threading.Thread.start
+        def resource_failure(thread, *args, **kwargs):
+            if thread.name == "mesouq-auth-rpc" and not failed.is_set():
+                failed.set()
+                if failure_timing == "after_start":
+                    original(thread,*args,**kwargs)
+                raise RuntimeError("qa-thread-resource-failure")
+            return original(thread,*args,**kwargs)
+        try:
+            broker.start()
+            with monkeypatch.context() as patch:
+                patch.setattr(threading.Thread,"start",resource_failure)
+                process = _rpc_process(broker, 2)
+                stdout, stderr = process.communicate(timeout=8)
+            assert process.returncode == 0, stderr
+            assert failed.is_set()
+            expected = [False,True] if failure_timing == "before_start" else [True,True]
+            assert json.loads(stdout)["accepted"] == expected
+            assert broker._accept_thread.is_alive()
+            deadline = time.monotonic()+3
+            while time.monotonic()<deadline:
+                if not broker._handlers and not broker._connections and _all_slots_available(broker):
+                    break
+                time.sleep(0.01)
+            assert not broker._handlers and not broker._connections and _all_slots_available(broker)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill();process.communicate(timeout=3)
+            broker.close(timeout=2)

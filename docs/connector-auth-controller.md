@@ -164,3 +164,5 @@ References: https://developer.apple.com/library/archive/documentation/System/Con
 Startup SIGINT/SIGTERM interrupts the callback wait, closes the callback and broker listeners, and exits before a worker can start. After startup, the same signals request the normal graceful shutdown. The underlying authentication module is unchanged.
 
 Broker cleanup tolerates an interrupted accept-thread start and releases the socket, directory descriptor and token vault even when thread joining fails. Hosted signal fixtures bind real loopback listeners without reverse-DNS timing and use short private Unix-socket paths.
+
+Startup defers SIGINT/SIGTERM only while binding and recording the owned Unix socket, preserving the original signal mask and handlers; signals delivered through another unblocked thread are also deferred on main. Shutdown invalidates the token vault independently of provider I/O; late provider completions cannot restore credentials. A handler thread that cannot start releases its connection and slot while the accept loop remains available. Already started handlers keep sole cleanup ownership.
