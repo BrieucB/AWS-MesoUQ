@@ -264,3 +264,21 @@ test('accuracy source figure identities must be unambiguous',()=>{
   const {artifact}=actualAccuracyFigure(accuracyFigureNames[0]);
   assert.throws(()=>benchmarkFigureArtifacts({artifacts:[artifact,{...artifact,id:'e'.repeat(32)}]},{profile:'accuracy'}),/Ambiguous/);
 });
+
+test('source-supplied scientific limitations are shown verbatim and escaped',()=>{
+  const limitations=Object.freeze([
+    'Finite coordinate-selected central-cohort marginal accuracy.',
+    'An observed244/256 rule does not imply exact-binomial population qualification.',
+    'Numerical reference refinement is not an exactness proof; unresolved cases retain their denominator.',
+    'Marginal W2 does not establish joint posterior equality.',
+    'One HNPE training lineage does not measure training-seed variability.',
+    'Native allocation costs include failed and resumed method attempts; independent reference costs are separate.',
+    '<script>alert("posterior")</script> & original',
+  ]);
+  const expected=copy(limitations),s=setup();s.lab.detail=copy(campaign);s.lab.result={limitations};
+  const html=s.lab.view();
+  assert.ok(html.includes('<h3>Scientific limitations</h3>'));
+  for(const value of limitations.slice(0,6))assert.ok(html.includes(value));
+  assert.ok(html.includes('&lt;script&gt;alert(&quot;posterior&quot;)&lt;/script&gt; &amp; original'));
+  assert.ok(!html.includes('<script>'));assert.deepEqual(s.lab.result.limitations,expected);
+});
