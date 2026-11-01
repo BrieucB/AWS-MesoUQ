@@ -172,7 +172,7 @@ jobs:
                           context.mkdir(mode=0o700)
                           selected = ['services/aws_publishing/Dockerfile', 'services/aws_publishing/pyproject.toml',
                                       'services/aws_publishing/aws_publishing', 'src/aws_mesouq/__init__.py',
-                                      'src/aws_mesouq/contracts.py', 'src/aws_mesouq/release.py', 'src/aws_mesouq/benchmark.py', 'src/aws_mesouq/presets']
+                                      'src/aws_mesouq/contracts.py', 'src/aws_mesouq/release.py', 'src/aws_mesouq/benchmark.py', 'src/aws_mesouq/benchmark_accuracy.py', 'src/aws_mesouq/benchmark_accuracy_protocol.py', 'src/aws_mesouq/presets']
                           archive = command(['git', 'archive', '--format=tar', sha, *selected])
                           with tarfile.open(fileobj=io.BytesIO(archive)) as files:
                               for member in files.getmembers():

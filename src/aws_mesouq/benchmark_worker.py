@@ -86,7 +86,11 @@ def validate_operator(config):
 
 
 class BenchmarkWorker:
-    def __init__(self, api, slurm, journal, *, project, operator, clock=time.time, maximum_active=16):
+    def __init__(self, api, slurm, journal, *, project, operator, clock=time.time, maximum_active=16,
+                 propagate_auth_errors=False):
+        if type(propagate_auth_errors) is not bool:
+            raise ValueError("Authentication propagation policy must be boolean")
+        self.propagate_auth_errors = propagate_auth_errors
         self.operator = validate_operator(operator)
         identity = existing_identity(journal)
         self.api, self.slurm, self.journal, self.clock = api, slurm, journal, clock
@@ -953,6 +957,13 @@ os.close(fd)
 
 
 
+    @staticmethod
+    def _fatal_auth(error):
+        from .connector.api import APIError
+        from .connector.auth import SessionExpired
+        return isinstance(error, SessionExpired) or (
+            isinstance(error, APIError) and error.status in (401, 403))
+
     def sweep(self):
         check_transport_health(self.transport)
         errors = []
@@ -963,6 +974,9 @@ os.close(fd)
                 except SSHSessionError:
                     raise
                 except Exception as error:
+                    if self.propagate_auth_errors and self._fatal_auth(error):
+                        self.save()
+                        raise
                     errors.append(type(error).__name__)
         while sum(not e.get("cloud_terminal") for e in self.state["stages"].values()) < self.maximum_active:
             entry = self._claim()
@@ -973,6 +987,9 @@ os.close(fd)
             except SSHSessionError:
                 raise
             except Exception as error:
+                if self.propagate_auth_errors and self._fatal_auth(error):
+                    self.save()
+                    raise
                 errors.append(type(error).__name__)
         check_transport_health(self.transport)
         campaigns = self.api.request("GET", f"/v1/projects/{self.project}/benchmarks")["campaigns"]
@@ -983,6 +1000,9 @@ os.close(fd)
                 except (SSHSessionError, ArtifactIntegrityError):
                     raise
                 except Exception as error:
+                    if self.propagate_auth_errors and self._fatal_auth(error):
+                        self.save()
+                        raise
                     errors.append(type(error).__name__)
         return {"active_stages": sum(not e.get("cloud_terminal") for e in self.state["stages"].values()), "errors": errors}
 
