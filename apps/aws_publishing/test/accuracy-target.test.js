@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {writeFile} from 'node:fs/promises';
 import {AccuracyLab,accuracyDraftError,accuracyAccounting} from '../src/benchmark-accuracy.js';
+import {benchmarkFigureArtifacts,loadBenchmarkFigure} from '../src/benchmark-figures.js';
 import {BenchmarkLab as Workspace} from '../src/benchmark-workspace.js';
 
 const request={
@@ -54,7 +55,7 @@ test('corrupt numerical bytes are rejected',async()=>{const s=downloadSetup({cor
 test('foreign private-download hosts are rejected before any file request',async()=>{const s=downloadSetup({foreign:true});await s.lab.downloadArtifact(s.artifact.id);assert.equal(s.getFetchCalls(),0);assert.equal(s.downloads.length,0);});
 test('artifact descriptor cannot exceed the published source limit',async()=>{const s=downloadSetup();s.lab.capabilities.max_artifact_bytes=1;await s.lab.downloadArtifact(s.artifact.id);assert.equal(s.calls.length,0);assert.equal(s.downloads.length,0);});
 test('late artifact metadata after project reset cannot initiate a file fetch',async()=>{const gate=deferred(),s=downloadSetup({deferredMetadata:gate});const pending=s.lab.downloadArtifact(s.artifact.id);s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});gate.resolve({artifact:s.artifact,url:'https://files.example.test/data'});await pending;assert.equal(s.getFetchCalls(),0);assert.equal(s.downloads.length,0);});
-test('source scientific results and figure access use only the accuracy route',async()=>{const png=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1kAAAAASUVORK5CYII=','base64')),sha=createHash('sha256').update(png).digest('hex');const artifact={id:'b'.repeat(32),name:'metrics-posterior-marginals.png',size_bytes:png.length,sha256:sha,media_type:'image/png'};
+test('source scientific results and figure access use only the accuracy route',async()=>{const png=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1kAAAAASUVORK5CYII=','base64')),sha=createHash('sha256').update(png).digest('hex');const artifact={id:'b'.repeat(32),name:'confirmation-posterior-marginals.png',size_bytes:png.length,sha256:sha,media_type:'image/png'};
   const s=setup(async url=>url.endsWith('/results')?{result:{scientific_status:'terminal_unmet',qualification:{source_only:true}},accounting:copy(campaign.accounting),raw_result_artifact:{id:'c'.repeat(32),name:'comparison.json',size_bytes:2,sha256:'d'.repeat(64),media_type:'application/json'},artifacts:[artifact]}:{artifact,url:'https://files.example.test/figure'});
   s.lab.detail=copy(campaign);s.lab.fetcher=async()=>new Response(png,{status:200,headers:{'content-type':'image/png','content-length':String(png.length)}});
   await s.lab.loadResults();assert.equal(s.lab.result.scientific_status,'terminal_unmet');assert.equal(s.lab.figures[0].status,'ready');assert.match(s.lab.figures[0].src,/^data:image\/png;base64,/);assert.ok(s.calls.every(([url])=>url.includes('/benchmark-accuracy/')));
@@ -221,4 +222,45 @@ test('late final accounting cannot change another campaign context',async()=>{
   s.lab.detail=copy(campaign);const pending=s.lab.loadResults();s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});
   gate.resolve({result:{scientific_status:'terminal_unmet'},raw_result_artifact:raw,artifacts:[],accounting:campaign.accounting});await pending;
   assert.equal(s.lab.detail,null);assert.equal(s.lab.result,null);
+});
+
+const accuracyFigureNames=['confirmation-case-scores.png','confirmation-claims-and-costs.png','guide-effort-history.png','reference-refinement.png','confirmation-posterior-marginals.png'];
+function actualAccuracyFigure(name){
+  const bytes=Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1kAAAAASUVORK5CYII=','base64'));
+  return {bytes,artifact:{id:'f'.repeat(32),name,size_bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),media_type:'image/png'}};
+}
+test('all five source accuracy figures load through the explicit checked profile',async()=>{
+  for(const name of accuracyFigureNames){
+    const {bytes,artifact}=actualAccuracyFigure(name);let called=0;
+    const api={project:(_project,suffix)=>suffix,request:async()=>({artifact,download_url:'https://files.example.test/figure'}),validateStorageUrl:url=>assert.equal(url,'https://files.example.test/figure')};
+    const src=await loadBenchmarkFigure({api,project:'mesouq',campaign:cid,artifact,profile:'accuracy',fetcher:async(_url,options)=>{
+      called++;assert.equal(options.credentials,'omit');assert.equal(options.redirect,'error');return new Response(bytes,{headers:{'content-type':'image/png','content-length':String(bytes.length)}});
+    }});
+    assert.equal(called,1);assert.match(src,/^data:image\/png;base64,/);
+    const rows=benchmarkFigureArtifacts({artifacts:[artifact]},{profile:'accuracy'});assert.equal(rows.length,1);assert.ok(rows[0].title);
+  }
+});
+test('fixed-budget figure allowlist remains separate from accuracy names',async()=>{
+  const {artifact}=actualAccuracyFigure(accuracyFigureNames[0]);let calls=0;
+  assert.deepEqual(benchmarkFigureArtifacts({artifacts:[artifact]}),[]);
+  await assert.rejects(loadBenchmarkFigure({api:{request:async()=>calls++},project:'mesouq',campaign:cid,artifact,fetcher:async()=>calls++}),/could not be loaded/);
+  assert.equal(calls,0);
+  const legacy={...artifact,name:'metrics-posterior-marginals.png'};
+  assert.equal(benchmarkFigureArtifacts({artifacts:[legacy]}).length,1);
+  assert.deepEqual(benchmarkFigureArtifacts({artifacts:[legacy]},{profile:'accuracy'}),[]);
+});
+test('unknown profiles and names cannot fetch private figure bytes',async()=>{
+  const {artifact}=actualAccuracyFigure('unapproved-science.png');let calls=0;
+  await assert.rejects(loadBenchmarkFigure({api:{request:async()=>calls++},project:'mesouq',campaign:cid,artifact,profile:'accuracy',fetcher:async()=>calls++}));
+  await assert.rejects(loadBenchmarkFigure({api:{request:async()=>calls++},project:'mesouq',campaign:cid,artifact,profile:'arbitrary',fetcher:async()=>calls++}));
+  assert.equal(calls,0);
+});
+test('accuracy figure checksum verification remains required',async()=>{
+  const {bytes,artifact}=actualAccuracyFigure(accuracyFigureNames[0]);
+  await assert.rejects(loadBenchmarkFigure({api:{project:(_p,s)=>s,request:async()=>({artifact,download_url:'https://files.example.test/figure'}),validateStorageUrl:()=>{}},
+    project:'mesouq',campaign:cid,artifact,profile:'accuracy',fetcher:async()=>new Response(new Uint8Array(bytes.length),{headers:{'content-type':'image/png'}})}));
+});
+test('accuracy source figure identities must be unambiguous',()=>{
+  const {artifact}=actualAccuracyFigure(accuracyFigureNames[0]);
+  assert.throws(()=>benchmarkFigureArtifacts({artifacts:[artifact,{...artifact,id:'e'.repeat(32)}]},{profile:'accuracy'}),/Ambiguous/);
 });

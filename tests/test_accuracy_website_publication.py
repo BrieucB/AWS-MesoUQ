@@ -1,6 +1,7 @@
 """Accuracy UI publication: real conditional publisher, offline AWS fixture only."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -13,7 +14,7 @@ SPEC.loader.exec_module(fixtures)
 publication=fixtures.publication
 BASE_KEYS=(*publication.REMEMBERED_BASE_KEYS,*publication.REMEMBERED_NEW_KEYS)
 NEW_KEYS=("src/benchmark-accuracy.js","src/benchmark-workspace.js")
-ORDER=(*NEW_KEYS,"src/benchmark-lab.css","src/app.js")
+ORDER=("src/benchmark-figures.js",*NEW_KEYS,"src/benchmark-lab.css","src/app.js")
 WORKFLOW=(ROOT/".github/workflows/publish-accuracy-website.yml").read_text()
 
 def materialize(directory,assets):
@@ -42,11 +43,12 @@ class AccuracyPublicationTests(unittest.TestCase):
     def test_dependencies_precede_entry_and_all16_assets_are_verified(self):
         config=self.aws.objects[publication.CONFIG][0]
         result=self.publish()
-        self.assertEqual(result["conditional_writes"],4)
+        self.assertEqual(result["conditional_writes"],5)
         self.assertEqual(result["assets_verified"],16)
         self.assertEqual(self.writes(),list(ORDER))
-        self.assertTrue(all("--if-none-match" in row for row in self.puts()[:2]))
-        self.assertTrue(all("--if-match" in row for row in self.puts()[2:]))
+        for row in self.puts():
+            key=row[row.index("--key")+1]
+            self.assertIn("--if-none-match" if key in NEW_KEYS else "--if-match",row)
         self.assertEqual(self.aws.objects[publication.CONFIG][0],config)
         for key in BASE_KEYS:
             if key not in ORDER and key!=publication.CONFIG:
@@ -55,8 +57,8 @@ class AccuracyPublicationTests(unittest.TestCase):
         self.aws.store(NEW_KEYS[0],self.target[NEW_KEYS[0]])
         self.aws.store("src/benchmark-lab.css",self.target["src/benchmark-lab.css"])
         first=self.publish()
-        self.assertEqual(first["conditional_writes"],2)
-        self.assertEqual(self.writes(),[NEW_KEYS[1],"src/app.js"])
+        self.assertEqual(first["conditional_writes"],3)
+        self.assertEqual(self.writes(),["src/benchmark-figures.js",NEW_KEYS[1],"src/app.js"])
         self.aws.calls.clear()
         second=self.publish()
         self.assertEqual(second["conditional_writes"],0)
@@ -110,3 +112,47 @@ class AccuracyPublicationTests(unittest.TestCase):
         self.assertEqual({row["Action"] for row in allowed},{"s3:ListBucket","s3:GetObject","s3:PutObject"})
         write=next(row for row in allowed if row["Action"]=="s3:PutObject")
         self.assertEqual(set(write["Resource"]),{"arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/"+key for key in ORDER})
+
+    def test_publication_baseline_matches_the_last_successful_private_entry_release(self):
+        baseline="d3ea72e842e8e6dc24120e5edf62029362f01d5b"
+        self.assertEqual(WORKFLOW.count(baseline),2)
+        self.assertNotIn("dace4a501cb539d61ecad42e592f36b8666f2cc1",WORKFLOW)
+
+    def test_workflow_runs_the_actual_accuracy_build_gate_before_credentials(self):
+        command="python3 tests/test_accuracy_website_publication.py AccuracyBuildTests -v"
+        self.assertIn(command,WORKFLOW)
+        self.assertNotIn("PrivateEntryBuildTests",WORKFLOW)
+        self.assertLess(WORKFLOW.index(command),WORKFLOW.index("Obtain ephemeral website-only publication credentials"))
+        self.assertIn('AWS_MESOUQ_WEBSITE_CURRENT_DIST=',WORKFLOW)
+        self.assertIn('AWS_MESOUQ_WEBSITE_BASELINE_DIST=',WORKFLOW)
+
+@unittest.skipUnless(os.environ.get("AWS_MESOUQ_WEBSITE_CURRENT_DIST") and os.environ.get("AWS_MESOUQ_WEBSITE_BASELINE_DIST"),
+                     "Actual compiled build paths are supplied by the accuracy publication gate")
+class AccuracyBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.dist=Path(os.environ["AWS_MESOUQ_WEBSITE_CURRENT_DIST"])
+        self.baseline_dir=Path(os.environ["AWS_MESOUQ_WEBSITE_BASELINE_DIST"])
+        self.baseline=publication.read_build(self.baseline_dir,BASE_KEYS)
+        self.target=publication.read_build(self.dist,(*BASE_KEYS,*NEW_KEYS))
+    def test_actual_compiled_delta_is_exactly_the_reviewed_five_objects(self):
+        self.assertEqual(len(self.baseline),14)
+        self.assertEqual(len(self.target),16)
+        self.assertEqual(set(self.target)-set(self.baseline),set(NEW_KEYS))
+        changed={key for key in self.baseline if key!=publication.CONFIG and self.baseline[key]!=self.target[key]}
+        self.assertEqual(changed,set(ORDER)-set(NEW_KEYS))
+        self.assertEqual(publication.ACCURACY_ORDER,ORDER)
+    def test_actual_compiled_publication_preserves_runtime_and_replays_without_writes(self):
+        aws=fixtures.FakeAws(self.baseline)
+        runtime=aws.objects[publication.CONFIG][0]
+        result=publication.publish(self.dist,self.baseline_dir,"synthetic-bucket",fixtures.ROLE,aws=aws,profile="accuracy")
+        writes=[row[row.index("--key")+1] for row in aws.calls if row[:2]==("s3api","put-object")]
+        self.assertEqual(result["assets_verified"],16)
+        self.assertEqual(result["conditional_writes"],5)
+        self.assertEqual(writes,list(ORDER))
+        self.assertEqual(aws.objects[publication.CONFIG][0],runtime)
+        again=publication.publish(self.dist,self.baseline_dir,"synthetic-bucket",fixtures.ROLE,aws=aws,profile="accuracy")
+        self.assertEqual(again["conditional_writes"],0)
+        self.assertEqual(again["manifest_sha256"],result["manifest_sha256"])
+
+if __name__=="__main__":
+    unittest.main()

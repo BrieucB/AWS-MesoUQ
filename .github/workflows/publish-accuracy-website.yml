@@ -6,7 +6,7 @@ on:
       baseline_commit:
         description: Exact source commit matching the current website baseline
         required: true
-        default: 'dace4a501cb539d61ecad42e592f36b8666f2cc1'
+        default: 'd3ea72e842e8e6dc24120e5edf62029362f01d5b'
         type: string
       expected_source_commit:
         description: Exact reviewed main commit to publish
@@ -60,7 +60,7 @@ jobs:
               if (not re.fullmatch(r'[a-f0-9]{40}', baseline)
                       or not re.fullmatch(r'[a-f0-9]{40}', source)
                       or source != os.environ['GITHUB_SHA']
-                      or baseline != 'dace4a501cb539d61ecad42e592f36b8666f2cc1'):
+                      or baseline != 'd3ea72e842e8e6dc24120e5edf62029362f01d5b'):
                   raise ValueError()
               for value in (role, match[1], bucket):
                   print('::add-mask::' + value, flush=True)
@@ -102,7 +102,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           AWS_MESOUQ_WEBSITE_CURRENT_DIST="$RUNNER_TEMP/website-current/apps/aws_publishing/dist" \
           AWS_MESOUQ_WEBSITE_BASELINE_DIST="$RUNNER_TEMP/website-baseline/apps/aws_publishing/dist" \
-            python3 tests/test_private_entry_website_publication.py PrivateEntryBuildTests -v
+            python3 tests/test_accuracy_website_publication.py AccuracyBuildTests -v
       - name: Checkout the pinned official AWS credential client
         id: aws_action
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -155,6 +155,7 @@ jobs:
                   "Effect": "Allow",
                   "Action": "s3:PutObject",
                   "Resource": [
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-figures.js",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-accuracy.js",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.css",

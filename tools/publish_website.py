@@ -24,7 +24,7 @@ REMEMBERED_NEW_KEYS = ("src/site-session.js",)
 REMEMBERED_ORDER = (*REMEMBERED_NEW_KEYS, "src/client.js", "src/style.css", "src/app.js")
 PRIVATE_ENTRY_KEYS = (*REMEMBERED_BASE_KEYS, *REMEMBERED_NEW_KEYS)
 ACCURACY_NEW_KEYS = ("src/benchmark-accuracy.js", "src/benchmark-workspace.js")
-ACCURACY_ORDER = (*ACCURACY_NEW_KEYS, "src/benchmark-lab.css", "src/app.js")
+ACCURACY_ORDER = ("src/benchmark-figures.js", *ACCURACY_NEW_KEYS, "src/benchmark-lab.css", "src/app.js")
 PROFILES = {
     "accuracy": (PRIVATE_ENTRY_KEYS, ACCURACY_NEW_KEYS, ACCURACY_ORDER),
     "private-entry": (PRIVATE_ENTRY_KEYS, (), ("src/app.js",)),
