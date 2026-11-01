@@ -551,7 +551,23 @@ def dependency_v2_fixture(tmp_path, entry, environment):
         "exec(compile(open(p,'rb').read(),p,'exec',dont_inherit=True),d);"
         "print(json.dumps(d['isolated_dependency_snapshot'](json.load(sys.stdin))))")
     result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", command, str(entry)],
-        input=native.canonical(spec), check=True, capture_output=True, timeout=30)
+        input=native.canonical(spec), check=False, capture_output=True, timeout=30)
+    if result.returncode:
+        def path_metadata(path):
+            path = Path(path)
+            try:
+                observed = path.stat()
+                return {"path": str(path), "realpath": str(path.resolve()),
+                        "uid": observed.st_uid, "mode": oct(observed.st_mode & 0o7777)}
+            except OSError as error:
+                return {"path": str(path), "error": type(error).__name__}
+        pytest.fail("Isolated dependency fixture failed: " + json.dumps({
+            "returncode": result.returncode,
+            "interpreter": path_metadata(sys.executable),
+            "stdlib": [path_metadata(path) for path in spec["stdlib_paths"]],
+            "stdout_tail": result.stdout[-2048:].decode("utf-8", errors="replace"),
+            "stderr_tail": result.stderr[-4096:].decode("utf-8", errors="replace")},
+            sort_keys=True))
     return json.loads(result.stdout)
 
 
