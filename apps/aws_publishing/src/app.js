@@ -3,7 +3,7 @@ import {escapeHtml as h,curvePlot,intervalPlot} from './plots.js';
 import {configurationFor,approvedModel,outputArtifacts} from './defaults.js';
 import {posteriorArtifact,loadPosteriorImage} from './posterior.js';
 import {CurveEditor,editorMarkup,mountEditor} from './curve-editor.js';
-import {BenchmarkLab} from './benchmark-lab.js';
+import {BenchmarkLab} from './benchmark-workspace.js';
 import {SiteSession} from './site-session.js';
 const app=document.querySelector('#app');
 const state={config:null,preset:null,api:null,me:null,projects:[],project:'',model:'',jobs:[],artifacts:[],preview:null,result:null,posterior:{status:'idle',src:'',error:''},detail:null,loading:false,error:'',notice:'',tab:'workspace',diameter:'3.2',forceUnit:'uN',displacementUnit:'um',order:'force-displacement',submitKey:null,logoutFailed:false,sessionRenewable:false,sessionNotice:''};
