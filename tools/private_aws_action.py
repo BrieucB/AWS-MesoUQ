@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 ACTION_COMMIT = "e1253824e5c10ff9df46874f81ed3ec929e19cfd"
+MAX_SESSION_POLICY_CHARS = 2048
 
 
 def action_environment(phase, source=None):
@@ -27,8 +28,13 @@ def action_environment(phase, source=None):
     match = re.fullmatch(r"arn:aws:iam::([0-9]{12}):role/[A-Za-z0-9_+=,.@/-]+", role)
     if match is None or not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+", region) or not run.isdigit():
         raise ValueError("authentication-input-invalid")
-    if not isinstance(json.loads(policy), dict):
+    document = json.loads(policy)
+    if not isinstance(document, dict):
         raise ValueError("authentication-input-invalid")
+    # STS limits plaintext session policies to 2,048 characters, including JSON formatting.
+    policy = json.dumps(document, separators=(",", ":"), allow_nan=False)
+    if len(policy) > MAX_SESSION_POLICY_CHARS:
+        raise ValueError("authentication-session-policy-too-large")
     # Select OIDC explicitly; do not fall back to ambient owner/profile credentials.
     for name in list(env):
         if name.startswith("AWS_"):
@@ -81,8 +87,11 @@ def run(directory, phase, output=None):
         status = stream_action(["timeout", "--kill-after=5s",
                                 "180s" if phase == "configure" else "30s",
                                 "node", str(bundle)], env, output)
-    except Exception:
-        print(json.dumps({"status": "failed", "category": "authentication-client-failed"}), file=output)
+    except Exception as error:
+        category = ("authentication-session-policy-too-large"
+                    if isinstance(error, ValueError) and str(error) == "authentication-session-policy-too-large"
+                    else "authentication-client-failed")
+        print(json.dumps({"status": "failed", "category": category}), file=output)
         return 1
     if status:
         print(json.dumps({"status": "failed", "category": "scoped-authentication-failed"}), file=output)
