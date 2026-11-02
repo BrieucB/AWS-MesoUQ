@@ -2,6 +2,10 @@
 import importlib.util
 import io
 import json
+import re
+import tempfile
+import textwrap
+from unittest import mock
 from pathlib import Path
 import subprocess
 import unittest
@@ -94,6 +98,73 @@ class PrivateActionTests(unittest.TestCase):
                 values.update(patch)
                 with self.assertRaises((ValueError, json.JSONDecodeError)):
                     client.action_environment("configure", values)
+
+    def accuracy_policy(self, bucket_length=41):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/publish-accuracy-website.yml").read_text()
+        block = re.search(r"PUBLICATION_SESSION_POLICY: >-\n(.*?)\n        run:", workflow, re.S).group(1)
+        return textwrap.dedent(block).replace("${{ env.WEBSITE_BUCKET }}", "b" * bucket_length)
+
+    def test_accuracy_session_policy_fits_sts_without_permission_changes(self):
+        source = self.inputs()
+        source["PUBLICATION_SESSION_POLICY"] = self.accuracy_policy()
+        self.assertEqual(len(source["PUBLICATION_SESSION_POLICY"]), 2192)
+        env = client.action_environment("configure", source)
+        encoded = env["INPUT_INLINE-SESSION-POLICY"]
+        self.assertEqual(len(encoded), 1875)
+        self.assertLessEqual(len(encoded), 2048)
+        original = json.loads(source["PUBLICATION_SESSION_POLICY"])
+        self.assertEqual(json.loads(encoded), original)
+        self.assertEqual(len(original["Statement"][1]["Resource"]), 16)
+        self.assertEqual(len(original["Statement"][2]["Resource"]), 5)
+        self.assertEqual(original["Statement"][1]["Action"], "s3:GetObject")
+        self.assertEqual(original["Statement"][2]["Action"], "s3:PutObject")
+        self.assertNotIn("*", "".join(original["Statement"][1]["Resource"]))
+        self.assertNotIn("*", "".join(original["Statement"][2]["Resource"]))
+
+    def test_minification_preserves_whitespace_inside_json_strings(self):
+        policy = {"Statement": [{"Condition": {"StringEquals": {"synthetic": "value with spaces"}}}]}
+        source = self.inputs()
+        source["PUBLICATION_SESSION_POLICY"] = json.dumps(policy, indent=4)
+        env = client.action_environment("configure", source)
+        self.assertEqual(json.loads(env["INPUT_INLINE-SESSION-POLICY"]), policy)
+
+    def test_oversized_compact_policy_is_rejected_before_action(self):
+        source = self.inputs()
+        source["PUBLICATION_SESSION_POLICY"] = self.accuracy_policy(bucket_length=63)
+        with self.assertRaisesRegex(ValueError, "^authentication-session-policy-too-large$"):
+            client.action_environment("configure", source)
+
+    def test_exact_plaintext_limit_and_nonfinite_policy_fail_closed(self):
+        policy = {"Statement": [], "Padding": ""}
+        overhead = len(json.dumps(policy, separators=(",", ":")))
+        source = self.inputs()
+        policy["Padding"] = "x" * (2048 - overhead)
+        source["PUBLICATION_SESSION_POLICY"] = json.dumps(policy, indent=2)
+        self.assertEqual(len(client.action_environment("configure", source)["INPUT_INLINE-SESSION-POLICY"]), 2048)
+        policy["Padding"] += "x"
+        source["PUBLICATION_SESSION_POLICY"] = json.dumps(policy)
+        with self.assertRaisesRegex(ValueError, "^authentication-session-policy-too-large$"):
+            client.action_environment("configure", source)
+        source["PUBLICATION_SESSION_POLICY"] = '{"Statement":[],"invalid":NaN}'
+        with self.assertRaises(ValueError):
+            client.action_environment("configure", source)
+
+    def test_known_size_failure_is_categorized_without_private_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "dist").mkdir()
+            (root / "dist/index.js").write_text("// synthetic only")
+            def command(argv, **kwargs):
+                stdout = client.ACTION_COMMIT + "\n" if argv[-1] == "HEAD" else "v24.1.0\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+            output = io.StringIO()
+            with mock.patch.object(client.subprocess, "run", command), \
+                    mock.patch.object(client.shutil, "which", return_value="/synthetic/timeout"), \
+                    mock.patch.object(client, "action_environment", side_effect=ValueError("authentication-session-policy-too-large")), \
+                    mock.patch.object(client, "stream_action", side_effect=AssertionError("authentication must not start")):
+                self.assertEqual(client.run(root, "configure", output), 1)
+            self.assertEqual(json.loads(output.getvalue()), {
+                "status": "failed", "category": "authentication-session-policy-too-large"})
 
 
 if __name__ == "__main__":
