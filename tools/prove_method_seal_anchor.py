@@ -1,8 +1,11 @@
-"""Allocated synthetic proof of the native method-seal source/wire contract.
+"""Allocated source-backed ABI/postcommit regression for method sealing.
 
-No live campaign/context is loaded. Genuine source custody/admission/seal validators
-run against fresh toy fixtures. Only numeric fixtures and external transport I/O
-are substituted. Scheduler accounting for this proof remains separate.
+No live campaign/context is loaded. The source fixture doubles source-binding
+metadata, current-source publication binding, allocation identity/SLURM_JOB_ID,
+authority roots, toy worlds/normalization and TMCMC numerical execution. Adapter
+transport reads/publication are also substituted. Source custody/admission/seal
+validators themselves remain active. This is not production-context, seven-factor
+training or terminal-unmet qualification. Actual QA cost remains separate.
 """
 from __future__ import annotations
 import argparse
@@ -155,6 +158,12 @@ def main():
         "actual_qa_slurm_job_id":qa_job,"actual_qa_node":socket.gethostname(),
         "case_job_ids_and_costs":"synthetic protocol fixtures, not scheduler accounting",
         "current_campaign_or_context_loaded":False,"real_source_validators_preserved":True,
+        "qualification_scope":"isolated source-backed ABI/postcommit regression only",
+        "doubles":["P.source_binding", "PUB._current_source_binding", "P.require_allocation",
+            "SLURM_JOB_ID", "C._authority_base", "PUB._authority_base", "C.draw_worlds",
+            "native.fit_normalization", "tmcmc.run_case", "adapter._guide",
+            "adapter._pinned", "adapter._native_publication"],
+        "production_context_or_seven_factor_or_terminal_unmet_qualification":False,
         "fixture_setup":"reviewed genuine_admission setup stopped before first seal; dispatch performs first commit",
         "numerical_work":"established toy fixture substitutions only; no inference/reference generation",
         "source_fixture_sha256":hashlib.sha256(fixture_raw).hexdigest(),
