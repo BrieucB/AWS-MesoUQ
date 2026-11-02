@@ -4,7 +4,9 @@ import base64
 import json
 import logging
 import os
-from .api import Application, APIError
+from .api import APIError
+from .accuracy import (AccuracyApplication as Application, is_accuracy_path,
+    is_accuracy_event_request, request_wire_limit, policies_from_environment as _accuracy_policies)
 from .storage import DynamoStore, S3Objects, SQSNotifications
 
 LOG = logging.getLogger(__name__)
@@ -23,30 +25,7 @@ def application():
             validate_result,
         )
 
-        _application = Application(
-            DynamoStore(boto3.client("dynamodb"), os.environ["STATE_TABLE"]),
-            S3Objects(
-                boto3.client(
-                    "s3",
-                    endpoint_url=f"https://s3.{os.environ['AWS_REGION']}.amazonaws.com",
-                    config=Config(
-                        signature_version="s3v4",
-                        s3={"addressing_style": "virtual"},
-                        connect_timeout=2,
-                        read_timeout=3,
-                        retries={"mode": "standard", "total_max_attempts": 1},
-                    ),
-                ),
-                os.environ["DATA_BUCKET"],
-            ),
-            validate_configuration=validate_job_configuration,
-            validate_result=validate_result,
-            release_policy="v1",
-            benchmark_policies=json.loads(os.environ.get("BENCHMARK_POLICIES", "{}")),
-            notifications=SQSNotifications(
-                boto3.client("sqs"), os.environ["EVENT_QUEUE_URL"]
-            ),
-        )
+        _application = Application(DynamoStore(boto3.client('dynamodb'), os.environ['STATE_TABLE']), S3Objects(boto3.client('s3', endpoint_url=f"https://s3.{os.environ['AWS_REGION']}.amazonaws.com", config=Config(signature_version='s3v4', s3={'addressing_style': 'virtual'}, connect_timeout=2, read_timeout=3, retries={'mode': 'standard', 'total_max_attempts': 1})), os.environ['DATA_BUCKET']), validate_configuration=validate_job_configuration, validate_result=validate_result, release_policy='v1', benchmark_policies=json.loads(os.environ.get('BENCHMARK_POLICIES', '{}')), notifications=SQSNotifications(boto3.client('sqs'), os.environ['EVENT_QUEUE_URL']), accuracy_policies=_accuracy_policies())
     return _application
 
 
@@ -188,9 +167,15 @@ def handler(event, context):
                     401, "unauthenticated", "Verified application access token required"
                 )
         raw = event.get("body") or "{}"
+        limit = request_wire_limit(method, path)
+        if is_accuracy_event_request(method, path):
+            # Bound the gateway string before base64 decode/JSON allocation.
+            encoded_limit = 4 * ((limit + 2) // 3) if event.get("isBase64Encoded") else limit
+            if len(raw) > encoded_limit:
+                raise APIError(413, "request_too_large", "Request too large")
         if event.get("isBase64Encoded"):
             raw = base64.b64decode(raw, validate=True).decode("utf-8")
-        if len(raw.encode()) > 200_000:
+        if len(raw.encode()) > limit:
             raise APIError(413, "request_too_large", "Request too large")
         body = json.loads(
             raw,
@@ -200,7 +185,7 @@ def handler(event, context):
         )
         from .benchmark import is_benchmark_path
 
-        if is_benchmark_path(path):
+        if (is_benchmark_path(path) or is_accuracy_path(path)):
             global _benchmark_adapter
             if _benchmark_adapter is None:
                 from .benchmark_http import lambda_adapter

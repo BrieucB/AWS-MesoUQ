@@ -206,6 +206,8 @@ def create_app(application):
     async def event(campaign: Identifier, stage: Identifier, action: Literal["events", "artifacts"], payload: StageEvent, request: Request):
         return dispatch(request, payload.model_dump(mode="json", exclude_none=True))
 
+    from .accuracy_http import attach_accuracy_routes
+    attach_accuracy_routes(app, dispatch)
     return app
 
 

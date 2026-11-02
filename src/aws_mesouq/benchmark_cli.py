@@ -26,7 +26,8 @@ from aws_mesouq.connector.benchmark_supervisor import SourceWorkerSpec, WorkerSu
 
 MAX_COMMAND_BYTES = 8192
 MAX_MANIFEST_BYTES = 1024 * 1024
-WORKER_ENTRYPOINTS = {"benchmark-v1": "aws_mesouq/benchmark_cli.py"}
+WORKER_ENTRYPOINTS = {"benchmark-v1": "aws_mesouq/benchmark_cli.py",
+                      "benchmark-all": "aws_mesouq/benchmark_dispatch.py"}
 # Adding a worker kind requires reviewed source registration, never an RPC import path.
 
 
@@ -94,10 +95,18 @@ def _manifest(path):
     return _json(bytes(data))
 
 
-def _runtime_arguments(args):
+def _runtime_arguments(args, *, kind=None):
+    selected = kind or getattr(args, "worker_kind", "benchmark-v1")
+    if selected not in WORKER_ENTRYPOINTS:
+        raise BrokerError("unknown_worker_kind")
     values = ["managed-worker", "--api-url", args.api_url, "--project", args.project,
               "--operator-config", str(args.operator_config), "--journal", str(args.journal),
               "--poll-seconds", str(args.poll_seconds)]
+    if selected == "benchmark-all":
+        registry = getattr(args, "accuracy_contexts", None)
+        if registry is None:
+            raise BrokerError("accuracy_contexts_required")
+        values += ["--worker-kind", selected, "--accuracy-contexts", str(registry)]
     if args.ssh_host:
         values += ["--ssh-host", args.ssh_host, "--ssh-state-dir", str(args.ssh_state_dir)]
     else:
@@ -190,9 +199,16 @@ def _runtime_parser(parser):
     parser.add_argument("--ssh-state-dir", type=Path)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=20)
+    parser.add_argument("--worker-kind", choices=tuple(WORKER_ENTRYPOINTS), default="benchmark-v1")
+    parser.add_argument("--accuracy-contexts", type=Path)
 
 
 def _validate_runtime(parser, args):
+    if args.worker_kind == "benchmark-all":
+        if args.accuracy_contexts is None or not args.accuracy_contexts.is_absolute():
+            parser.error("Mixed benchmark dispatch requires an absolute reviewed accuracy-context registry")
+    elif args.accuracy_contexts is not None:
+        parser.error("Accuracy contexts require the registered mixed benchmark worker")
     if not math.isfinite(args.poll_seconds) or args.poll_seconds < 1:
         parser.error("Poll interval must be finite and at least one second")
     if args.ssh_host and args.ssh_state_dir is None:
@@ -226,7 +242,15 @@ def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=N
                 or transport.run(["hostname", "-f"]).strip() != operator["expected_host"]):
             raise BrokerError("worker_identity_mismatch")
         api = (api_factory or API)(args.api_url, tokens)
-        worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator)
+        policy = ({"propagate_auth_errors": True}
+                  if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all" else {})
+        worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator, **policy)
+        if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all":
+            from aws_mesouq.benchmark_dispatch import FairBenchmarkWorker, build_accuracy_worker
+            accuracy = build_accuracy_worker(api, slurm, journal, project=args.project,
+                                             registry_path=args.accuracy_contexts)
+            worker = FairBenchmarkWorker(worker, accuracy, journal, project=args.project,
+                                         owner_sub=journal.data["owner_sub"], stop=stop)
         while not stop.is_set():
             worker.sweep()
             if args.once:
@@ -337,9 +361,10 @@ def main(argv=None):
         arguments = _runtime_arguments(args)
         def load(value):
             return approved_worker(value["package_root"], value["manifest"],
-                                   value["binding"], arguments, kind=value["worker_kind"])
+                                   value["binding"], _runtime_arguments(args, kind=value["worker_kind"]),
+                                   kind=value["worker_kind"])
         specification = approved_worker(args.worker_package, args.worker_manifest,
-                                        args.worker_binding, arguments)
+                                        args.worker_binding, arguments, kind=args.worker_kind)
         # Borrow only: cold starts require an independently maintained normal guarded master.
         if args.ssh_host:
             from aws_mesouq.connector.ssh_session import SSHSession
