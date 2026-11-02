@@ -174,3 +174,9 @@ See the [infrastructure instructions](../infra/aws_publishing/README.md) for the
 scoped backend/static release workflows. Publish the verified immutable backend
 image and configuration before exposing the new browser interface. Preserve the
 current runtime configuration and unrelated website objects.
+
+## Method sealing accounting contract
+
+The scientific sealing validator returns an accounting wrapper containing the complete snapshot, its checksum, exact allocation membership and revision. Transport inputs and outputs retain the raw snapshot. The adapter compares the complete source wrapper with the wrapper derived from that raw snapshot, and retains the independent source-seal checksum and custody checks.
+
+A source seal can commit before a later adapter check fails. Such a failure does not authorize replay of a terminal task or replacement of its immutable evidence. Release validation uses `tools/prove_method_seal_anchor.py` inside an allocated, qualified scientific environment with explicit `--science-root`, `--baseline-adapter`, `--fixed-adapter` and fresh private `--output-root` paths. The proof uses fresh synthetic authority and toy numerical fixtures with genuine source admission/sealing validators; its scheduler cost is separate from campaign accounting. It retains the original postcommit failure, fixed producer/consumer success and corrupted-wrapper refusals.

@@ -1581,6 +1581,18 @@ def _source_receipt(control, directory, filename, role):
     return {role: {**_descriptor(control, directory, filename), "file": filename}}
 
 
+def _source_seal_anchor_matches(anchor, snapshot):
+    # The source validator authenticates the seal, states and full accounting.
+    # Its complete wrapper is distinct from the raw snapshot kept on the wire.
+    from aws_mesouq import benchmark_accuracy_protocol as protocol
+    protocol.validate_snapshot(snapshot)
+    expected = {"snapshot": snapshot, "snapshot_sha256": protocol.checksum(snapshot),
+        "allocation_ids": sorted(f"{row['allocation_id']}:{row['attempt']}"
+                                 for row in snapshot["allocations"]),
+        "revision": snapshot["revision"]}
+    return protocol.canonical(anchor) == protocol.canonical(expected)
+
+
 def _sealed(control, custody, runner, plan):
     pin = control["manifest"]["inputs"]["method_seal"]
     raw = _pinned(control, pin, "method-seal.json")
@@ -1588,7 +1600,8 @@ def _sealed(control, custody, runner, plan):
     authority = custody.sealed_evidence(control["manifest"]["request"], plan)
     if (authority["sealing_receipt"] != pin
             or verified["seal_sha256"] != control["manifest"]["pins"]["method_seal_sha256"]
-            or verified["accounting_anchor"] != control["manifest"]["inputs"]["sealed_allocation_anchor"]
+            or not _source_seal_anchor_matches(verified["accounting_anchor"],
+                control["manifest"]["inputs"]["sealed_allocation_anchor"])
             or raw["method_states"] != verified["method_states"]):
         raise NativeContractError("Global sealing authority or full source states differ")
     return raw, verified, authority
@@ -1942,7 +1955,8 @@ def _dispatch(control, clock):
         verified = runner.validate_sealing_receipt(m["request"], plan, seal)
         authority = custody.sealed_evidence(m["request"], plan)
         if (authority["sealing_receipt"] != seal
-                or verified["accounting_anchor"] != snapshot):
+                or verified["seal_sha256"] != seal["sha256"]
+                or not _source_seal_anchor_matches(verified["accounting_anchor"], snapshot)):
             raise NativeContractError("Source seal authority or full input ledger differs")
         outputs = {"method_seal": seal, "sealed_allocation_anchor": snapshot}
         pins.update(method_seal_sha256=seal["sha256"],
