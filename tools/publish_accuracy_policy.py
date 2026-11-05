@@ -16,7 +16,7 @@ import tempfile
 import time
 
 from publish_backend import CONFIG_KEYS, canonical, verify_source
-from publish_website import AwsCli, PublicationError, require
+from publish_website import PublicationError, require
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT / "services" / "aws_publishing"))
@@ -38,6 +38,25 @@ SOURCE_FILES = (
     "services/aws_publishing/aws_publishing/accuracy.py",
     "services/aws_publishing/aws_publishing/accuracy_policy_env.py",
 )
+
+
+class _SingleAttemptAws:
+    """Run one AWS CLI transport attempt without changing process-wide settings."""
+    def __call__(self, *arguments):
+        environment = dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_RETRY_MODE="standard")
+        try:
+            result = subprocess.run(
+                ["aws", "--no-cli-pager", "--output", "json", *map(str, arguments)],
+                env=environment, capture_output=True, text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise PublicationError("accuracy-policy-aws-command-failed") from None
+        require(result.returncode == 0, "accuracy-policy-aws-command-failed")
+        try:
+            value = json.loads(result.stdout or "{}")
+            require(isinstance(value, dict), "accuracy-policy-aws-response-invalid")
+            return value
+        except (ValueError, TypeError):
+            raise PublicationError("accuracy-policy-aws-response-invalid") from None
 
 
 def checksum(value):
@@ -135,7 +154,7 @@ def publish(guard, project_policies, *, apply=False, aws=None,
     """Perform at most one configuration update; ambiguous replies require reconciliation."""
     account, region, update = _validate_guard(guard, project_policies)
     (checkout_verifier or verify_checkout)(guard)
-    raw_aws = aws or AwsCli()
+    raw_aws = aws or _SingleAttemptAws()
 
     def call(*arguments):
         return raw_aws("--region", region, *arguments)

@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -269,6 +270,30 @@ class AccuracyPolicyPublicationTests(unittest.TestCase):
 
 
 class CheckoutAndCliTests(unittest.TestCase):
+    def test_aws_transport_overrides_inherited_retry_settings_without_global_changes(self):
+        completed = SimpleNamespace(returncode=0, stdout="{}")
+        with patch.dict(os.environ, {"AWS_MAX_ATTEMPTS": "9", "AWS_RETRY_MODE": "adaptive"}):
+            with patch.object(publication.subprocess, "run", return_value=completed) as invoke:
+                self.assertEqual(publication._SingleAttemptAws()(
+                    "lambda", "update-function-configuration", "--function-name", "fixture"), {})
+            self.assertEqual(invoke.call_count, 1)
+            environment = invoke.call_args.kwargs["env"]
+            self.assertEqual(environment["AWS_MAX_ATTEMPTS"], "1")
+            self.assertEqual(environment["AWS_RETRY_MODE"], "standard")
+            self.assertEqual(os.environ["AWS_MAX_ATTEMPTS"], "9")
+            self.assertEqual(os.environ["AWS_RETRY_MODE"], "adaptive")
+
+    def test_aws_transport_failure_and_timeout_make_one_attempt(self):
+        for result in (SimpleNamespace(returncode=1, stdout="{}"),
+                       subprocess.TimeoutExpired(["aws"], 120)):
+            with self.subTest(result=type(result).__name__):
+                options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+                with patch.object(publication.subprocess, "run", **options) as invoke:
+                    with self.assertRaises(publication.PublicationError):
+                        publication._SingleAttemptAws()(
+                            "lambda", "update-function-configuration", "--function-name", "fixture")
+                self.assertEqual(invoke.call_count, 1)
+
     def test_reviewed_checkout_requires_exact_head_clean_sources_and_codec_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
