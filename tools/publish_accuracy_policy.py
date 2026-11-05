@@ -15,11 +15,12 @@ import sys
 import tempfile
 import time
 
+SOURCE_ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(SOURCE_ROOT / "tools"), str(SOURCE_ROOT / "src"),
+                str(SOURCE_ROOT / "services" / "aws_publishing")]
+
 from publish_backend import CONFIG_KEYS, canonical, verify_source
 from publish_website import PublicationError, require
-
-SOURCE_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SOURCE_ROOT / "services" / "aws_publishing"))
 from aws_publishing.accuracy import AccuracyApplication
 from aws_publishing.accuracy_policy_env import decode_policies, encode_policies
 
@@ -78,6 +79,18 @@ def validate_policies(value):
     except (TypeError, ValueError):
         raise PublicationError("accuracy-policy-invalid") from None
     return deepcopy(value)
+
+
+def verify_import_origins():
+    expected = {
+        "publish_backend": SOURCE_ROOT / "tools" / "publish_backend.py",
+        "publish_website": SOURCE_ROOT / "tools" / "publish_website.py",
+        "aws_mesouq": SOURCE_ROOT / "src" / "aws_mesouq" / "__init__.py",
+        "aws_publishing.accuracy": SOURCE_ROOT / "services" / "aws_publishing" / "aws_publishing" / "accuracy.py",
+        "aws_publishing.accuracy_policy_env": SOURCE_ROOT / "services" / "aws_publishing" / "aws_publishing" / "accuracy_policy_env.py",
+    }
+    require(all(Path(getattr(sys.modules.get(name), "__file__", "")).resolve() == path
+                for name, path in expected.items()), "accuracy-policy-import-origin-conflict")
 
 
 def verify_checkout(guard, *, root=SOURCE_ROOT):
@@ -152,6 +165,7 @@ def _merge_policies(existing, update):
 def publish(guard, project_policies, *, apply=False, aws=None,
             image_verifier=None, checkout_verifier=None, sleep=time.sleep):
     """Perform at most one configuration update; ambiguous replies require reconciliation."""
+    verify_import_origins()
     account, region, update = _validate_guard(guard, project_policies)
     (checkout_verifier or verify_checkout)(guard)
     raw_aws = aws or _SingleAttemptAws()

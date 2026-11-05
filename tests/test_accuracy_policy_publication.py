@@ -270,6 +270,69 @@ class AccuracyPolicyPublicationTests(unittest.TestCase):
 
 
 class CheckoutAndCliTests(unittest.TestCase):
+    def test_isolated_clean_cli_help_invalid_input_and_read_only_plan(self):
+        environment = dict(os.environ, PYTHONPATH="/nonexistent-untrusted-site",
+                           PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1")
+        helper = ROOT / "tools" / "publish_accuracy_policy.py"
+        help_result = subprocess.run([sys.executable, "-I", "-B", str(helper), "--help"],
+                                     cwd="/tmp", env=environment, capture_output=True,
+                                     text=True, timeout=10)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--apply", help_result.stdout)
+        invalid = subprocess.run(
+            [sys.executable, "-I", "-B", str(helper), "--guard", "/nonexistent/guard.json",
+             "--project-policy", "/nonexistent/policy.json",
+             "--receipt-directory", "/nonexistent/receipts"],
+            cwd="/tmp", env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(invalid.returncode, 1)
+        self.assertNotIn("Traceback", invalid.stderr)
+        script = r"""
+import importlib.abc, importlib.util, json, pathlib, runpy, sys, tempfile
+class NoML(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in {"meso_uq","numpy","jax","torch","tensorflow","bayesflow"}:
+            raise RuntimeError("Numerical import forbidden")
+sys.meta_path.insert(0, NoML())
+root = pathlib.Path(sys.argv[1])
+entry = runpy.run_path(str(root/"tools/publish_accuracy_policy.py"), run_name="clean_activation_entry")
+entry["verify_import_origins"]()
+spec = importlib.util.spec_from_file_location("synthetic_activation_fixture",
+            root/"tests/test_accuracy_policy_publication.py")
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+aws = fixtures.FakeAws()
+scope = entry["publish"].__globals__
+scope["_SingleAttemptAws"] = lambda: aws
+scope["verify_checkout"] = lambda guard: None
+scope["verify_source"] = lambda *args: fixtures.IMAGE
+with tempfile.TemporaryDirectory() as temporary:
+    directory = pathlib.Path(temporary).resolve()
+    assert directory.resolve() == directory
+    for name,value in (("guard.json",fixtures.guard(aws)),("policy.json",fixtures.target_policy())):
+        path = directory/name
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+    result = entry["main"](["--guard",str(directory/"guard.json"),
+        "--project-policy",str(directory/"policy.json"),
+        "--receipt-directory",str(directory/"receipts")])
+    assert result == 0 and not aws.update_calls
+    receipt = json.loads((directory/"receipts/receipt.json").read_text())
+    assert receipt["status"] == "planned" and receipt["configuration_updates"] == 0
+print("isolated_plan_and_origins_passed")
+"""
+        planned = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT)],
+                                 cwd="/tmp", env=environment, capture_output=True,
+                                 text=True, timeout=10)
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        self.assertIn("isolated_plan_and_origins_passed", planned.stdout)
+
+    def test_cached_sdk_from_another_checkout_is_rejected_before_aws(self):
+        aws = FakeAws()
+        with patch.object(sys.modules["aws_mesouq"], "__file__", "/tmp/other-sdk/__init__.py"):
+            with self.assertRaisesRegex(publication.PublicationError, "import-origin-conflict"):
+                publish(aws)
+        self.assertFalse(aws.calls)
+
     def test_aws_transport_overrides_inherited_retry_settings_without_global_changes(self):
         completed = SimpleNamespace(returncode=0, stdout="{}")
         with patch.dict(os.environ, {"AWS_MAX_ATTEMPTS": "9", "AWS_RETRY_MODE": "adaptive"}):
@@ -326,7 +389,8 @@ class CheckoutAndCliTests(unittest.TestCase):
 
     def test_cli_uses_private_intent_receipt_and_refuses_reused_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
+            self.assertEqual(root.resolve(), root)
             expected, policy = guard(FakeAws()), target_policy()
             for name, value in (("guard.json", expected), ("policy.json", policy)):
                 path = root / name
@@ -342,6 +406,25 @@ class CheckoutAndCliTests(unittest.TestCase):
                 self.assertEqual(invoke.call_count, 1)
             for name in ("intent.json", "receipt.json"):
                 self.assertEqual((root / "receipts" / name).stat().st_mode & 0o777, 0o600)
+
+    def test_cli_rejects_symlinked_receipt_parent_before_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            target = root / "physical"
+            target.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(target, target_is_directory=True)
+            for name, value in (("guard.json", guard(FakeAws())), ("policy.json", target_policy())):
+                path = root / name
+                path.write_text(json.dumps(value))
+                path.chmod(0o600)
+            arguments = ["--guard", str(root / "guard.json"), "--project-policy",
+                         str(root / "policy.json"), "--receipt-directory", str(alias / "receipts")]
+            with patch.object(publication, "publish") as invoke:
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(publication.main(arguments), 1)
+                invoke.assert_not_called()
+            self.assertFalse((target / "receipts").exists())
 
     def test_private_input_mode_symlink_and_deep_json_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
