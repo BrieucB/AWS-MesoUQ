@@ -663,6 +663,22 @@ class _FrozenLoader(importlib.abc.Loader):
 
 
 class SourceGuard(importlib.abc.MetaPathFinder):
+    @staticmethod
+    def _package_inventory(package_root):
+        python, resources = set(), set()
+        for path in package_root.rglob("*"):
+            if path.is_symlink():
+                raise NativeContractError("Scientific source closure may not contain symlinks")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise NativeContractError("Scientific source closure requires regular files")
+            if path.suffix == ".py":
+                python.add(str(path))
+            elif not ("__pycache__" in path.parts and path.suffix == ".pyc"):
+                resources.add(str(path))
+        return python, resources
+
     def __init__(self, context, operator):
         self.context, self.operator = deepcopy(context), deepcopy(operator)
         self.snapshots, self.identities = {}, {}
@@ -692,8 +708,11 @@ class SourceGuard(importlib.abc.MetaPathFinder):
         if sources.get(str(entry)) != context["adapter_sha256"]:
             raise NativeContractError("Entrypoint differs from reviewed adapter")
         package_root = self.science_root / "meso_uq"
-        actual = {str(path) for path in package_root.rglob("*.py")}
+        actual, actual_resources = self._package_inventory(package_root)
         declared = {name for name in sources if package_root in Path(name).parents}
+        self.original_package_root = package_root
+        self.original_python_members = declared
+        self.original_resource_members = None
         if actual != declared:
             raise NativeContractError("Complete scientific package source closure required")
         binding = {str(Path(name).relative_to(package_root)): sources[name] for name in sorted(declared)}
@@ -702,7 +721,78 @@ class SourceGuard(importlib.abc.MetaPathFinder):
         for package, root in (("aws_mesouq", self.aws_root), ("meso_uq", self.science_root)):
             if str(root / package / "__init__.py") not in sources:
                 raise NativeContractError("Unbound native package initializer")
+        self.staging_lease = None
+        self.original_snapshots, self.original_identities = {}, {}
+        self.package_resources = {}
+        staging = operator.get("source_staging")
+        resources = operator.get("native_package_resources")
+        enabled = "verified_source_staging_v1" in context.get("capabilities", ())
+        if enabled != (staging is not None and resources is not None):
+            raise NativeContractError("Source staging capability and resource closure must agree")
+        if not enabled and (staging is not None or resources is not None):
+            raise NativeContractError("Source staging requires explicit context authorization")
+        if enabled:
+            if not isinstance(staging, dict) or set(staging) != {"root", "max_bytes", "max_namespaces"}:
+                raise NativeContractError("Bounded source staging policy required")
+            if not isinstance(resources, dict) or len(resources) > 4096:
+                raise NativeContractError("Bounded package resource closure required")
+            if actual_resources != set(resources):
+                raise NativeContractError("Complete scientific package resource closure required")
+            self.original_resource_members = set(resources)
+            helper = str(self.aws_root / "aws_mesouq" / "source_staging.py")
+            if helper not in self.snapshots:
+                raise NativeContractError("Source staging helper must be source-bound")
+            for name, expected in sorted(resources.items()):
+                path = _safe_absolute(name)
+                if package_root not in path.parents:
+                    raise NativeContractError("Package resource escaped its scientific closure")
+                _sha(expected)
+                with stable_bytes(path, maximum=MAX_SOURCE) as (raw, identity):
+                    if hashlib.sha256(raw).hexdigest() != expected:
+                        raise NativeContractError("Scientific package resource checksum changed")
+                    total += len(raw)
+                    if total > MAX_SOURCE:
+                        raise NativeContractError("Native source and resource closure exceeds its bound")
+                    self.package_resources[str(path)] = raw
+                    self.snapshots[str(path)], self.identities[str(path)] = raw, identity
         self.installed = False
+
+    def _stage_scientific_sources(self):
+        # Import only the authenticated standard-library AWS helper before any
+        # scientific package initializer can observe an unstaged source path.
+        from aws_mesouq.source_staging import stage_sources
+        if any(name == "meso_uq" or name.startswith("meso_uq.") for name in sys.modules):
+            raise NativeContractError("Scientific package imported before source staging")
+        source_root = self.science_root
+        files = {
+            str(Path(name).relative_to(source_root)): raw
+            for name, raw in self.snapshots.items()
+            if source_root in Path(name).parents
+        }
+        policy = self.operator["source_staging"]
+        lease = stage_sources(
+            policy["root"], self.context["runtime_profile_sha256"], files,
+            max_bytes=policy["max_bytes"], max_namespaces=policy["max_namespaces"])
+        try:
+            staged_snapshots, staged_identities = {}, {}
+            for name, raw in self.snapshots.items():
+                original = Path(name)
+                path = (lease.source_root / original.relative_to(source_root)
+                        if source_root in original.parents else original)
+                with stable_bytes(path, maximum=MAX_SOURCE) as (current, identity):
+                    if current != raw:
+                        raise NativeContractError("Staged source differs from authenticated bytes")
+                    staged_snapshots[str(path)] = raw
+                    staged_identities[str(path)] = identity
+            lease.verify()
+        except BaseException:
+            lease.close()
+            raise
+        self.original_snapshots, self.original_identities = self.snapshots, self.identities
+        self.snapshots, self.identities = staged_snapshots, staged_identities
+        self.science_root = lease.source_root
+        self.roots = (self.aws_root, self.science_root)
+        self.staging_lease = lease
 
     def install(self):
         if not self.installed:
@@ -718,6 +808,15 @@ class SourceGuard(importlib.abc.MetaPathFinder):
             os.environ["PYTHONNOUSERSITE"] = "1"
             sys.meta_path.insert(0, self)
             sys.dont_write_bytecode = True
+            try:
+                if self.operator.get("source_staging") is not None:
+                    self._stage_scientific_sources()
+                    sys.path[:] = [str(self.aws_root), str(self.science_root), *self.search_path]
+                    os.environ["PYTHONPATH"] = os.pathsep.join(sys.path)
+            except BaseException:
+                sys.meta_path.remove(self)
+                self.close()
+                raise
             self.installed = True
         return self
 
@@ -733,10 +832,25 @@ class SourceGuard(importlib.abc.MetaPathFinder):
             _FrozenLoader(origin, self.snapshots[origin], package), origin=origin, is_package=package)
 
     def check(self):
-        for name, raw in self.snapshots.items():
-            with stable_bytes(name, maximum=MAX_SOURCE) as (current, identity):
-                if current != raw or identity != self.identities[name]:
-                    raise NativeContractError("Native source changed during execution")
+        python, resources = self._package_inventory(self.original_package_root)
+        if (python != self.original_python_members
+                or (self.original_resource_members is not None
+                    and resources != self.original_resource_members)):
+            raise NativeContractError("Original scientific package membership changed")
+        for snapshots, identities in (
+                (self.original_snapshots, self.original_identities),
+                (self.snapshots, self.identities)):
+            for name, raw in snapshots.items():
+                with stable_bytes(name, maximum=MAX_SOURCE) as (current, identity):
+                    if current != raw or identity != identities[name]:
+                        raise NativeContractError("Native source changed during execution")
+        if self.staging_lease is not None:
+            self.staging_lease.verify()
+
+    def close(self):
+        if self.staging_lease is not None:
+            self.staging_lease.close()
+            self.staging_lease = None
 
 
 def _dependency_equivalent(current, expected):
@@ -860,18 +974,22 @@ def _validate_control_identity(control):
             or m["context_id"] != context["id"]
             or m["source_binding_sha256"] != context["source_binding_sha256"]
             or m["policy_sha256"] != context["policy_sha256"]
-            or m["reservation"]["native_cpus"] != context["native_cpus"]
-            or m["reservation"]["native_gpus"] != context["native_gpus"]):
+):
         raise NativeContractError("Native control differs from source-bound context/task")
-    _validate_window(control["window"], m["reservation"]["gpu_seconds"])
+    from aws_mesouq.benchmark_accuracy_protocol import validate_manifest_context
+    validate_manifest_context(m, context)
+    _validate_window(control["window"], m["reservation"].get("allocated_seconds", m["reservation"]["gpu_seconds"]))
     if control["runtime_environment"] != _runtime_environment(context, m):
         raise NativeContractError("Native cache/temp environment differs from source-bound policy")
     return control
 
 
 def _script(control, context, operator, window):
-    directives = {**operator["scheduler"], "cpus-per-task": context["native_cpus"],
-                  "gres": "gpu:1", "time": window["time"]}
+    resources = control["manifest"]["reservation"]
+    scheduler = operator["reference_scheduler"] if resources["native_gpus"] == 0 else operator["scheduler"]
+    directives = {**scheduler, "cpus-per-task": resources["native_cpus"], "time": window["time"]}
+    if resources["native_gpus"]:
+        directives["gres"] = "gpu:1"
     directory = Path(control["control_directory"])
     lines = ["#!/bin/bash", "#SBATCH --job-name=" + control["marker"],
         "#SBATCH --chdir=" + str(directory),
@@ -898,7 +1016,7 @@ def _script(control, context, operator, window):
     for variable, path in _runtime_environment(context, control["manifest"]).items():
         lines.extend(["install -d -m 0700 " + shlex.quote(path),
                       "export " + variable + "=" + shlex.quote(path)])
-    if control["manifest"]["kind"] in ("hnpe_initialize", "hnpe_advance"):
+    if control["manifest"]["kind"] in ("hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"):
         lines.append("export KERAS_BACKEND=jax")
     elif control["manifest"]["kind"] in ("guide_hnpe_inference", "confirmation_hnpe_inference"):
         lines.append("export KERAS_BACKEND=torch")
@@ -914,37 +1032,42 @@ def _prepare(payload):
     if context.get("enabled") is not True:
         raise NativeContractError("Disabled context cannot stage new native work")
     guard = _verify_profile(context, operator)
-    guard.install()
-    from aws_mesouq import benchmark_accuracy_protocol as protocol
-    protocol.validate_context(context)
-    manifest = protocol.validate_manifest(claim["task"]["manifest"])
-    if protocol.checksum(manifest) != claim["task"]["manifest_sha256"]:
-        raise NativeContractError("Prepared manifest checksum changed")
-    _validate_window(window, manifest["reservation"]["gpu_seconds"])
-    _require_scratch(context["native_root"])
-    quota = _home_preflight(context, manifest_sha256=claim["task"]["manifest_sha256"])
-    campaign, directory = _paths(context, manifest)
-    _mkdir(directory)
-    for path in _runtime_environment(context, manifest).values():
-        _mkdir(path)
-    control = {"schema": CONTROL_SCHEMA, "context": deepcopy(context), "operator": deepcopy(operator),
-        "manifest": deepcopy(manifest), "manifest_sha256": claim["task"]["manifest_sha256"],
-        "marker": claim["task"]["marker"], "window": deepcopy(window),
-        "control_directory": str(directory), "campaign_directory": str(campaign),
-        "runtime_environment": _runtime_environment(context, manifest)}
-    _validate_control_identity(control)
-    immutable_json(directory / "control.json", control)
-    immutable_json(directory / "request.json", manifest["request"])
-    immutable_json(directory / "task-manifest.json", manifest)
-    script = _script(control, context, operator, window).encode()
-    path = immutable(directory / "run.sh", script)
-    guard.check()
-    sha = hashlib.sha256(script).hexdigest()
-    return {"script_path": path, "script_sha256": sha,
-        "intent_sha256": checksum({"manifest_sha256": control["manifest_sha256"],
-            "script_sha256": sha, "marker": control["marker"], "window": window}),
-        "marker": control["marker"], "window": deepcopy(window),
-        "preflight": _preflight_snapshot(context, control["manifest_sha256"], quota)}
+    try:
+        guard.install()
+        from aws_mesouq import benchmark_accuracy_protocol as protocol
+        protocol.validate_context(context)
+        manifest = protocol.validate_manifest(claim["task"]["manifest"])
+        if protocol.checksum(manifest) != claim["task"]["manifest_sha256"]:
+            raise NativeContractError("Prepared manifest checksum changed")
+        _validate_window(window, manifest["reservation"].get("allocated_seconds", manifest["reservation"]["gpu_seconds"]))
+        _require_scratch(context["native_root"])
+        quota = _home_preflight(context, manifest_sha256=claim["task"]["manifest_sha256"])
+        campaign, directory = _paths(context, manifest)
+        _mkdir(directory)
+        for path in _runtime_environment(context, manifest).values():
+            _mkdir(path)
+        control = {"schema": CONTROL_SCHEMA, "context": deepcopy(context), "operator": deepcopy(operator),
+            "manifest": deepcopy(manifest), "manifest_sha256": claim["task"]["manifest_sha256"],
+            "marker": claim["task"]["marker"], "window": deepcopy(window),
+            "control_directory": str(directory), "campaign_directory": str(campaign),
+            "runtime_environment": _runtime_environment(context, manifest)}
+        _validate_control_identity(control)
+        immutable_json(directory / "control.json", control)
+        immutable_json(directory / "request.json", manifest["request"])
+        immutable_json(directory / "task-manifest.json", manifest)
+        script = _script(control, context, operator, window).encode()
+        path = immutable(directory / "run.sh", script)
+        sha = hashlib.sha256(script).hexdigest()
+        return {"script_path": path, "script_sha256": sha,
+            "intent_sha256": checksum({"manifest_sha256": control["manifest_sha256"],
+                "script_sha256": sha, "marker": control["marker"], "window": window}),
+            "marker": control["marker"], "window": deepcopy(window),
+            "preflight": _preflight_snapshot(context, control["manifest_sha256"], quota)}
+    finally:
+        try:
+            guard.check()
+        finally:
+            guard.close()
 
 
 # Fixed standard-library bootstrap. It authenticates the entrypoint before
@@ -1247,7 +1370,7 @@ def _decimal(value, name):
     return int(value)
 
 
-def _parse_sacct(raw, *, job_id, marker, user, cpus, cancelling):
+def _parse_sacct(raw, *, job_id, marker, user, cpus, cancelling, gpus_expected=1):
     """Parse only the exact root allocation; unknown costs remain unknown."""
     if not isinstance(raw, str) or len(raw) > MAX_METADATA:
         raise NativeContractError("Bounded SACCT output required")
@@ -1299,14 +1422,17 @@ def _parse_sacct(raw, *, job_id, marker, user, cpus, cancelling):
     account = {"source": "sacct", "site": "karolina", "slurm_job_id": job_id,
         "state": state, "elapsed_seconds": elapsed,
         "allocated_gpus": gpus, "cpu_seconds": cpu_seconds}
-    if gpus == 0:
+    if gpus == gpus_expected and allocated_cpus == cpus and cpu_seconds == elapsed * cpus:
+        if gpus_expected == 0:
+            account["allocated_cpus"] = allocated_cpus
+    elif gpus == 0:
         if not (cancelling and state == "CANCELLED" and elapsed == 0
                 and cpu_seconds == 0 and allocated_cpus == 0
                 and f[5] == "" and f[7] in ("Unknown", "None", "")):
             raise NativeContractError("Unknown or nonzero allocation cannot become zero")
         account["preallocation_cancellation"] = {
             "start": None, "allocated_cpus": 0, "allocated_tres": ""}
-    elif gpus != 1 or allocated_cpus != cpus or cpu_seconds != elapsed * cpus:
+    else:
         raise NativeContractError("Terminal resource accounting differs from context")
     if state == "REVOKED":
         raise NativeContractError("Unadmitted terminal native state")
@@ -1327,7 +1453,8 @@ def _observe(payload):
                   or task["status"] == "cancelling")
     observation = _parse_sacct(result.stdout, job_id=job,
         marker=control["marker"], user=context["native_user"],
-        cpus=context["native_cpus"], cancelling=cancelling)
+        cpus=control["manifest"]["reservation"]["native_cpus"], cancelling=cancelling,
+        gpus_expected=control["manifest"]["reservation"]["native_gpus"])
     if observation is not None and observation["state"] == "running":
         try:
             clock = _read_json(Path(control["control_directory"]) / "allocation-clock.json")
@@ -1361,7 +1488,10 @@ def remote_request(payload):
             return _publication(payload, guard)
         return _read_artifact(payload)
     finally:
-        guard.check()
+        try:
+            guard.check()
+        finally:
+            guard.close()
 
 
 def _inside_campaign(control, path):
@@ -1535,7 +1665,8 @@ def _planner(control, runner, custody, plan, guide_root, costs, clock):
         progress["attempts"] = projected
         extra = {"attempts": entries}
     decision = runner.plan_next_effort(m["request"], plan, method,
-                                       progress=progress, accounting=costs)
+                                       progress=progress, accounting=costs,
+        maximum_parallel_factors=3 if "bounded_factor_parallelism_v1" in control["context"]["capabilities"] else 1)
     target = decision.get("effort_target", decision.get("population_size"))
     if decision["action"] == "record_failed_guide":
         # This branch retains a failed native population in the source guide
@@ -1550,14 +1681,21 @@ def _planner(control, runner, custody, plan, guide_root, costs, clock):
             bank_receipt_sha256=m["inputs"]["phase_receipts"]["guide_preparation"]["sha256"])
         history.append(evidence)
     eligible = []
-    for row in decision.get("eligible_factors", []):
+    for row in decision.get("eligible_factors", [])[:decision.get("maximum_parallel_factors", 1)]:
         factor = row["factor"]
         previous = m["inputs"]["progress"].get(factor)
-        eligible.append({"factor": factor, "operation": row["action"],
-            "to_update": None if row["action"] == "initialize" else row["requested_to_update"],
+        operation = row["action"]
+        if operation == "initialize" and "fused_factor_lifecycle_v1" in control["context"]["capabilities"]:
+            operation = "initialize_advance"
+        eligible.append({"factor": factor, "operation": operation,
+            "to_update": None if operation == "initialize" else row["requested_to_update"],
             "expected_state_sha256": row["expected_parent_state_sha256"],
             "generation": 0 if previous is None else previous["generation"]})
-    maximum = (decision["eligible_factors"][0]["maximum_reserved_gpu_seconds"]
+        if "bounded_factor_parallelism_v1" in control["context"]["capabilities"]:
+            eligible[-1]["maximum_reserved_gpu_seconds"] = row["maximum_reserved_gpu_seconds"]
+    maximum = (max(row.get("maximum_reserved_gpu_seconds",
+                           decision["eligible_factors"][0]["maximum_reserved_gpu_seconds"])
+                   for row in eligible)
                if eligible else decision.get("maximum_reserved_gpu_seconds", 0))
     proposal = {"method": method, "action": decision["action"],
         "effort_target": target, "candidate_sha256": decision.get("candidate_sha256"),
@@ -1635,12 +1773,12 @@ def _native_publication(control, job, *, outputs, pins, receipts, checks,
         "output_pins": deepcopy(pins), "proposal": deepcopy(proposal),
         "scientific_status": scientific_status, "qualification": qualification,
         "checks": checks, "artifacts": deepcopy(artifacts)}
-    if m["kind"] in {"hnpe_initialize", "hnpe_advance"}:
+    if m["kind"] in {"hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"}:
         wrapper["outputs"]["progress"].pop("native_receipt")
     directory = Path(control["control_directory"])
     immutable_json(directory / "native-receipt.json", wrapper)
     native = _descriptor(control, directory, "native-receipt.json")
-    if m["kind"] in {"hnpe_initialize", "hnpe_advance"}:
+    if m["kind"] in {"hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"}:
         outputs = deepcopy(outputs)
         outputs["progress"]["native_receipt"] = deepcopy(native)
     result = {"schema": protocol.RESULT_SCHEMA, **_binding(control, job),
@@ -1684,27 +1822,27 @@ def _load_control(path):
 
 def _allocated(control, *, execute=False, factor_cli=False):
     guard = _verify_profile(control["context"], control["operator"], allocated=True)
-    guard.install()
-    from aws_mesouq import benchmark_accuracy_protocol as protocol
-    from aws_mesouq.adapters.benchmark import allocation_clock, run_science
-    m, window = protocol.validate_manifest(control["manifest"]), control["window"]
-    if protocol.checksum(m) != control["manifest_sha256"]:
-        raise NativeContractError("Allocated native manifest checksum changed")
-    _, directory = _paths(control["context"], m)
-    _require_scratch(directory)
-    if str(directory) != control["control_directory"]:
-        raise NativeContractError("Allocated native path differs")
-    quota = _home_preflight(control["context"],
-                            manifest_sha256=control["manifest_sha256"])
-    clock = allocation_clock({"runtime_clock_policy": "allocation_deadline_v1",
-        "allocated_seconds": window["allocated_seconds"],
-        "internal_seconds": window["internal_seconds"]})
-    immutable_json(directory / "allocation-clock.json", clock)
-    immutable_json(directory / ("quota-check-" + uuid.uuid4().hex + ".json"),
-        {**_preflight_snapshot(control["context"], control["manifest_sha256"], quota),
-         "slurm_job_id": clock["slurm_job_id"],
-         "boundary": "allocated_stage" if execute else "allocated_supervisor"})
     try:
+        guard.install()
+        from aws_mesouq import benchmark_accuracy_protocol as protocol
+        from aws_mesouq.adapters.benchmark import allocation_clock, run_science
+        m, window = protocol.validate_manifest(control["manifest"]), control["window"]
+        if protocol.checksum(m) != control["manifest_sha256"]:
+            raise NativeContractError("Allocated native manifest checksum changed")
+        _, directory = _paths(control["context"], m)
+        _require_scratch(directory)
+        if str(directory) != control["control_directory"]:
+            raise NativeContractError("Allocated native path differs")
+        quota = _home_preflight(control["context"],
+                                manifest_sha256=control["manifest_sha256"])
+        clock = allocation_clock({"runtime_clock_policy": "allocation_deadline_v1",
+            "allocated_seconds": window["allocated_seconds"],
+            "internal_seconds": window["internal_seconds"]})
+        immutable_json(directory / "allocation-clock.json", clock)
+        immutable_json(directory / ("quota-check-" + uuid.uuid4().hex + ".json"),
+            {**_preflight_snapshot(control["context"], control["manifest_sha256"], quota),
+             "slurm_job_id": clock["slurm_job_id"],
+             "boundary": "allocated_stage" if execute else "allocated_supervisor"})
         if execute:
             return _dispatch(control, clock)
         command = [control["operator"]["python_bin"], "-I", "-S", "-B", "-c",
@@ -1714,11 +1852,14 @@ def _allocated(control, *, execute=False, factor_cli=False):
         return run_science(command, str(directory),
                            clock["watchdog_deadline_epoch"])
     finally:
-        guard.check()
+        try:
+            guard.check()
+        finally:
+            guard.close()
 
 
 def _training(control, clock, plan, guide_root, runner, custody):
-    """Use precisely the maintained initialize-factor/advance-factor CLI."""
+    """Use the maintained durable factor lifecycle commands."""
     from meso_uq.benchmark_lab.accuracy_v2 import cli, training
     m = control["manifest"]
     factor = m["factor"]
@@ -1726,7 +1867,9 @@ def _training(control, clock, plan, guide_root, runner, custody):
     directory = Path(control["control_directory"])
     action_path = directory / "factor-action.json"
     _mkdir(lineage.parent)
-    operation = "initialize-factor" if m["kind"] == "hnpe_initialize" else "advance-factor"
+    operation = {"hnpe_initialize": "initialize-factor",
+        "hnpe_initialize_advance": "initialize-and-advance-factor",
+        "hnpe_advance": "advance-factor"}[m["kind"]]
     args = [operation, "--request", str(directory / "request.json"),
         "--campaign-instance-id", m["campaign_instance_id"], "--factor", factor,
         "--lineage-dir", str(lineage), "--case-plan", str(guide_root / "case-plan.json"),
@@ -1741,8 +1884,9 @@ def _training(control, clock, plan, guide_root, runner, custody):
         "--allocation-deadline-epoch", str(clock["allocation_deadline_epoch"]),
         "--receipt-output", str(action_path)]
     if operation == "advance-factor":
-        args.extend(["--expected-state-sha256", m["expected_state_sha256"],
-                     "--to-update", str(m["effort_target"])])
+        args.extend(["--expected-state-sha256", m["expected_state_sha256"]])
+    if operation != "initialize-factor":
+        args.extend(["--to-update", str(m["effort_target"])])
     status = cli.main(args)
     if status not in (None, 0):
         raise NativeContractError("Maintained scientific CLI failed")
@@ -1786,6 +1930,11 @@ def _dispatch(control, clock):
     job, kind = clock["slurm_job_id"], m["kind"]
     if provenance.source_binding()["sha256"] != m["source_binding_sha256"]:
         raise NativeContractError("Allocated scientific source binding changed")
+    if kind in {"hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"} and "persistent_execution_cache_v1" in control["context"]["capabilities"]:
+        policy.configure_native_execution(execution_cache={
+            **control["operator"]["execution_cache"],
+            "source_sha256": control["context"]["source_binding_sha256"],
+            "runtime_identity": control["context"]["runtime_profile_sha256"]})
     source_clock = provenance.StageClock(control["window"]["internal_seconds"],
         allocation_job_id=job, allocation_start_epoch=clock["allocation_start_epoch"],
         allocation_deadline_epoch=clock["allocation_deadline_epoch"])
@@ -1879,7 +2028,7 @@ def _dispatch(control, clock):
     guide_root, plan, guide_pin = _guide(control, custody, runner)
     preparation = {"directory": str(guide_root), "receipt_sha256": guide_pin["sha256"]}
     costs = runner.validate_allocation_snapshot(m["request"], plan, snapshot)
-    if kind in {"hnpe_initialize", "hnpe_advance"}:
+    if kind in {"hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"}:
         progress, receipts = _training(control, clock, plan, guide_root, runner, custody)
         checks.update({"campaign_authority", "native_state", "optimizer_predecessor",
                        "case_plan", "normalization", "validation"})
@@ -2269,7 +2418,7 @@ def _publication(payload, guard):
     if wrapper["binding"] != _binding(control, job):
         raise NativeContractError("Native source validation producer changed")
     expected_outputs = deepcopy(wrapper["outputs"])
-    if control["manifest"]["kind"] in {"hnpe_initialize", "hnpe_advance"}:
+    if control["manifest"]["kind"] in {"hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"}:
         expected_outputs["progress"]["native_receipt"] = publication["result"]["native_receipt"]
     for name, expected in (("outputs", expected_outputs),
                            ("output_pins", wrapper["output_pins"]),

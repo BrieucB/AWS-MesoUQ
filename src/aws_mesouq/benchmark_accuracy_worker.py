@@ -457,8 +457,9 @@ class AccuracyWorker:
 
     def _prepare(self, entry):
         context = self._validate_existing(entry)
-        reservation = entry["claim"]["task"]["manifest"]["reservation"]["gpu_seconds"]
-        window = funded_window(reservation, reservation)
+        reservation = entry["claim"]["task"]["manifest"]["reservation"]
+        seconds = reservation.get("allocated_seconds", reservation["gpu_seconds"])
+        window = funded_window(seconds, seconds)
         if window is None:
             # No native RPC, HTTP submission intent or scheduler call is allowed.
             # Activation remains disabled until the source sticky-unfundable

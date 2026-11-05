@@ -8,7 +8,7 @@ The immutable profile w2-rms0p1-central90-2048-244of256-v1 uses eight guide worl
 
 The authenticated project API is rooted at /v1/projects/{project}/benchmark-accuracy. It provides capabilities, campaigns, task pages, cancellation, archival, accounting, results and private artifact descriptors. Signed connector claims/events use /v1/benchmark-connector/accuracy. The API validates and stores source results; scientific calculations and performance measurements run on Karolina.
 
-The shared owner controller uses its existing enrolled journal/key and a reviewed typed execution-context registry. The benchmark-all worker alternates fixed-budget and accuracy-target work. See [Shared benchmark dispatch](benchmark-dispatch.md) for authentication, lease and registry boundaries. Coordination windows provide backpressure; Slurm enforces physical resource availability.
+The shared owner controller uses its existing enrolled journal/key and a reviewed typed execution-context registry. The benchmark-all worker alternates fixed-budget and accuracy-target work. See [Shared benchmark dispatch](benchmark-dispatch.md) for authentication, lease and registry boundaries. Coordination windows provide backpressure; Slurm enforces physical resource availability. Runtime capability/profile selection and its accounting/storage rules are described in [Runtime optimization profiles](benchmark-runtime-optimizations.md).
 
 ## Costs, results and recovery
 

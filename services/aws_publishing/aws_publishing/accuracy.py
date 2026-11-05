@@ -318,12 +318,12 @@ class AccuracyRoutes:
             # Numerical-reference settings and native window are independent
             # of either method's experimental compute allowance.
             return 14400
-        if kind in ("hnpe_initialize", "hnpe_advance", "guide_preparation"):
+        if kind in ("hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance", "guide_preparation"):
             return campaign["request"]["controls"]["hnpe"]["training_budget"]
         return 600
 
     def _new_task(self, state, campaign, kind, *, method=None, factor=None,
-                  effort_target=None, generation=0, previous=None, inputs=None, maximum=None):
+                  effort_target=None, generation=0, previous=None, inputs=None, maximum=None, parallel=False):
         if campaign["status"] in ("cancelling", "cancelled", "failed", "completed"):
             return None
         context = self._context(campaign)
@@ -335,15 +335,25 @@ class AccuracyRoutes:
         protocol.integer(amount, "task reservation", 1)
         if owner in ("hnpe", "tmcmc"):
             account = campaign["accounting"][owner]
+            active = [r for r in self._rows(state, campaign) if r["method"] == owner
+                      and r["status"] not in protocol.TERMINAL]
             if account["unknown_allocations"]:
-                _error(409, "accuracy_method_allocation_active", "Reserve one source-selected native method action, then reconcile before replanning")
+                safe_wave = (parallel and owner == "hnpe"
+                    and "bounded_factor_parallelism_v1" in context["capabilities"]
+                    and kind in ("hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance")
+                    and len(active) < 3 and account["unknown_allocations"] == len(active)
+                    and all(r["kind"] in ("hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance")
+                            and r["factor"] != factor for r in active))
+                if not safe_wave:
+                    _error(409, "accuracy_method_allocation_active", "Current source-selected actions must close before replanning")
             remaining = campaign["request"]["budget"]["method_gpu_seconds"] - account["settled_gpu_seconds"] - account["reserved_gpu_seconds"]
             if factor is not None:
                 factor_used = sum((r["allocated_gpu_seconds"] or 0) + r["reserved_gpu_seconds"]
                     for r in self._rows(state, campaign) if r["method"] == "hnpe" and r["factor"] == factor)
                 remaining = min(remaining, campaign["request"]["controls"]["hnpe"]["training_budget"] - factor_used)
             amount = min(amount, remaining)
-            if amount < 1 or (kind != "guide_preparation" and amount < 60):
+            minimum = 180 if parallel and factor is not None else 60
+            if amount < 1 or (kind != "guide_preparation" and amount < minimum):
                 return None
         if kind == "guide_preparation" and amount < 60:
             campaign["status"] = "blocked_unfundable"
@@ -363,15 +373,17 @@ class AccuracyRoutes:
         campaign["task_count"] += 1
         ident = f"t{campaign['task_count']:08d}-{uuid4().hex}"
         allocation = f"a{campaign['task_count']:08d}-{uuid4().hex}"
+        resources = protocol.task_resources(context, kind)
+        reserved_gpu_seconds = amount * resources["native_gpus"]
         row = {"allocation_id": allocation, "attempt": 1, "method": owner,
             "kind": allocation_kind, "factor": factor, "status": "claimed",
             "slurm_job_id": None, "allocated_gpu_seconds": None,
-            "allocated_cpu_seconds": None, "reserved_gpu_seconds": amount,
+            "allocated_cpu_seconds": None, "reserved_gpu_seconds": reserved_gpu_seconds,
             "not_submitted": False}
         state["accuracy_allocations"][campaign["id"] + ":" + allocation] = {"row": row, "task_id": ident}
         campaign["ledger_revision"] += 1
         account = campaign["accounting"][owner]
-        account["reserved_gpu_seconds"] += amount
+        account["reserved_gpu_seconds"] += reserved_gpu_seconds
         account["unknown_allocations"] += 1
         snapshot = self._snapshot(state, campaign)
         task = {"id": ident, "campaign_id": campaign["id"], "kind": kind,
@@ -394,13 +406,14 @@ class AccuracyRoutes:
             "source_binding_sha256": campaign["source_binding_sha256"],
             "policy_sha256": context["policy_sha256"], "accounting": snapshot,
             "input_ledger_sha256": protocol.checksum(snapshot),
-            "reservation": {"allocation_id": allocation, "gpu_seconds": amount,
-                "native_cpus": context["native_cpus"], "native_gpus": context["native_gpus"]},
+            "reservation": {"allocation_id": allocation, "gpu_seconds": reserved_gpu_seconds,
+                **resources, **({"allocated_seconds": amount} if resources["native_gpus"] == 0 else {})},
             "pins": {**deepcopy(campaign["pins"]), "candidate_sha256":
                 campaign["methods"][task["method"]]["candidate_sha256"]
                 if task["method"] in ("hnpe", "tmcmc") else None},
             "inputs": deepcopy(inputs or {})}
         protocol.validate_manifest(manifest)
+        protocol.validate_manifest_context(manifest, context)
         task["manifest"], task["manifest_sha256"] = manifest, protocol.checksum(manifest)
         state["accuracy_tasks"][campaign["id"] + ":" + ident] = task
         campaign["active_tasks"].append(ident)
@@ -675,7 +688,8 @@ class AccuracyRoutes:
             return
         context = self._context(campaign)
         gpu, cpu = protocol.validate_accounting(accounting, job_id=task["slurm_job_id"],
-            task_status=task["status"], expected_cpus=context["native_cpus"],
+            task_status=task["status"], expected_cpus=task["manifest"]["reservation"]["native_cpus"],
+            expected_gpus=task["manifest"]["reservation"]["native_gpus"],
             allow_preallocation=campaign["status"] == "cancelling")
         row = self._row(state, campaign, task)
         if task["accounting_closed"]:
@@ -1008,27 +1022,41 @@ class AccuracyRoutes:
                 or (action == "evaluate_guide" and method == "hnpe")) and proposal["maximum_reserved_gpu_seconds"] < 60:
             raise ValueError("Source action cannot fund the approved 60-second native minimum")
         if action == "train_factor":
-            chosen = proposal["eligible_factors"][0]
-            factor = chosen["factor"]
-            previous = campaign["progress"].get(factor)
-            if chosen["operation"] == "initialize":
-                if previous is not None or any(r["method"] == "hnpe" and r["factor"] == factor
-                    and not r["not_submitted"] for r in current):
-                    _error(409, "accuracy_lineage_reinitialization", "An allocated lineage cannot be initialized again")
-                kind = "hnpe_initialize"
-            else:
-                if previous is None or previous["state_sha256"] != chosen["expected_state_sha256"] or previous["generation"] != chosen["generation"]:
-                    _error(409, "accuracy_generation_conflict", "Native optimizer predecessor changed")
-                kind = "hnpe_advance"
-            made = self._new_task(state, campaign, kind, method="hnpe", factor=factor,
-                effort_target=chosen["to_update"], generation=chosen["generation"],
-                previous=chosen["expected_state_sha256"],
-                maximum=proposal["maximum_reserved_gpu_seconds"],
-                inputs=self._inputs(state, campaign, planner_receipt=result["native_receipt"]))
-            if made is None:
-                info["status"], campaign["status"] = "budget_blocked", "blocked"
-            else:
+            capabilities = self._context(campaign)["capabilities"]
+            parallel = "bounded_factor_parallelism_v1" in capabilities
+            if not parallel and any("maximum_reserved_gpu_seconds" in row for row in proposal["eligible_factors"]):
+                raise ValueError("Per-factor wave funding requires its approved source capability")
+            chosen_factors = proposal["eligible_factors"][:3 if parallel else 1]
+            made = []
+            for chosen in chosen_factors:
+                factor = chosen["factor"]
+                previous = campaign["progress"].get(factor)
+                if chosen["operation"] in ("initialize", "initialize_advance"):
+                    if previous is not None or any(r["method"] == "hnpe" and r["factor"] == factor
+                        and not r["not_submitted"] for r in current):
+                        _error(409, "accuracy_lineage_reinitialization", "An allocated lineage cannot be initialized again")
+                    if chosen["operation"] == "initialize_advance":
+                        if "fused_factor_lifecycle_v1" not in capabilities:
+                            raise ValueError("Combined factor lifecycle was not approved for this context")
+                        kind = "hnpe_initialize_advance"
+                    else:
+                        kind = "hnpe_initialize"
+                else:
+                    if previous is None or previous["state_sha256"] != chosen["expected_state_sha256"] or previous["generation"] != chosen["generation"]:
+                        _error(409, "accuracy_generation_conflict", "Native optimizer predecessor changed")
+                    kind = "hnpe_advance"
+                child = self._new_task(state, campaign, kind, method="hnpe", factor=factor,
+                    effort_target=chosen["to_update"], generation=chosen["generation"],
+                    previous=chosen["expected_state_sha256"],
+                    maximum=chosen.get("maximum_reserved_gpu_seconds", proposal["maximum_reserved_gpu_seconds"]),
+                    parallel=parallel,
+                    inputs=self._inputs(state, campaign, planner_receipt=result["native_receipt"]))
+                if child is not None:
+                    made.append(child)
+            if made:
                 info["status"] = "training"
+            else:
+                info["status"], campaign["status"] = "budget_blocked", "blocked"
         elif action == "fresh_tmcmc_attempt":
             if method != "tmcmc" or proposal["effort_target"] not in (2048, 4096, 8192):
                 raise ValueError("Bounded fresh TMCMC population required")
@@ -1057,8 +1085,9 @@ class AccuracyRoutes:
                 raise ValueError("A source-derived terminal wrapper is required")
             info["status"] = proposal["status"]
             campaign["phase_receipts"]["freeze_" + method] = deepcopy(result["native_receipt"])
-            if all(campaign["methods"][m]["status"] in ("frozen", "terminal_unmet", "no_candidate")
-                   for m in ("hnpe", "tmcmc")):
+            if "guide_reference" in campaign["phase_receipts"] and all(
+                    campaign["methods"][m]["status"] in ("frozen", "terminal_unmet", "no_candidate")
+                    for m in ("hnpe", "tmcmc")):
                 if not self._has_active(state, campaign, kind="method_seal"):
                     self._new_task(state, campaign, "method_seal", inputs=self._inputs(state, campaign))
         elif action == "record_failed_guide":
@@ -1091,10 +1120,14 @@ class AccuracyRoutes:
             if value["generation"] != task["generation"] + 1 or updates > task["effort_target"]:
                 raise ValueError("Native advance generation/target mismatch")
             previous = campaign["progress"].get(task["factor"])
-            if previous is None or previous["state_sha256"] != task["expected_state_sha256"]:
-                _error(409, "accuracy_generation_conflict", "Current optimizer predecessor changed")
-            if updates < previous["optimizer_updates"]:
-                raise ValueError("Committed native optimizer progress cannot regress")
+            if task["kind"] == "hnpe_initialize_advance":
+                if previous is not None or task["expected_state_sha256"] is not None:
+                    _error(409, "accuracy_generation_conflict", "Combined lifecycle requires a fresh native lineage")
+            else:
+                if previous is None or previous["state_sha256"] != task["expected_state_sha256"]:
+                    _error(409, "accuracy_generation_conflict", "Current optimizer predecessor changed")
+                if updates < previous["optimizer_updates"]:
+                    raise ValueError("Committed native optimizer progress cannot regress")
             if updates < task["effort_target"] and (not isinstance(value.get("stop_reason"), str) or not value["stop_reason"]):
                 raise ValueError("Partial native progress requires an authenticated native stop reason")
         if value["candidate_sha256"] is not None:
@@ -1294,6 +1327,17 @@ class AccuracyRoutes:
         return protocol.validate_result(record["result"], task["manifest"],
             native_root=self._context(campaign)["native_root"] + "/" + campaign["id"])
 
+    def _queue_guide_compile(self, state, campaign, method, effort_target, method_result):
+        pending = campaign.setdefault("pending_guide_compiles", {})
+        pending[method] = {"effort_target": effort_target, "method_result": deepcopy(method_result)}
+        if "guide_reference" not in campaign["phase_receipts"]:
+            campaign["methods"][method]["status"] = "awaiting_reference"
+            return
+        waiting = pending.pop(method)
+        self._new_task(state, campaign, "guide_compile", method=method,
+            effort_target=waiting["effort_target"],
+            inputs=self._inputs(state, campaign, method_result=waiting["method_result"]))
+
     def complete(self, state, campaign, task, raw):
         result = protocol.validate_result(raw, task["manifest"],
             native_root=self._context(campaign)["native_root"] + "/" + campaign["id"])
@@ -1337,16 +1381,27 @@ class AccuracyRoutes:
             campaign["pins"] = {**deepcopy(result["output_pins"]), "candidate_sha256": None}
             campaign["phase"] = "guide_reference"
             self._new_task(state, campaign, "guide_reference", inputs=self._inputs(state, campaign))
+            if "independent_guide_reference_v1" in self._context(campaign)["capabilities"]:
+                campaign["phase"] = "methods"
+                for method in ("hnpe", "tmcmc"):
+                    self._plan(state, campaign, method, "frozen_guide_banks")
         else:
             campaign["pins"] = {**deepcopy(result["output_pins"]), "candidate_sha256": None}
             if kind == "guide_reference":
                 campaign["phase_receipts"]["guide_reference"] = deepcopy(result["native_receipt"])
                 campaign["phase"] = "methods"
                 for method in ("hnpe", "tmcmc"):
-                    self._plan(state, campaign, method, "initial_guide")
+                    pending = campaign.get("pending_guide_compiles", {}).get(method)
+                    if pending is not None:
+                        self._queue_guide_compile(state, campaign, method, **deepcopy(pending))
+                    elif campaign["methods"][method]["status"] not in ("frozen", "terminal_unmet", "no_candidate"):
+                        self._plan(state, campaign, method, "initial_guide")
+                if all(campaign["methods"][m]["status"] in ("frozen", "terminal_unmet", "no_candidate")
+                       for m in ("hnpe", "tmcmc")) and not self._has_active(state, campaign, kind="method_seal"):
+                    self._new_task(state, campaign, "method_seal", inputs=self._inputs(state, campaign))
             elif kind == "plan":
                 self._planner_action(state, campaign, task, result)
-            elif kind in ("hnpe_initialize", "hnpe_advance"):
+            elif kind in ("hnpe_initialize", "hnpe_advance", "hnpe_initialize_advance"):
                 self._training_progress(campaign, task, result)
                 self._plan(state, campaign, "hnpe", "factor_committed")
             elif kind == "guide_tmcmc_attempt":
@@ -1356,13 +1411,9 @@ class AccuracyRoutes:
                 if attempt in campaign["tmcmc_attempts"]:
                     raise ValueError("Fresh TMCMC attempt was replayed")
                 campaign["tmcmc_attempts"].append(attempt)
-                self._new_task(state, campaign, "guide_compile", method="tmcmc",
-                    effort_target=task["effort_target"], inputs=self._inputs(state, campaign,
-                    method_result=attempt))
+                self._queue_guide_compile(state, campaign, "tmcmc", task["effort_target"], attempt)
             elif kind == "guide_hnpe_inference":
-                self._new_task(state, campaign, "guide_compile", method="hnpe",
-                    effort_target=task["effort_target"], inputs=self._inputs(state, campaign,
-                    method_result=deepcopy(result["native_receipt"])))
+                self._queue_guide_compile(state, campaign, "hnpe", task["effort_target"], result["native_receipt"])
             elif kind == "guide_compile":
                 history = outputs.get("guide_history")
                 self._set_history(campaign, task["method"], history)

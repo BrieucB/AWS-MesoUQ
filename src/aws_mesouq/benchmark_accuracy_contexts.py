@@ -50,7 +50,7 @@ def validate_operator(value, context):
     required = {"repository", "python_bin", "python_sha256", "adapter_path", "environment_script",
                 "environment_sha256", "dependency_manifest_path", "dependency_manifest_sha256",
                 "native_python_sources", "expected_host", "scheduler", "allowed_upload_origins"}
-    protocol.keys(value, required, {"dependency_overlays"})
+    protocol.keys(value, required, {"dependency_overlays", "reference_scheduler", "source_staging", "native_package_resources", "execution_cache"})
     for name in ("repository", "python_bin", "adapter_path", "environment_script", "dependency_manifest_path"):
         if not isinstance(value[name], str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", value[name]):
             raise ValueError("Reviewed native runtime paths must be safe absolute paths")
@@ -86,6 +86,31 @@ def validate_operator(value, context):
         "adapters/__init__.py", "adapters/benchmark.py", "adapters/benchmark_accuracy.py")}
     required_sources |= {str(science_root / "meso_uq" / name) for name in (
         "__init__.py", "benchmark_lab/__init__.py", "benchmark_lab/accuracy_v2/__init__.py")}
+    staging = value.get("source_staging")
+    resources = value.get("native_package_resources")
+    if ("verified_source_staging_v1" in context["capabilities"]) != (staging is not None and resources is not None):
+        raise ValueError("Verified source staging requires its explicit resource closure and bounds")
+    if staging is not None:
+        protocol.keys(staging, {"root", "max_bytes", "max_namespaces"})
+        root = PurePosixPath(staging["root"]) if isinstance(staging["root"], str) else PurePosixPath("/")
+        if (not root.is_absolute() or str(root) != staging["root"] or ".." in root.parts
+                or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(root)) or str(root) == "/"
+                or any(root == own or root in own.parents or own in root.parents for own in (aws_root, science_root))):
+            raise ValueError("Private source staging requires an independent canonical root")
+        protocol.integer(staging["max_bytes"], "staged source byte bound", 1, 536870912)
+        protocol.integer(staging["max_namespaces"], "staged source namespace bound", 1, 64)
+        if not isinstance(resources, dict) or not 1 <= len(resources) <= 1024:
+            raise ValueError("Bounded exact native package resource closure required")
+        for name, digest in resources.items():
+            path = PurePosixPath(name) if isinstance(name, str) else PurePosixPath("/")
+            if (not path.is_absolute() or str(path) != name or ".." in path.parts
+                    or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(path))
+                    or science_root / "meso_uq" not in path.parents or path.suffix in (".py", ".pyc")):
+                raise ValueError("Native resource escaped the reviewed scientific package")
+            protocol.sha(digest, "native resource SHA")
+        required_sources.add(str(aws_root / "aws_mesouq/source_staging.py"))
+    elif resources is not None:
+        raise ValueError("Native resource closure requires verified source staging")
     if not required_sources <= set(sources):
         raise ValueError("Native entrypoint/package dependency closure is incomplete")
     for source, digest in sources.items():
@@ -108,6 +133,32 @@ def validate_operator(value, context):
     for field in ("account", "qos", "mem"):
         if not isinstance(scheduler[field], str) or not re.fullmatch(r"[A-Za-z0-9_:.+-]+", scheduler[field]):
             raise ValueError("Unsafe native scheduler profile")
+    reference_scheduler = value.get("reference_scheduler")
+    if ("cpu_reference_resources_v1" in context["capabilities"]) != (reference_scheduler is not None):
+        raise ValueError("CPU references require their reviewed scheduler profile")
+    if reference_scheduler is not None:
+        protocol.keys(reference_scheduler, {"partition", "account", "qos", "mem"})
+        for field in reference_scheduler:
+            if not isinstance(reference_scheduler[field], str) or not re.fullmatch(r"[A-Za-z0-9_:.+-]+", reference_scheduler[field]):
+                raise ValueError("Unsafe native CPU reference scheduler profile")
+    cache = value.get("execution_cache")
+    if ("persistent_execution_cache_v1" in context["capabilities"]) != (cache is not None):
+        raise ValueError("Persistent execution caching requires an explicit approved policy")
+    if cache is not None:
+        protocol.keys(cache, {"root", "max_bytes", "max_namespaces"})
+        root = PurePosixPath(cache["root"]) if isinstance(cache["root"], str) else PurePosixPath("/")
+        if (not root.is_absolute() or str(root) != cache["root"] or ".." in root.parts
+                or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(root)) or str(root) == "/"
+                or any(root == own or root in own.parents or own in root.parents for own in (aws_root, science_root))):
+            raise ValueError("Execution cache requires an independent canonical private root")
+        protocol.integer(cache["max_bytes"], "execution cache byte bound", 0, 2**40)
+        if 0 < cache["max_bytes"] < 65536:
+            raise ValueError("Execution cache must fund bounded native metadata and payloads")
+        protocol.integer(cache["max_namespaces"], "execution cache namespace bound", 1, 64)
+        if staging is not None:
+            staged_root = PurePosixPath(staging["root"])
+            if root == staged_root or root in staged_root.parents or staged_root in root.parents:
+                raise ValueError("Source staging and execution cache require disjoint roots")
     origins = value["allowed_upload_origins"]
     if not isinstance(origins, list) or not 1 <= len(origins) <= 8 or len(set(origins)) != len(origins):
         raise ValueError("Exact reviewed private upload origins are required")
@@ -190,9 +241,9 @@ class AccuracyExecutionContexts:
             raise ValueError("Claim campaign, request or task identity changed")
         if (manifest["source_binding_sha256"] != context["source_binding_sha256"]
                 or manifest["policy_sha256"] != context["policy_sha256"]
-                or manifest["reservation"]["native_cpus"] != context["native_cpus"]
-                or manifest["reservation"]["native_gpus"] != context["native_gpus"]):
+):
             raise ValueError("Claim differs from its reviewed scientific execution context")
+        protocol.validate_manifest_context(manifest, context)
         protocol.integer(task["revision"], "task revision")
         lease = task["lease"]
         protocol.keys(lease, {"token", "epoch", "connector_id", "expires_at"})
