@@ -86,10 +86,22 @@ test('returning to the list fences a late detail refresh',async()=>{
   s.lab.backToList();gate.resolve({campaign});await pending;await new Promise(resolve=>setImmediate(resolve));
   assert.equal(s.lab.detail,null);assert.equal(s.lab.result,null);
 });
-test('task progress displays only supplied verified updates and losses, including zero',()=>{
-  const s=setup();s.lab.detail=copy(campaign);s.lab.detail.tasks=[{kind:'hnpe_advance',factor:'acoustic_1',attempt:1,status:'succeeded',progress:{optimizer_updates:0,validation_nll:-2.25,best_validation_nll:-2.5,stop_reason:'<script>'}}];
-  const html=s.lab.detailView();assert.match(html,/Last verified progress/);assert.match(html,/Optimizer updates: 0/);assert.match(html,/Best validation NLL: -2.5/);assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);
-});
+for(const kind of ['hnpe_advance','hnpe_initialize_advance']){
+  test(kind+' progress preserves supplied generation, updates, losses and allocation cost',()=>{
+    const s=setup();s.lab.detail=copy(campaign);
+    const progress={generation:1,optimizer_updates:0,validation_nll:-2.25,best_validation_nll:-2.5,stop_reason:'<script>'};
+    const task={kind,factor:'acoustic_1',attempt:1,status:'succeeded',generation:0,effort_target:1920,progress};
+    const cost={allocated_gpu_seconds:90,reserved_gpu_seconds:0,cpu_seconds:1440,unknown_allocations:0};
+    s.lab.detail.tasks=[task];s.lab.detail.accounting.methods.hnpe=copy(cost);
+    const before=copy(s.lab.detail),html=s.lab.detailView();
+    assert.ok(html.includes('<td>'+kind.replaceAll('_',' ')+'</td>'));
+    assert.match(html,/Last verified progress/);assert.match(html,/Optimizer updates: 0/);
+    assert.match(html,/Validation NLL: -2.25/);assert.match(html,/Best validation NLL: -2.5/);
+    assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);
+    assert.ok(html.includes('<th scope="row">HNPE</th><td>—</td><td>90</td><td>0</td><td>1,440</td><td>0</td>'));
+    assert.deepEqual(s.lab.detail,before);
+  });
+}
 
 
 test('campaign and task pagination preserve supplied ordering, escape cursors and remove duplicates',async()=>{
