@@ -280,7 +280,8 @@ def test_frozen_loader_compiles_verified_bytes_not_disk_or_pyc(tmp_path):
 def test_script_has_one_gpu_no_untrusted_import_path_and_bounded_clock(tmp_path):
     control = {"marker": "mqacc-safe", "control_directory": str(tmp_path),
                "manifest": {"kind": "hnpe_advance", "campaign_instance_id": "a"*32,
-                            "task_id": "t00000001-"+"b"*32}}
+                            "task_id": "t00000001-"+"b"*32,
+                             "reservation": {"native_cpus": 4, "native_gpus": 1}}}
     context = {"native_cpus": 4, "native_root": str(tmp_path / "native"),
                "adapter_sha256": "c"*64}
     operator = {"scheduler": {"partition": "qgpu", "account": "safe",
@@ -762,6 +763,8 @@ def test_low_quota_prepare_has_no_staging_side_effect(tmp_path, monkeypatch):
     from aws_mesouq import benchmark_accuracy_protocol as protocol
     class Guard:
         def install(self): return self
+        def check(self): return None
+        def close(self): return None
     monkeypatch.setattr(native, "_verify_profile", lambda *a, **kw: Guard())
     monkeypatch.setattr(protocol, "validate_context", lambda value: value)
     monkeypatch.setattr(protocol, "validate_manifest", lambda value: value)
@@ -780,6 +783,7 @@ def test_low_quota_prepare_has_no_staging_side_effect(tmp_path, monkeypatch):
 def test_observation_recovery_does_not_require_new_work_quota(monkeypatch):
     class Guard:
         def check(self): return None
+        def close(self): return None
     monkeypatch.setattr(native, "_verify_profile", lambda *a, **kw: Guard())
     monkeypatch.setattr(native, "_home_preflight", lambda *a, **kw:
         pytest.fail("Quota eligibility blocked cost reconciliation"))
@@ -832,9 +836,10 @@ def test_explicit_bytecode_disabled_bootstrap_creates_no_home_cache(tmp_path):
 def native_control_fixture(tmp_path):
     context = {"id": "c"*64, "enabled": True, "native_root": str(tmp_path / "native"),
         "source_binding_sha256": "d"*64, "policy_sha256": "e"*64,
-        "native_cpus": 4, "native_gpus": 1, "runtime_profile_sha256": native.checksum({})}
+        "native_cpus": 4, "native_gpus": 1, "capabilities": [],
+        "runtime_profile_sha256": native.checksum({})}
     manifest = {"campaign_instance_id": "a"*32, "task_id": "t00000001-"+"b"*32,
-        "attempt": 1, "context_id": context["id"],
+        "attempt": 1, "kind": "guide_preparation", "context_id": context["id"],
         "source_binding_sha256": context["source_binding_sha256"],
         "policy_sha256": context["policy_sha256"],
         "reservation": {"allocation_id": "allocation", "gpu_seconds": 60,
@@ -1518,6 +1523,7 @@ def real_protocol_native_control(tmp_path, monkeypatch, nonce, *, portable_recor
     class Guard:
         def install(self): return self
         def check(self): return None
+        def close(self): return None
     monkeypatch.setattr(native, "_verify_profile", lambda *a, **kw: Guard())
     # Placement/quota are exercised independently by their existing tests.
     monkeypatch.setattr(native, "_require_scratch", lambda path: Path(path))
@@ -1654,3 +1660,63 @@ def test_portable_codec_keeps_real_wire_nonce_binding_before_any_output(tmp_path
     with pytest.raises(ValueError, match="scientific/transport identity mismatch"):
         native.main(["--execute-stage", str(path)])
     assert reached == [] and records == []
+
+
+def test_cpu_reference_sacct_accepts_real_cpu_cost_without_a_gpu():
+    result = native._parse_sacct(sacct(tres="cpu=4,mem=4G,node=1"),
+        job_id="123", marker="mqacc-safe", user="tester", cpus=4,
+        cancelling=False, gpus_expected=0)
+    assert result["accounting"]["allocated_gpus"] == 0
+    assert result["accounting"]["cpu_seconds"] == 240
+    assert "preallocation_cancellation" not in result["accounting"]
+
+
+@pytest.mark.parametrize("tres,cpus,cpu", [
+    ("cpu=4,gres/gpu=1", "4", "240"), ("cpu=8", "8", "480"), ("cpu=4", "4", "239"),
+])
+def test_cpu_reference_sacct_rejects_wrong_allocation_resources(tres, cpus, cpu):
+    with pytest.raises(native.NativeContractError):
+        native._parse_sacct(sacct(tres=tres, cpus=cpus, cpu=cpu),
+            job_id="123", marker="mqacc-safe", user="tester", cpus=4,
+            cancelling=False, gpus_expected=0)
+
+
+def test_cpu_reference_script_uses_approved_cpu_profile_and_no_gpu_request(tmp_path):
+    control = {"marker": "mqacc-safe", "control_directory": str(tmp_path),
+        "manifest": {"kind": "guide_reference", "campaign_instance_id": "a" * 32,
+            "task_id": "t00000001-" + "b" * 32,
+            "reservation": {"native_cpus": 4, "native_gpus": 0}}}
+    context = {"native_root": str(tmp_path / "native"), "adapter_sha256": "c" * 64}
+    operator = {"scheduler": {"partition": "qgpu", "account": "gpu", "qos": "normal", "mem": "4G"},
+        "reference_scheduler": {"partition": "qcpu", "account": "cpu", "qos": "normal", "mem": "4G"},
+        "environment_script": "/safe/env.sh", "environment_sha256": "a" * 64,
+        "python_bin": "/safe/python", "adapter_path": "/safe/aws_mesouq/adapters/benchmark_accuracy.py",
+        "repository": "/safe/science"}
+    script = native._script(control, context, operator, {"time": "00:01:00"})
+    assert "#SBATCH --partition=qcpu" in script
+    assert "#SBATCH --account=cpu" in script
+    assert "#SBATCH --cpus-per-task=4" in script
+    assert "#SBATCH --gres" not in script
+
+
+def test_native_prepare_releases_source_lease_even_when_preflight_fails(tmp_path, monkeypatch):
+    from aws_mesouq import benchmark_accuracy_protocol as protocol
+    events = []
+    class Guard:
+        def install(self): events.append("install")
+        def check(self): events.append("check")
+        def close(self): events.append("close")
+    monkeypatch.setattr(native, "_verify_profile", lambda *args, **kwargs: Guard())
+    monkeypatch.setattr(protocol, "validate_context", lambda value: value)
+    monkeypatch.setattr(protocol, "validate_manifest", lambda value: value)
+    monkeypatch.setattr(native, "_require_scratch", lambda value: value)
+    monkeypatch.setattr(native, "_home_preflight", lambda *args, **kwargs:
+        (_ for _ in ()).throw(native.NativeContractError("preflight stopped")))
+    manifest = {"reservation": {"native_gpus": 0, "gpu_seconds": 0, "allocated_seconds": 120}}
+    claim = {"task": {"manifest": manifest, "manifest_sha256": native.checksum(manifest)}}
+    window = {"allocated_seconds": 120, "internal_seconds": 120,
+              "runtime_clock_policy": "allocation_deadline_v1", "time": "00:02:00"}
+    with pytest.raises(native.NativeContractError, match="preflight stopped"):
+        native._prepare({"context": {"enabled": True, "native_root": str(tmp_path)},
+            "operator": {}, "claim": claim, "window": window})
+    assert events == ["install", "check", "close"]

@@ -32,6 +32,7 @@ KINDS = {
     "guide_reference": ("reference", "guide_reference"),
     "plan": ("overhead", "metrics"),
     "hnpe_initialize": ("hnpe", "hnpe_initialize"),
+    "hnpe_initialize_advance": ("hnpe", "hnpe_initialize_advance"),
     "hnpe_advance": ("hnpe", "hnpe_advance"),
     "guide_hnpe_inference": ("hnpe", "guide_hnpe_inference"),
     "guide_tmcmc_attempt": ("tmcmc", "guide_tmcmc_attempt"),
@@ -117,7 +118,7 @@ def validate_context(value: Any) -> dict:
         "runtime_profile_sha256", "native_root", "archive_root", "native_user",
         "native_cpus", "native_gpus", "maximum_artifact_bytes", "maximum_total_artifact_bytes",
         "maximum_artifact_files", "capabilities", "allowed_artifacts"}
-    keys(value, required, {"stage_reservations"})
+    keys(value, required, {"stage_reservations", "reference_resources"})
     windows = value.get("stage_reservations", {})
     if not isinstance(windows, dict) or set(windows) - set(KINDS):
         raise ValueError("Invalid approved native stage windows")
@@ -146,6 +147,14 @@ def validate_context(value: Any) -> dict:
         raise ValueError("Invalid source capabilities")
     if value["enabled"] and not REQUIRED_CAPABILITIES <= set(capabilities):
         raise ValueError("Final source custody capabilities are required")
+    reference = value.get("reference_resources")
+    if ("cpu_reference_resources_v1" in capabilities) != (reference is not None):
+        raise ValueError("CPU references require an explicit approved resource profile")
+    if reference is not None:
+        keys(reference, {"native_cpus", "native_gpus"})
+        integer(reference["native_cpus"], "reference CPU count", 1, value["native_cpus"])
+        if type(reference["native_gpus"]) is not int or reference["native_gpus"] != 0:
+            raise ValueError("CPU reference resource profile requires zero GPUs")
     allowed = value["allowed_artifacts"]
     if not isinstance(allowed, dict) or set(allowed) - set(KINDS):
         raise ValueError("Invalid curated artifact policy")
@@ -157,6 +166,20 @@ def validate_context(value: Any) -> dict:
     if context_id(value) != value["id"]:
         raise ValueError("Context checksum mismatch")
     return deepcopy(value)
+
+
+def task_resources(context: dict, kind: str) -> dict:
+    if kind in {"guide_reference", "confirmation_reference"} and "cpu_reference_resources_v1" in context["capabilities"]:
+        return deepcopy(context["reference_resources"])
+    return {name: context[name] for name in ("native_cpus", "native_gpus")}
+
+
+def validate_manifest_context(manifest: dict, context: dict) -> None:
+    resources = task_resources(context, manifest["kind"])
+    if any(manifest["reservation"][name] != value for name, value in resources.items()):
+        raise ValueError("Task resources differ from the reviewed execution context")
+    if manifest["kind"] == "hnpe_initialize_advance" and "fused_factor_lifecycle_v1" not in context["capabilities"]:
+        raise ValueError("Combined factor lifecycle requires its approved source capability")
 
 
 def public_context(value: dict) -> dict:
@@ -228,10 +251,10 @@ def archive_signing_bytes(owner_sub: str, body: dict) -> bytes:
 
 
 def validate_accounting(value: Any, *, job_id: str, task_status: str,
-                        expected_cpus: int, allow_preallocation: bool) -> tuple[int, int]:
+                        expected_cpus: int, allow_preallocation: bool, expected_gpus: int = 1) -> tuple[int, int]:
     base = {"source", "site", "slurm_job_id", "state", "elapsed_seconds",
             "allocated_gpus", "cpu_seconds"}
-    keys(value, base, {"preallocation_cancellation"})
+    keys(value, base, {"preallocation_cancellation", "allocated_cpus"})
     if value["source"] != "sacct" or value["site"] != "karolina" or value["slurm_job_id"] != job_id:
         raise ValueError("Native accounting identity mismatch")
     if value["state"] not in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}:
@@ -239,10 +262,12 @@ def validate_accounting(value: Any, *, job_id: str, task_status: str,
     elapsed = integer(value["elapsed_seconds"], "native elapsed seconds")
     cpus = integer(value["cpu_seconds"], "native CPU seconds")
     gpus = integer(value["allocated_gpus"], "allocated GPU count")
-    if gpus == 1:
-        if "preallocation_cancellation" in value or cpus != elapsed * expected_cpus:
+    if gpus == expected_gpus and "preallocation_cancellation" not in value:
+        if cpus != elapsed * expected_cpus or (expected_gpus == 0 and value.get("allocated_cpus") != expected_cpus):
             raise ValueError("Allocated native resource evidence mismatch")
-        return elapsed, cpus
+        if "allocated_cpus" in value and (type(value["allocated_cpus"]) is not int or value["allocated_cpus"] != expected_cpus):
+            raise ValueError("Native allocated CPU count mismatch")
+        return elapsed * gpus, cpus
     if not allow_preallocation or task_status != "cancelling" or value["state"] != "CANCELLED" or gpus != 0 or elapsed != 0 or cpus != 0:
         raise ValueError("Zero allocation requires an authoritative queued cancellation")
     proof = value.get("preallocation_cancellation")
@@ -373,12 +398,19 @@ def validate_manifest(value: Any) -> dict:
                 identifier(item)
             else:
                 sha(item, name)
-    keys(value["reservation"], {"allocation_id", "gpu_seconds", "native_cpus", "native_gpus"})
+    keys(value["reservation"], {"allocation_id", "gpu_seconds", "native_cpus", "native_gpus"}, {"allocated_seconds"})
     identifier(value["reservation"]["allocation_id"])
-    integer(value["reservation"]["gpu_seconds"], "reservation", 1)
+    integer(value["reservation"]["gpu_seconds"], "reservation")
     integer(value["reservation"]["native_cpus"], "native CPUs", 1)
-    if type(value["reservation"]["native_gpus"]) is not int or value["reservation"]["native_gpus"] != 1:
-        raise ValueError("Approved one-GPU task required")
+    gpus = value["reservation"]["native_gpus"]
+    if type(gpus) is not int or gpus not in (0, 1):
+        raise ValueError("Approved native GPU count required")
+    if gpus == 0:
+        if value["kind"] not in {"guide_reference", "confirmation_reference"} or value["reservation"]["gpu_seconds"] != 0:
+            raise ValueError("Zero GPUs are restricted to CPU reference stages")
+        integer(value["reservation"].get("allocated_seconds"), "CPU allocation window", 60)
+    elif "allocated_seconds" in value["reservation"] or value["reservation"]["gpu_seconds"] < 1:
+        raise ValueError("GPU reservation must fund the original allocation window")
     if not isinstance(value["inputs"], dict) or len(canonical(value)) > 250000:
         raise ValueError("Bounded task input metadata required")
     return deepcopy(value)
@@ -427,14 +459,22 @@ def validate_proposal(value: Any) -> dict:
         raise ValueError("Invalid eligible factor alternatives")
     names = set()
     for item in eligible:
-        keys(item, {"factor", "operation", "to_update", "expected_state_sha256", "generation"})
-        if item["factor"] not in FACTORS or item["factor"] in names or item["operation"] not in {"initialize", "advance"}:
+        keys(item, {"factor", "operation", "to_update", "expected_state_sha256", "generation"},
+             {"maximum_reserved_gpu_seconds"})
+        if item["factor"] not in FACTORS or item["factor"] in names or item["operation"] not in {"initialize", "initialize_advance", "advance"}:
             raise ValueError("Invalid factor action")
         names.add(item["factor"])
         integer(item["generation"], "generation")
-        if item["operation"] == "initialize":
-            if item["expected_state_sha256"] is not None or item["generation"] != 0 or item["to_update"] is not None:
+        if "maximum_reserved_gpu_seconds" in item:
+            integer(item["maximum_reserved_gpu_seconds"], "factor maximum reservation", 1,
+                    value["maximum_reserved_gpu_seconds"])
+        if item["operation"] in {"initialize", "initialize_advance"}:
+            if item["expected_state_sha256"] is not None or item["generation"] != 0:
                 raise ValueError("Initialization cannot replay a native prefix")
+            if item["operation"] == "initialize_advance":
+                integer(item["to_update"], "requested update", 1)
+            elif item["to_update"] is not None:
+                raise ValueError("Initialization cannot request trained updates")
         else:
             sha(item["expected_state_sha256"])
             integer(item["to_update"], "requested update", 1)
@@ -560,6 +600,7 @@ ROLE_OUTPUTS = {
     "guide_reference": frozenset(("guide_reference",)),
     "plan": frozenset(("guide_history", "method_states", "candidate", "failure_reason")),
     "hnpe_initialize": frozenset(("progress",)),
+    "hnpe_initialize_advance": frozenset(("progress",)),
     "hnpe_advance": frozenset(("progress",)),
     "guide_hnpe_inference": frozenset(("candidate",)),
     "guide_tmcmc_attempt": frozenset(("candidate", "tmcmc_attempts")),
@@ -582,6 +623,7 @@ def required_validation_checks(kind: str) -> frozenset[str]:
         "guide_reference": {"reference", "case_plan", "bank"},
         "plan": {"planner", "accounting", "native_state", "guide_history"},
         "hnpe_initialize": {"campaign_authority", "native_state", "optimizer_predecessor", "case_plan", "normalization", "validation"},
+        "hnpe_initialize_advance": {"campaign_authority", "native_state", "optimizer_predecessor", "case_plan", "normalization", "validation"},
         "hnpe_advance": {"campaign_authority", "native_state", "optimizer_predecessor", "case_plan", "normalization", "validation"},
         "guide_hnpe_inference": {"candidate", "case_plan", "bank", "native_state"},
         "guide_tmcmc_attempt": {"fresh_attempt", "case_plan", "bank"},
