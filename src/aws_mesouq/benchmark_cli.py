@@ -6,6 +6,7 @@ The controller accepts lifecycle commands only from its owner's standard input.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -343,6 +344,35 @@ def _record_startup_failure(phase, error):
                 except OSError:
                     pass
 
+@contextmanager
+def _legacy_context_registry(operator_config):
+    """Select an explicit full-registry companion for this managed child only."""
+    from aws_mesouq.benchmark_contexts import REGISTRY_ENV
+
+    companion = Path(str(operator_config) + ".benchmark-context-registry.json")
+    try:
+        companion.lstat()
+    except FileNotFoundError:
+        yield
+        return
+    if not companion.is_absolute() or companion != companion.resolve():
+        raise ValueError("Benchmark context companion requires a canonical absolute path")
+    previous = os.environ.get(REGISTRY_ENV)
+    if previous is not None:
+        ambient = Path(previous)
+        if not ambient.is_absolute() or ambient != ambient.resolve() or ambient != companion:
+            raise ValueError("Explicit benchmark context registry sources conflict")
+    else:
+        os.environ[REGISTRY_ENV] = str(companion)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(REGISTRY_ENV, None)
+        else:
+            os.environ[REGISTRY_ENV] = previous
+
+
 def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=None):
     """Use normal v1 journal/identity/claims; injectable external boundaries aid synthetic QA.
 
@@ -384,7 +414,8 @@ def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=N
         policy = ({"propagate_auth_errors": True}
                   if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all" else {})
         phase = "legacy_worker"
-        worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator, **policy)
+        with _legacy_context_registry(args.operator_config):
+            worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator, **policy)
         if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all":
             from aws_mesouq.benchmark_dispatch import FairBenchmarkWorker, build_accuracy_worker
             phase = "accuracy_worker"
