@@ -18,7 +18,7 @@ import stat
 import sys
 import tempfile
 
-MAX_JOURNAL_BYTES = 16 * 1024 * 1024
+MAX_JOURNAL_BYTES = 32 * 1024 * 1024
 MAX_OPERATOR_BYTES = 256 * 1024
 COMPANION_SUFFIX = ".benchmark-context-registry.json"
 RECOVERY_ERROR_CODES = frozenset((
