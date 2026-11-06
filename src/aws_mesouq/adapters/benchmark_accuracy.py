@@ -1104,6 +1104,17 @@ try:
    raise ValueError('Native entrypoint checksum changed')
   namespace={'__name__':'__accuracy_verified_rpc__','__file__':path}
   exec(compile(source,path,'exec',dont_inherit=True),namespace)
+  if request['operation'] in {'preflight','observe','publication','read_artifact'}:
+   verified_profile=namespace['_verify_profile']
+   def profile_with_imports(*args,**kwargs):
+    guard=verified_profile(*args,**kwargs)
+    try:
+     guard.install()
+    except BaseException:
+     guard.close()
+     raise
+    return guard
+   namespace['_verify_profile']=profile_with_imports
   try:
    result=namespace['remote_request'](request)
   except Exception as error:
