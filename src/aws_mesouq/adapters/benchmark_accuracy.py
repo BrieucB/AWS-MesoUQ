@@ -994,7 +994,8 @@ def _script(control, context, operator, window):
     lines = ["#!/bin/bash", "#SBATCH --job-name=" + control["marker"],
         "#SBATCH --chdir=" + str(directory),
         "#SBATCH --output=" + str(directory / "stdout.log"),
-        "#SBATCH --error=" + str(directory / "stderr.log")]
+        "#SBATCH --error=" + str(directory / "stderr.log"),
+        "#SBATCH --open-mode=append"]
     lines.extend("#SBATCH --" + name + "=" + str(value) for name, value in directives.items())
     dollar = chr(36)
     lines.extend(["set -euo pipefail", "umask 077",
@@ -1027,6 +1028,59 @@ def _script(control, context, operator, window):
     return "\n".join(lines) + "\n"
 
 
+def _prepare_scheduler_logs(directory):
+    parent, name = _open_parent(directory)
+    try:
+        root = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    finally:
+        os.close(parent)
+    try:
+        _check_private_directory(root)
+        for name in ("stdout.log", "stderr.log"):
+            descriptor, created = None, None
+            try:
+                try:
+                    descriptor = os.open(
+                        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600, dir_fd=root)
+                except FileExistsError:
+                    descriptor = os.open(
+                        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
+                else:
+                    original = os.fstat(descriptor)
+                    created = (original.st_dev, original.st_ino)
+                    os.fchmod(descriptor, 0o600)
+                current = os.fstat(descriptor)
+                if (not stat.S_ISREG(current.st_mode) or current.st_uid != os.getuid()
+                        or current.st_nlink != 1 or stat.S_IMODE(current.st_mode) != 0o600):
+                    raise NativeContractError("Private owned scheduler log required")
+                leaf = os.stat(name, dir_fd=root, follow_symlinks=False)
+                if (leaf.st_dev, leaf.st_ino, leaf.st_uid, leaf.st_mode, leaf.st_nlink) != (
+                        current.st_dev, current.st_ino, current.st_uid,
+                        current.st_mode, current.st_nlink):
+                    raise NativeContractError("Scheduler log changed during preparation")
+                if created is not None:
+                    os.fsync(descriptor)
+            except BaseException:
+                if created is not None:
+                    try:
+                        leaf = os.stat(name, dir_fd=root, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if ((leaf.st_dev, leaf.st_ino) == created
+                                and stat.S_ISREG(leaf.st_mode)
+                                and leaf.st_uid == os.getuid() and leaf.st_nlink == 1):
+                            os.unlink(name, dir_fd=root)
+                raise
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        os.fsync(root)
+    finally:
+        os.close(root)
+
+
 def _prepare(payload):
     context, operator, claim, window = (payload[name] for name in ("context", "operator", "claim", "window"))
     if context.get("enabled") is not True:
@@ -1044,6 +1098,7 @@ def _prepare(payload):
         quota = _home_preflight(context, manifest_sha256=claim["task"]["manifest_sha256"])
         campaign, directory = _paths(context, manifest)
         _mkdir(directory)
+        _prepare_scheduler_logs(directory)
         for path in _runtime_environment(context, manifest).values():
             _mkdir(path)
         control = {"schema": CONTROL_SCHEMA, "context": deepcopy(context), "operator": deepcopy(operator),
@@ -1820,7 +1875,7 @@ def _native_publication(control, job, *, outputs, pins, receipts, checks,
     return publication
 
 
-def _load_control(path):
+def _read_control(path):
     control = _read_json(_safe_absolute(path), maximum=MAX_CONTROL)
     _keys(control, {"schema", "context", "operator", "manifest", "manifest_sha256",
         "marker", "window", "control_directory", "campaign_directory", "runtime_environment"})
@@ -1828,13 +1883,18 @@ def _load_control(path):
         raise NativeContractError("Native control schema differs")
     if str(Path(path).parent) != control["control_directory"]:
         raise NativeContractError("Native control relocated")
-    return _validate_control_identity(control)
+    return control
+
+
+def _load_control(path):
+    return _validate_control_identity(_read_control(path))
 
 
 def _allocated(control, *, execute=False, factor_cli=False):
     guard = _verify_profile(control["context"], control["operator"], allocated=True)
     try:
         guard.install()
+        _validate_control_identity(control)
         from aws_mesouq import benchmark_accuracy_protocol as protocol
         from aws_mesouq.adapters.benchmark import allocation_clock, run_science
         m, window = protocol.validate_manifest(control["manifest"]), control["window"]
@@ -2471,7 +2531,7 @@ def main(argv=None):
     group.add_argument("--manifest")
     group.add_argument("--execute-stage")
     args = parser.parse_args(argv)
-    control = _load_control(args.manifest or args.execute_stage)
+    control = _read_control(args.manifest or args.execute_stage)
     return _allocated(control, execute=args.execute_stage is not None)
 
 
