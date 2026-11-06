@@ -20,8 +20,8 @@ import threading
 import time
 
 from aws_mesouq.connector.auth import SessionExpired, browser_login
-from aws_mesouq.connector.auth_broker import AuthBroker, BrokerError
-from aws_mesouq.connector.broker_client import BrokerClient
+from aws_mesouq.connector.auth_broker import AuthBroker, BrokerError, _open_directory, _socket_metadata
+from aws_mesouq.connector.broker_client import BrokerClient, CONTROLLER_ENV, GENERATION_ENV, SOCKET_ENV
 from aws_mesouq.connector.benchmark_supervisor import SourceWorkerSpec, WorkerSupervisor
 
 MAX_COMMAND_BYTES = 8192
@@ -217,40 +217,183 @@ def _validate_runtime(parser, args):
         parser.error("An existing enrolled normal connector journal is required")
 
 
+
+STARTUP_DIAGNOSTIC_SCHEMA = "aws_mesouq.managed_worker_startup_failure.v1"
+MAX_STARTUP_DIAGNOSTIC_BYTES = 2048
+_STARTUP_PHASES = frozenset((
+    "sdk_imports", "broker_registration", "operator", "transport", "journal",
+    "enrollment", "scheduler", "native_identity", "api_client", "legacy_worker",
+    "accuracy_worker", "dispatcher",
+))
+
+
+def _startup_source_frame(error):
+    root = Path(__file__).resolve().parent
+    current = error.__traceback__
+    selected = None
+    for _ in range(128):
+        if current is None:
+            return selected
+        code = current.tb_frame.f_code
+        try:
+            path = Path(code.co_filename)
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root)
+            name = code.co_name
+            safe_name = name.isidentifier() or name in (
+                "<module>", "<lambda>", "<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>")
+            if (path == resolved and resolved.is_file() and resolved.suffix == ".py"
+                    and relative.as_posix().isascii() and len(relative.as_posix()) <= 240
+                    and name.isascii() and len(name) <= 96 and safe_name
+                    and 1 <= current.tb_lineno <= 1_000_000):
+                selected = {"path": "aws_mesouq/" + relative.as_posix(),
+                            "line": current.tb_lineno, "function": name}
+        except (OSError, ValueError):
+            pass
+        current = current.tb_next
+    return None
+
+
+def _record_startup_failure(phase, error):
+    """Best-effort, payload-free evidence in the existing private broker directory."""
+    directory_fd = None
+    file_fd = None
+    created = None
+    name = None
+    try:
+        if phase not in _STARTUP_PHASES:
+            return
+        controller = int(os.environ[CONTROLLER_ENV])
+        generation = int(os.environ[GENERATION_ENV])
+        if (controller != os.getppid() or not 1 <= controller <= 2**31 - 1
+                or not 1 <= generation <= 2**63 - 1):
+            return
+        socket_path = Path(os.environ[SOCKET_ENV])
+        directory_fd = _open_directory(socket_path.parent, private=True)
+        _socket_metadata(directory_fd, socket_path.name)
+        source_fd = os.open(__file__, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(source_fd, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 1024 * 1024:
+                return
+            source_bytes = source.read(1024 * 1024 + 1)
+            after = os.fstat(source.fileno())
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if len(source_bytes) != before.st_size or any(
+                getattr(before, field) != getattr(after, field) for field in fields):
+            return
+        kind = type(error)
+        module_name = kind.__module__
+        module = sys.modules.get(module_name)
+        exception_name = kind.__name__
+        trusted_module = (module_name == "builtins"
+                          or module_name.partition(".")[0] in sys.stdlib_module_names
+                          or module_name.startswith("aws_mesouq."))
+        if (not trusted_module or getattr(module, exception_name, None) is not kind
+                or not exception_name.isascii() or not exception_name.isidentifier()
+                or len(exception_name) > 64):
+            exception_name = "Exception"
+        record = {
+            "schema": STARTUP_DIAGNOSTIC_SCHEMA, "phase": phase,
+            "exception_class": exception_name, "source_frame": _startup_source_frame(error),
+            "controller_pid": controller, "worker_pid": os.getpid(),
+            "worker_generation": generation, "created_at_unix_ns": time.time_ns(),
+            "cli_source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        }
+        api_module = sys.modules.get("aws_mesouq.connector.api")
+        if kind is getattr(api_module, "APIError", None):
+            status = error.status
+            if type(status) is int and 100 <= status <= 599:
+                record["http_status"] = status
+        data = json.dumps(record, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        if len(data) > MAX_STARTUP_DIAGNOSTIC_BYTES:
+            return
+        name = f"worker-startup-failure-{os.getpid()}-{generation}.json"
+        file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                          | os.O_NONBLOCK, 0o600, dir_fd=directory_fd)
+        info = os.fstat(file_fd)
+        created = (info.st_dev, info.st_ino)
+        os.fchmod(file_fd, 0o600)
+        info = os.fstat(file_fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+            raise OSError("Unsafe diagnostic file")
+        with os.fdopen(file_fd, "wb") as output:
+            file_fd = None
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.fsync(directory_fd)
+    except Exception:
+        # Refuse replacement, unsafe paths or failed writes without changing worker outcome.
+        if created is not None and directory_fd is not None and name is not None:
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if ((current.st_dev, current.st_ino) == created
+                        and current.st_uid == os.geteuid() and current.st_nlink == 1
+                        and stat.S_ISREG(current.st_mode)):
+                    os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+    finally:
+        for descriptor in (file_fd, directory_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
 def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=None):
     """Use normal v1 journal/identity/claims; injectable external boundaries aid synthetic QA.
 
     CLI exposes no dependency/import overrides. There is deliberately no login fallback.
     """
-    from aws_mesouq.benchmark_worker import BenchmarkWorker, existing_identity, validate_operator
-    from aws_mesouq.connector.api import API
-    from aws_mesouq.connector.journal import Journal
-    from aws_mesouq.connector.slurm import Slurm
-    from aws_mesouq.connector.transport import Transport
-
-    tokens = BrokerClient.from_environment()
-    operator = validate_operator(json.loads(args.operator_config.read_text()))
-    transport = (transport_factory or Transport)(
-        host=args.ssh_host, local=args.local_cluster, state_dir=args.ssh_state_dir)
-    journal = None
-    stop = stop if stop is not None else threading.Event()
+    phase = "sdk_imports"
     try:
+        from aws_mesouq.benchmark_worker import BenchmarkWorker, existing_identity, validate_operator
+        from aws_mesouq.connector.api import API
+        from aws_mesouq.connector.journal import Journal
+        from aws_mesouq.connector.slurm import Slurm
+        from aws_mesouq.connector.transport import Transport
+
+        phase = "broker_registration"
+        tokens = BrokerClient.from_environment()
+        phase = "operator"
+        operator = validate_operator(json.loads(args.operator_config.read_text()))
+        phase = "transport"
+        transport = (transport_factory or Transport)(
+            host=args.ssh_host, local=args.local_cluster, state_dir=args.ssh_state_dir)
+        journal = None
+        stop = stop if stop is not None else threading.Event()
+    except Exception as error:
+        _record_startup_failure(phase, error)
+        raise
+    try:
+        phase = "journal"
         journal = Journal(args.journal)
+        phase = "enrollment"
         existing_identity(journal)
+        phase = "scheduler"
         slurm = Slurm(transport)
+        phase = "native_identity"
         if (transport.identity() != operator["expected_user"]
                 or transport.run(["hostname", "-f"]).strip() != operator["expected_host"]):
             raise BrokerError("worker_identity_mismatch")
+        phase = "api_client"
         api = (api_factory or API)(args.api_url, tokens)
         policy = ({"propagate_auth_errors": True}
                   if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all" else {})
+        phase = "legacy_worker"
         worker = BenchmarkWorker(api, slurm, journal, project=args.project, operator=operator, **policy)
         if getattr(args, "worker_kind", "benchmark-v1") == "benchmark-all":
             from aws_mesouq.benchmark_dispatch import FairBenchmarkWorker, build_accuracy_worker
+            phase = "accuracy_worker"
             accuracy = build_accuracy_worker(api, slurm, journal, project=args.project,
                                              registry_path=args.accuracy_contexts)
+            phase = "dispatcher"
             worker = FairBenchmarkWorker(worker, accuracy, journal, project=args.project,
                                          owner_sub=journal.data["owner_sub"], stop=stop)
+        phase = "polling"
         while not stop.is_set():
             worker.sweep()
             if args.once:
@@ -259,8 +402,9 @@ def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=N
         return 0
     except SessionExpired:
         return 3
-    except Exception:
-        # The supervisor reports the code; never print arbitrary exception text or payloads.
+    except Exception as error:
+        if phase in _STARTUP_PHASES:
+            _record_startup_failure(phase, error)
         return 2
     finally:
         try:
@@ -268,6 +412,7 @@ def run_managed_worker(args, *, api_factory=None, transport_factory=None, stop=N
                 journal.close()
         finally:
             transport.close()
+
 
 
 def _emit(stream, value):
