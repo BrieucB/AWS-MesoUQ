@@ -192,3 +192,38 @@ text header, UTF-8 BOM and blank lines. A 1001-row upload is rejected intact; no
 samples are decimated or silently truncated. Fitted result curves are also capped
 at 1000 points so their complete normalized arrays fit the existing HTTP/DynamoDB
 summary envelope. The 1 MiB file cap remains an independent byte limit.
+
+## Bounded accuracy policy environment
+
+`BENCHMARK_ACCURACY_POLICIES` accepts its existing JSON object or an explicit
+`mesouq-zlib-v1:` value. The latter contains canonical padded standard base64
+of one zlib stream holding a UTF-8 JSON object. Encoded input is limited to
+64 KiB and decompression stops at 256 KiB. This permits the supported sixteen
+ordinary execution contexts while bounding cold-start parsing memory. Lambda's
+separate 4 KiB aggregate environment limit still applies to deployment.
+
+Compressed JSON rejects duplicate keys and nonfinite constants. Base64 spelling,
+stream completion and trailing bytes are verified before the ordinary application
+context validator runs. Existing plaintext parsing and constructor inputs retain
+their existing semantics.
+
+Use the service's source-defined operator encoder with a reviewed policy mapping:
+
+```python
+from aws_publishing.accuracy_policy_env import encode_policies, decode_policies
+
+encoded = encode_policies(reviewed_policies)
+assert decode_policies(encoded) == reviewed_policies
+```
+
+Keep both the old frozen contexts and newly enabled context in that mapping.
+Encoding changes the environment transport only. The application validates the
+same complete context records after decoding. Review the complete environment
+byte count, image source, literal environment hashes and revision preconditions
+before activating a new value.
+
+The reviewed activation helper is `tools/publish_accuracy_policy.py`. It reads
+private `--guard` and `--project-policy` files and writes private receipts under
+`--receipt-directory`. Its default operation verifies a deployment plan. The
+explicit `--apply` option performs the separately approved update with image,
+environment-hash and revision preconditions, followed by complete readback.

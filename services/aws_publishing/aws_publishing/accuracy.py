@@ -13,6 +13,7 @@ from aws_mesouq import benchmark_accuracy as wire
 from aws_mesouq import benchmark_accuracy_protocol as protocol
 from .api import Application, APIError
 from .benchmark import BenchmarkRoutes
+from .accuracy_policy_env import decode_policies
 
 
 def is_accuracy_path(path):
@@ -34,13 +35,7 @@ def request_wire_limit(method, path):
 
 
 def policies_from_environment():
-    try:
-        value = json.loads(os.environ.get("BENCHMARK_ACCURACY_POLICIES", "{}"))
-    except (ValueError, TypeError):
-        raise ValueError("Invalid accuracy policy configuration") from None
-    if not isinstance(value, dict):
-        raise ValueError("Invalid accuracy policy configuration")
-    return value
+    return decode_policies(os.environ.get("BENCHMARK_ACCURACY_POLICIES", "{}"))
 
 
 def _error(status, code, message):
