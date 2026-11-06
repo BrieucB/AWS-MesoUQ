@@ -208,3 +208,38 @@ The broker clears its token vault and removes its owned socket normally at
 shutdown. Its private directory can remain with the failure record for owner
 retention. Polling failures and session-expiration handling retain their existing
 behavior. Startup diagnostics perform no token request or browser sign-in.
+
+## Explicit managed-child legacy context registry
+
+A retained controller can load a reviewed worker that uses the exact sibling
+`<operator-config>.benchmark-context-registry.json` of its existing operator
+configuration. This companion contains the complete existing
+`aws_mesouq.benchmark_context_registry.v1` document. Its original legacy operator
+and every additional operator/context require explicit approval. The unchanged
+operator configuration is retained byte for byte.
+
+The normal registry reader requires a canonical absolute path, a regular
+file owned by the current user with mode 0600 and one link, at most 256 KiB,
+and a stable read.
+Normal execution-context validation requires the exact legacy operator and
+retains every journal-stored context and campaign binding. Context definitions must come from approved
+complete operator records.
+
+With no companion, existing environment-based and legacy behavior continues.
+With a companion, an existing `AWS_MESOUQ_BENCHMARK_CONTEXT_REGISTRY` setting
+must select that same canonical path. A conflicting explicit source fails
+closed. The managed child temporarily selects the companion only during
+`BenchmarkWorker` construction and restores its original environment on every
+exit path. Accuracy initialization and polling see the original environment.
+
+This uses the retained controller's existing arguments and authentication.
+Delivery approval and receipts bind the exact operator and companion bytes.
+Installing a companion, recovering private context definitions and replacing
+the running worker each require the corresponding runtime authorization.
+
+The recovery helper in `tools/recover_benchmark_context_registry.py` requires
+explicit approval for reading the existing private operator and journal and
+preparing a candidate registry plus receipt from exact stored context definitions.
+Its public tests use synthetic fixtures. Actual journal, operator and runtime
+data stay in the authorized private environment. Installing the candidate at the
+exact derived sibling path and replacing the worker require runtime approval.
