@@ -181,13 +181,28 @@ and worker PIDs, generation, timestamp and CLI source SHA256. An exact SDK
 `APIError` may also supply an integer HTTP status from100 through599. Messages,
 server bodies, locals, source lines and credentials are excluded.
 
-The retained controller's existing `status` response supplies the worker PID,
-generation and registered package binding. The operator intentionally reads only
-the matching diagnostic filename after the current worker exits, in that controller's existing private broker
-directory, bounds the read to2 KiB, and verifies controller/worker/generation,
-fresh timestamp and the CLI SHA against the reviewed package manifest. A stale or
-mismatching record does not describe the current worker. This requires no owner
-status/protocol upgrade or additional worker argument.
+The retained controller's `status` response can supply a live worker PID and
+generation. A fast initialization failure can exit before that response and leave
+both fields null. Diagnostic consumption therefore requires explicit consent for
+a bounded, filename-only lookup in that controller's exact known private broker
+directory.
+
+Before one controlled `use_spec` replacement, record a baseline of names matching
+exactly `worker-startup-failure-<decimal-pid>-<decimal-generation>.json`. Inspect at
+most64 directory entries and expose only matching names. Refuse overflow,
+unexpected paths or ambiguous results. Bind the controlled `use_spec` payload and
+accepted admission to the reviewed package and exact CLI SHA, then observe the
+paused worker and exit2. Crosscheck any non-null returned PID, generation or
+binding. When registration is unavailable after exit, select exactly one new
+matching filename using the guarded baseline difference.
+
+Open only that record without following links. Require a regular, owner-only
+mode0600, single-link file in the private mode0700 broker directory and read at
+most2 KiB. Validate the fixed schema, expected controller PID, filename/body
+worker PID and generation, creation time within the recorded replacement intent
+window, and CLI SHA against the reviewed package manifest before projecting
+approved metadata. Absent, stale or multiple new records require reconciliation.
+This route uses the existing owner protocol and worker arguments.
 
 The broker clears its token vault and removes its owned socket normally at
 shutdown. Its private directory can remain with the failure record for owner
