@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import io
+from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -452,6 +454,39 @@ class RecoveryTests(unittest.TestCase):
         for raw in (b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1e999}'):
             with self.assertRaises(recovery.RecoveryRejected):
                 recovery.parse(raw)
+
+    def test_known_rejection_emits_only_source_defined_error_code(self):
+        settings = self.root / "invalid-settings.private.json"
+        self.write(settings, {"private": "SYNTHETIC_PRIVATE_ERROR_CANARY"})
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            status = recovery.main(["--settings", str(settings)])
+        result = json.loads(captured.getvalue())
+        self.assertEqual(status, 2)
+        self.assertEqual(result["error_code"], "invalid_recovery_settings")
+        self.assertNotIn("SYNTHETIC_PRIVATE_ERROR_CANARY", captured.getvalue())
+
+    def test_other_or_payload_bearing_errors_never_expose_their_message(self):
+        class Subclass(recovery.RecoveryRejected):
+            pass
+        canary = "SYNTHETIC_PRIVATE_ERROR_CANARY"
+        errors = [ValueError(canary), type(canary, (Exception,), {})(canary),
+                  recovery.RecoveryRejected(canary),
+                  Subclass("invalid_recovery_settings"),
+                  recovery.RecoveryRejected("invalid_recovery_settings", canary),
+                  recovery.RecoveryRejected(123)]
+        settings = self.root / "settings.private.json"
+        self.write(settings, self.settings)
+        for error in errors:
+            with self.subTest(error_class=type(error).__name__):
+                captured = io.StringIO()
+                with mock.patch.object(recovery, "recover", side_effect=error), redirect_stdout(captured):
+                    status = recovery.main(["--settings", str(settings)])
+                result = json.loads(captured.getvalue())
+                self.assertEqual(status, 2)
+                self.assertEqual(result["error_code"], "registry_recovery_rejected")
+                self.assertNotIn(canary, captured.getvalue())
+                self.assertNotIn(str(self.journal_path), captured.getvalue())
 
     def test_normal_isolated_cli_keeps_all_actual_fields_private(self):
         settings = self.root / "settings.private.json"

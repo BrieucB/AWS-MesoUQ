@@ -21,6 +21,42 @@ import tempfile
 MAX_JOURNAL_BYTES = 16 * 1024 * 1024
 MAX_OPERATOR_BYTES = 256 * 1024
 COMPANION_SUFFIX = ".benchmark-context-registry.json"
+RECOVERY_ERROR_CODES = frozenset((
+    'duplicate_json_field',
+    'existing_journal_lock_changed',
+    'explicit_normal_journal_required',
+    'explicit_operator_json_required',
+    'input_changed',
+    'input_paths_overlap',
+    'input_size_changed',
+    'invalid_journal_root',
+    'invalid_known_project',
+    'invalid_path',
+    'invalid_recovery_settings',
+    'invalid_stored_context_fields',
+    'invalid_stored_context_identifier',
+    'missing_complete_stored_contexts',
+    'missing_direct_path',
+    'missing_nonlegacy_contexts',
+    'missing_versioned_namespace',
+    'noncanonical_path',
+    'nonfinite_json',
+    'normal_context_map_changed',
+    'output_directory_exists',
+    'output_readback_failed',
+    'published_context_map_changed',
+    'published_output_changed',
+    'registry_size_exceeded',
+    'sdk_import_origin_changed',
+    'stored_legacy_operator_changed',
+    'unsafe_created_output',
+    'unsafe_existing_journal_lock',
+    'unsafe_private_directory',
+    'unsafe_private_input',
+    'unsupported_namespace_schema',
+    'unsupported_recovery_settings',
+    'unsupported_stored_context_policy',
+))
 
 class RecoveryRejected(RuntimeError):
     pass
@@ -386,8 +422,13 @@ def main(argv=None):
         print(json.dumps(result, sort_keys=True))
         return 0
     except Exception as error:
-        print(json.dumps({"status": "rejected", "error_class": type(error).__name__},
-                         sort_keys=True))
+        code = "registry_recovery_rejected"
+        if (type(error) is RecoveryRejected and len(error.args) == 1
+                and type(error.args[0]) is str and error.args[0] in RECOVERY_ERROR_CODES):
+            code = error.args[0]
+        error_class = "RecoveryRejected" if type(error) is RecoveryRejected else "Exception"
+        print(json.dumps({"status": "rejected", "error_class": error_class,
+                          "error_code": code}, sort_keys=True))
         return 2
     finally:
         if snapshot is not None:
