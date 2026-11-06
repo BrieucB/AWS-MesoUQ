@@ -166,3 +166,30 @@ Startup SIGINT/SIGTERM interrupts the callback wait, closes the callback and bro
 Broker cleanup tolerates an interrupted accept-thread start and releases the socket, directory descriptor and token vault even when thread joining fails. Hosted signal fixtures bind real loopback listeners without reverse-DNS timing and use short private Unix-socket paths.
 
 Startup defers SIGINT/SIGTERM only while binding and recording the owned Unix socket, preserving the original signal mask and handlers; signals delivered through another unblocked thread are also deferred on main. Shutdown invalidates the token vault independently of provider I/O; late provider completions cannot restore credentials. A handler thread that cannot start releases its connection and slot while the accept loop remains available. Already started handlers keep sole cleanup ownership.
+
+## Private managed-worker startup failures
+
+A managed worker that fails during initialization makes one best-effort private
+`worker-startup-failure-<worker-pid>-<generation>.json` record beside the existing
+broker socket. The record is at most 2 KiB with mode0600 inside the verified
+mode0700 broker directory. Creation is exclusive and never replaces an existing
+entry. Failed writes preserve the worker's existing exception/exit behavior.
+
+The fixed schema contains an initialization phase, a bounded trusted exception
+class, the last relative SDK source frame (path, line and function), controller
+and worker PIDs, generation, timestamp and CLI source SHA256. An exact SDK
+`APIError` may also supply an integer HTTP status from100 through599. Messages,
+server bodies, locals, source lines and credentials are excluded.
+
+The retained controller's existing `status` response supplies the worker PID,
+generation and registered package binding. The operator intentionally reads only
+the matching diagnostic filename after the current worker exits, in that controller's existing private broker
+directory, bounds the read to2 KiB, and verifies controller/worker/generation,
+fresh timestamp and the CLI SHA against the reviewed package manifest. A stale or
+mismatching record does not describe the current worker. This requires no owner
+status/protocol upgrade or additional worker argument.
+
+The broker clears its token vault and removes its owned socket normally at
+shutdown. Its private directory can remain with the failure record for owner
+retention. Polling failures and session-expiration handling retain their existing
+behavior. Startup diagnostics perform no token request or browser sign-in.
