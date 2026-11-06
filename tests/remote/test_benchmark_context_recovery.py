@@ -315,9 +315,17 @@ class RecoveryTests(unittest.TestCase):
                 self.recover()
 
     def test_input_size_cap_is_enforced_before_json(self):
-        with mock.patch.object(recovery, "MAX_JOURNAL_BYTES", 64):
-            with self.assertRaises(recovery.RecoveryRejected):
+        self.assertEqual(recovery.MAX_JOURNAL_BYTES, 32 * 1024 * 1024)
+        with self.journal_path.open("r+b") as stream:
+            stream.truncate(recovery.MAX_JOURNAL_BYTES + 1)
+        self.journal_raw = self.journal_path.read_bytes()
+        with mock.patch.object(
+                recovery, "parse", side_effect=AssertionError("oversized input was parsed")):
+            with self.assertRaises(recovery.RecoveryRejected) as rejected:
                 self.recover()
+        self.assertEqual(rejected.exception.args, ("unsafe_private_input",))
+        self.assertFalse(Path(self.settings["output_directory"]).exists())
+        self.assert_inputs_preserved()
 
     def test_changed_source_journal_is_detected_before_publication(self):
         original = recovery.with_registry
@@ -487,6 +495,40 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(result["error_code"], "registry_recovery_rejected")
                 self.assertNotIn(canary, captured.getvalue())
                 self.assertNotIn(str(self.journal_path), captured.getvalue())
+
+    def test_large_journal_recovers_exact_contexts_without_exporting_unrelated_padding(self):
+        marker = "SYNTHETIC_LARGE_UNRELATED_PADDING_"
+        self.journal["unrelated_padding"] = marker + "x" * (16 * 1024 * 1024 + 4096)
+        self.update_journal()
+        self.journal_raw = self.journal_path.read_bytes()
+        self.assertGreater(len(self.journal_raw), 16 * 1024 * 1024)
+        self.assertLessEqual(len(self.journal_raw), recovery.MAX_JOURNAL_BYTES)
+        settings_path = self.root / "large-settings.private.json"
+        self.write(settings_path, self.settings)
+        result = subprocess.run(
+            [sys.executable, "-I", "-B",
+             str(ROOT / "tools/recover_benchmark_context_registry.py"),
+             "--settings", str(settings_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=20, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["status"], "prepared")
+        self.assertEqual(summary["context_count"], 3)
+        self.assertTrue(summary["complete_context_map_equal"])
+        output = Path(self.settings["output_directory"])
+        registry_path = output / "benchmark-context-registry.json"
+        registry_raw = registry_path.read_bytes()
+        receipt_raw = (output / "installation-receipt.private.json").read_bytes()
+        self.assertLess(len(registry_raw) + len(receipt_raw), 64 * 1024)
+        for blob in (registry_raw, receipt_raw, result.stdout.encode(), result.stderr.encode()):
+            self.assertNotIn(marker.encode(), blob)
+        normal = recovery.with_registry(
+            self.contexts, self.validator, self.operator, "p", registry_path)
+        self.assertEqual(normal.contexts, self.stored)
+        self.assertEqual(
+            normal.namespace(copy.deepcopy(self.journal["benchmark_lab"]), self.legacy_context),
+            self.journal["benchmark_lab"])
+        self.assert_inputs_preserved()
 
     def test_normal_isolated_cli_keeps_all_actual_fields_private(self):
         settings = self.root / "settings.private.json"
