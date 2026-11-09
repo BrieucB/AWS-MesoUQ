@@ -109,6 +109,12 @@ def _verify_profile(context,operator,*,allocated=False,dependencies=True):
  if UNIT['failure']=='verify':
   raise RuntimeError('synthetic_verification_failure')
  return Guard()
+def _source_qualification(context,guard):
+ # Explicit synthetic science authority; startup tests forbid model imports.
+ assert guard.installed is True
+ from aws_mesouq import benchmark_accuracy_protocol as protocol
+ return protocol.validate_source_qualification({'schema':protocol.SOURCE_QUALIFICATION_SCHEMA,
+  'science_revision':'f'*40,'source_binding_sha256':'d'*64,'semantic_policy_sha256':'e'*64})
 def _require_scratch(path):
  return Path(path)
 def _home_preflight(context,*,manifest_sha256=None):

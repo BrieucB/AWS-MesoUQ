@@ -141,7 +141,7 @@ class AccuracyWorker:
         return claim["campaign"]["id"] + ":" + claim["task"]["id"]
 
     def _validate_existing(self, entry):
-        self.contexts.validate_claim(entry["claim"])
+        self.contexts.validate_claim(entry["claim"], recovery=True)
         manifest = entry["claim"]["task"]["manifest"]
         if (entry["context_id"] != manifest["context_id"]
                 or entry["manifest_sha256"] != p.checksum(manifest)):
@@ -149,7 +149,7 @@ class AccuracyWorker:
         return self.contexts.context(entry["context_id"])
 
     def _retain_claim(self, claim):
-        claim = self.contexts.validate_claim(claim)
+        claim = self.contexts.validate_claim(claim, recovery=True)
         if claim["task"] is None:
             return None
         if claim["task"]["lease"]["connector_id"] != self.client._identity()["connector_id"]:
@@ -196,10 +196,10 @@ class AccuracyWorker:
         self.save()
 
     def _claim_one(self):
-        supported = self.supported()
-        if not supported:
-            return None
         if self.state["pending_claim"] is None:
+            supported = self.supported()
+            if not supported:
+                return None
             self.state["pending_claim"] = self.client.build_claim_body(self.project,
                 "accuracy-claim-" + uuid4().hex, supported_contexts=supported)
             self.save()
@@ -224,7 +224,8 @@ class AccuracyWorker:
                 "accuracy-refresh-" + uuid4().hex, supported_contexts=[entry["context_id"]],
                 campaign_id=entry["claim"]["campaign"]["id"], task_id=task["id"])
             self.save()
-        response = self.contexts.validate_claim(self.client.claim_frozen(entry["pending_refresh"]))
+        response = self.contexts.validate_claim(
+            self.client.claim_frozen(entry["pending_refresh"]), recovery=True)
         if response["task"] is None:
             return self._reconcile_terminal(entry)
         self._merge_claim(entry, response)
@@ -424,6 +425,13 @@ class AccuracyWorker:
             return True
         return False
 
+    def _reconcile_before_new_work(self, entry):
+        if entry["job_id"] is not None:
+            entry["phase"] = "job_known"
+            self.save()
+            return True
+        return self._lookup(entry)
+
     def _cancelled(self, entry):
         return (entry["claim"]["campaign"]["status"] == "cancelling"
             or entry["claim"]["task"]["status"] == "cancelling")
@@ -468,6 +476,9 @@ class AccuracyWorker:
             entry["last_error"] = "source_sticky_unfundable_contract_required"
             self.save()
             return
+        if self._reconcile_before_new_work(entry):
+            return
+        self.contexts.require_new_work(entry["context_id"])
         try:
             preparation = self.executor.prepare(deepcopy(entry["claim"]), window)
         except Exception as error:
@@ -498,10 +509,11 @@ class AccuracyWorker:
             self.save()
             return
         authorization = deepcopy(entry["claim"]["task"]["lease"])
-        if self._lookup(entry):
+        if self._reconcile_before_new_work(entry):
             return
         if entry["submission_invoked"]:
             raise AccuracyWorkerBlocked("Scheduler submission already invoked; reconcile only")
+        self.contexts.require_new_work(entry["context_id"])
         self._preflight(entry, "before_submit")
         # Neither native lookup nor quota/source checks extend permission to
         # submit. An expired check cycle must be retried with explicit authority.
@@ -520,6 +532,8 @@ class AccuracyWorker:
         lease = entry["claim"]["task"]["lease"]
         if lease["epoch"] != authorization["epoch"]:
             raise AccuracyWorkerBlocked("Submission fence changed during native checks")
+        self._validate_existing(entry)
+        self.contexts.require_new_work(entry["context_id"])
         entry["submission_invoked"] = True
         entry["phase"] = "submission_invoked"
         self.save()
@@ -677,6 +691,9 @@ class AccuracyWorker:
         elif phase == "claimed":
             self._prepare(entry)
         elif phase == "prepared":
+            if self._reconcile_before_new_work(entry):
+                return
+            self.contexts.require_new_work(entry["context_id"])
             self._preflight(entry, "before_intent")
             prepared = entry["native_preparation"]
             self._event(entry, "submitting", {key: prepared[key] for key in

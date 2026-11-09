@@ -122,7 +122,11 @@ def metadata(payload):
  if BOUNDARY['failure']=='operation':
   raise RuntimeError('synthetic_operation_failure')
  return {'verified':True}
-def _prepared_preflight(payload):
+def _require_new_work_qualification(context,guard):
+ assert guard.installed is True
+ if not context['enabled']:
+  raise NativeContractError('disabled_new_work')
+def _prepared_preflight(payload,guard):
  if not payload['context']['enabled']:
   raise NativeContractError('disabled_new_work')
  if BOUNDARY['failure']=='quota':
@@ -246,7 +250,7 @@ def test_existing_prepare_and_profile_routes_keep_native_admission(tmp_path, ope
     assert result.returncode == 0, result.stderr.decode()
     observed = events(trace)
     assert observed.count("verify") == 1
-    assert observed.count("install") == (operation == "prepare")
+    assert observed.count("install") == 1
     assert observed.count("close") == 1
     assert not lease.exists()
 

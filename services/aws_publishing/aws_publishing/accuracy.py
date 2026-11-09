@@ -286,7 +286,8 @@ class AccuracyRoutes:
 
     def capabilities(self, state, identity, sub, project):
         self.app.member(state, identity, project)
-        contexts = self._contexts(project, sub)
+        contexts = [c for c in self._contexts(project, sub)
+                    if protocol.source_policy_qualified(c)]
         enabled = len(contexts) == 1
         reason = None if enabled else ("No approved accuracy execution context is enabled" if not contexts else "Multiple enabled source contexts require an unambiguous operator policy")
         return 200, {"schema_version": 2, "enabled": enabled,
@@ -322,7 +323,7 @@ class AccuracyRoutes:
         if campaign["status"] in ("cancelling", "cancelled", "failed", "completed"):
             return None
         context = self._context(campaign)
-        if not context["enabled"]:
+        if not context["enabled"] or not protocol.source_policy_qualified(context):
             campaign["status"] = "blocked"
             return None
         owner, allocation_kind = protocol.KINDS[kind]
@@ -419,9 +420,6 @@ class AccuracyRoutes:
     def create(self, state, identity, sub, project, body):
         self.app.member(state, identity, project)
         request = wire.validate_create(body)
-        contexts = self._contexts(project, sub)
-        if not contexts:
-            _error(409, "accuracy_disabled", "No approved accuracy execution context is enabled")
         transport = wire.transport_request_checksum(request)
         request_key = "accuracy_create:" + protocol.checksum([project, sub, request["idempotency_key"]])
         previous = state["requests"].get(request_key)
@@ -429,8 +427,14 @@ class AccuracyRoutes:
             if previous["hash"] != transport:
                 _error(409, "idempotency_conflict", "The transport nonce already binds a different request")
             return 202, deepcopy(previous["response"])
+        contexts = self._contexts(project, sub)
+        if not contexts:
+            _error(409, "accuracy_disabled", "No approved accuracy execution context is enabled")
+        contexts = [c for c in contexts if protocol.source_policy_qualified(c)]
+        if not contexts:
+            _error(409, "accuracy_source_unqualified", "No enabled context has a matching source-policy qualification")
         if len(contexts) != 1:
-            _error(409, "accuracy_context_ambiguous", "Operator policy must select exactly one current source context")
+            _error(409, "accuracy_context_ambiguous", "Operator policy must select exactly one qualified source context")
         context, ident, now = contexts[0], uuid4().hex, self.app.clock()
         campaign = {
             "id": ident, "schema_version": 2, "project_id": project, "owner_sub": sub,
@@ -643,6 +647,9 @@ class AccuracyRoutes:
                     continue
                 task = self._task(state, campaign, ident, mutable=True)
                 self._lease_expiry(state, campaign, task)
+                if (task["submission_intent"] is None and task["status"] in ("ready", "claimed")
+                        and (not context["enabled"] or not protocol.source_policy_qualified(context))):
+                    continue
                 if task["lease"] is not None:
                     if value.get("campaign_id") == campaign["id"] and task["lease"]["connector_id"] == value["connector_id"]:
                         task["lease"]["expires_at"] = self.app.clock() + self.app.lease_seconds
@@ -652,8 +659,7 @@ class AccuracyRoutes:
                     continue
                 if task["status"] in ("succeeded", "failed", "cancelled"):
                     continue
-                if not context["enabled"] and task["status"] == "ready":
-                    continue
+
                 task["lease_epoch"] += 1
                 task["lease"] = {"token": secrets.token_urlsafe(48),
                     "epoch": task["lease_epoch"], "connector_id": value["connector_id"],

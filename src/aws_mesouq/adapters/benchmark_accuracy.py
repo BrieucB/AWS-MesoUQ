@@ -917,6 +917,30 @@ def _verify_profile(context, operator, *, allocated=False, dependencies=True):
     return guard
 
 
+def _source_qualification(context, guard):
+    """Compute policy authority only inside the authenticated source guard."""
+    if guard.installed is not True or guard.context != context:
+        raise NativeContractError("Installed source guard required for qualification")
+    guard.check()
+    from aws_mesouq import benchmark_accuracy_protocol as protocol
+    from meso_uq.benchmark_lab.accuracy_v2 import policy
+    protocol.validate_context(context)
+    record = {"schema": protocol.SOURCE_QUALIFICATION_SCHEMA,
+        "science_revision": context["science_revision"],
+        "source_binding_sha256": context["source_binding_sha256"],
+        "semantic_policy_sha256": _sha(policy.policy_fingerprint())}
+    guard.check()
+    return protocol.validate_source_qualification(record)
+
+
+def _require_new_work_qualification(context, guard):
+    from aws_mesouq import benchmark_accuracy_protocol as protocol
+    if (context.get("enabled") is not True
+            or not protocol.source_policy_qualified(context)
+            or _source_qualification(context, guard) != context["source_qualification"]):
+        raise NativeContractError("Scientific source policy is not qualified for new work")
+
+
 def _require_scratch(path):
     path = _safe_absolute(str(path))
     if path.parts[1:3] != ("scratch", "project") or len(path.parts) < 7:
@@ -1091,6 +1115,8 @@ def _prepare(payload):
         from aws_mesouq import benchmark_accuracy_protocol as protocol
         protocol.validate_context(context)
         manifest = protocol.validate_manifest(claim["task"]["manifest"])
+        protocol.validate_manifest_context(manifest, context)
+        _require_new_work_qualification(context, guard)
         if protocol.checksum(manifest) != claim["task"]["manifest_sha256"]:
             raise NativeContractError("Prepared manifest checksum changed")
         _validate_window(window, manifest["reservation"].get("allocated_seconds", manifest["reservation"]["gpu_seconds"]))
@@ -1159,7 +1185,7 @@ try:
    raise ValueError('Native entrypoint checksum changed')
   namespace={'__name__':'__accuracy_verified_rpc__','__file__':path}
   exec(compile(source,path,'exec',dont_inherit=True),namespace)
-  if request['operation'] in {'preflight','observe','publication','read_artifact'}:
+  if request['operation'] in {'verify_profile','qualify_source','preflight','observe','publication','read_artifact'}:
    verified_profile=namespace['_verify_profile']
    def profile_with_imports(*args,**kwargs):
     guard=verified_profile(*args,**kwargs)
@@ -1231,11 +1257,12 @@ raise SystemExit(status)
 """
 
 
-def _prepared_preflight(payload):
+def _prepared_preflight(payload, guard):
     context, entry = payload["context"], payload["entry"]
     if context.get("enabled") is not True:
         raise NativeContractError("Disabled context cannot authorize new submission")
     control = _entry_control(context, entry)
+    _require_new_work_qualification(context, guard)
     preparation = entry["native_preparation"]
     _keys(preparation, {"script_path", "script_sha256", "intent_sha256", "marker", "window"},
           {"preflight"})
@@ -1294,7 +1321,7 @@ def _native_entry(entry):
 
 
 def _native_payload(operation, payload):
-    if operation == "verify_profile":
+    if operation in {"verify_profile", "qualify_source"}:
         _keys(payload, set())
         return {}
     if operation == "prepare":
@@ -1371,20 +1398,31 @@ class AccuracyNativeExecutor:
                 admitted.append(context_id)
         return admitted
 
+    def qualify_source(self, context_id):
+        context = self.contexts.context(context_id)
+        from aws_mesouq import benchmark_accuracy_protocol as protocol
+        record = protocol.validate_source_qualification(self._rpc(context_id, "qualify_source"))
+        if (record["science_revision"] != context["science_revision"]
+                or record["source_binding_sha256"] != context["source_binding_sha256"]):
+            raise NativeContractError("Source qualification tuple differs from trusted context")
+        return record
+
     def prepare(self, claim, window):
         claim = self.contexts.validate_claim(claim)
+        self.contexts.require_new_work(claim["task"]["manifest"]["context_id"])
         return self._rpc(claim["task"]["manifest"]["context_id"],
                          "prepare", claim=claim, window=window)
 
     def preflight(self, entry):
         self.contexts.validate_claim(entry["claim"])
+        self.contexts.require_new_work(entry["context_id"])
         return self._rpc(entry["context_id"], "preflight", entry=entry)
 
     def observe(self, entry):
         return self._rpc(entry["context_id"], "observe", entry=entry)
 
     def cancel(self, entry, *, authorize):
-        self.contexts.validate_claim(entry["claim"])
+        self.contexts.validate_claim(entry["claim"], recovery=True)
         if not callable(authorize):
             raise NativeContractError("Live cancellation authorization required")
         def checked_authorization():
@@ -1537,17 +1575,23 @@ def remote_request(payload):
     _keys(payload, {"operation", "context", "operator"},
           {"claim", "window", "entry", "accounting", "spec"})
     operation = payload["operation"]
-    if operation not in {"verify_profile", "preflight", "prepare", "observe", "publication", "read_artifact"}:
+    if operation not in {"verify_profile", "qualify_source", "preflight", "prepare", "observe", "publication", "read_artifact"}:
         raise NativeContractError("Unsupported fixed native operation")
     if operation == "prepare":
         return _prepare(payload)
     guard = _verify_profile(payload["context"], payload["operator"])
     try:
+        if operation == "qualify_source":
+            return _source_qualification(payload["context"], guard)
         if operation == "verify_profile":
+            try:
+                _require_new_work_qualification(payload["context"], guard)
+            except NativeContractError:
+                return {"verified": False}
             _home_preflight(payload["context"])
             return {"verified": True}
         if operation == "preflight":
-            return _prepared_preflight(payload)
+            return _prepared_preflight(payload, guard)
         if operation == "observe":
             return _observe(payload)
         if operation == "publication":
@@ -1895,6 +1939,7 @@ def _allocated(control, *, execute=False, factor_cli=False):
     try:
         guard.install()
         _validate_control_identity(control)
+        _require_new_work_qualification(control["context"], guard)
         from aws_mesouq import benchmark_accuracy_protocol as protocol
         from aws_mesouq.adapters.benchmark import allocation_clock, run_science
         m, window = protocol.validate_manifest(control["manifest"]), control["window"]

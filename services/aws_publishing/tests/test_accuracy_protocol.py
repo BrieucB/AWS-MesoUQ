@@ -180,6 +180,7 @@ def test_ambiguous_enabled_sources_do_not_choose_an_arbitrary_release(accuracy_l
     one = deepcopy(accuracy_lab[5])
     two = deepcopy(one)
     two["source_binding_sha256"] = "f"*64
+    two["source_qualification"]["source_binding_sha256"] = "f"*64
     two["id"] = p.context_id(two)
     accuracy_lab[0].accuracy_policies["p"] = [one, two]
     status, response = call(accuracy_lab, "GET", "/v1/projects/p/benchmark-accuracy/capabilities")

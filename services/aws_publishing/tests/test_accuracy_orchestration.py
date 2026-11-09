@@ -194,8 +194,10 @@ def test_worker_cpu_reference_funds_walltime_without_fabricating_a_gpu_hold():
                 "script_sha256": "a" * 64, "intent_sha256": "b" * 64,
                 "marker": "marker", "window": window}
     worker = SimpleNamespace(_validate_existing=lambda entry: {"native_root": "/scratch/native"},
+        _reconcile_before_new_work=lambda entry: False,
+        contexts=SimpleNamespace(require_new_work=lambda context_id: None),
         executor=SimpleNamespace(prepare=prepare), save=lambda: None)
-    entry = {"claim": {"campaign": {"id": "campaign"}, "task": {
+    entry = {"context_id": "synthetic-context", "claim": {"campaign": {"id": "campaign"}, "task": {
         "marker": "marker", "manifest": {"reservation": {
             "native_gpus": 0, "native_cpus": 16, "gpu_seconds": 0, "allocated_seconds": 120}}}}}
     AccuracyWorker._prepare(worker, entry)

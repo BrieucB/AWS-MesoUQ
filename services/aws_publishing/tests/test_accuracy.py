@@ -31,6 +31,12 @@ def accuracy_lab(lab):
         "capabilities": sorted(protocol.REQUIRED_CAPABILITIES),
         "allowed_artifacts": {kind: ["stage-receipt.json", "comparison.json", "allocation-accounting-final.json", "display-summary.json", "validation-capsule.json"] for kind in protocol.KINDS},
     }
+    # Synthetic independent source-qualification output; no production policy pin.
+    context["source_qualification"] = {
+        "schema": protocol.SOURCE_QUALIFICATION_SCHEMA,
+        "science_revision": "a" * 40, "source_binding_sha256": "b" * 64,
+        "semantic_policy_sha256": "d" * 64,
+    }
     context["id"] = protocol.context_id(context)
     app = AccuracyApplication(lab[1], lab[2], clock=lambda: now[0],
         accuracy_policies={"p": [context]})

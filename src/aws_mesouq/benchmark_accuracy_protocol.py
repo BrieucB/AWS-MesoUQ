@@ -108,6 +108,39 @@ def descriptor(value: Any, *, native_root: str | None = None) -> dict:
     return deepcopy(value)
 
 
+SOURCE_QUALIFICATION_SCHEMA = "aws_mesouq.benchmark_accuracy_source_qualification.v1"
+
+
+def validate_source_qualification(value: Any) -> dict:
+    """Validate an operator-qualified source record, never a request parameter."""
+    keys(value, {"schema", "science_revision", "source_binding_sha256",
+                 "semantic_policy_sha256"})
+    if value["schema"] != SOURCE_QUALIFICATION_SCHEMA:
+        raise ValueError("Unsupported accuracy source qualification")
+    if (not isinstance(value["science_revision"], str)
+            or re.fullmatch(r"[a-f0-9]{40}", value["science_revision"]) is None):
+        raise ValueError("Invalid qualified scientific source commit")
+    sha(value["source_binding_sha256"], "qualified source binding")
+    sha(value["semantic_policy_sha256"], "qualified semantic policy")
+    return deepcopy(value)
+
+
+def source_policy_qualified(context: dict) -> bool:
+    """Trust only a source qualification delivered in server/operator policy.
+
+    This checks the record's binding, not its scientific derivation. The
+    qualification tool must compute the semantic pin from authenticated source
+    before an operator publishes a new context. Legacy absence stays absent.
+    """
+    try:
+        record = validate_source_qualification(context.get("source_qualification"))
+    except ValueError:
+        return False
+    return (record["science_revision"] == context.get("science_revision")
+            and record["source_binding_sha256"] == context.get("source_binding_sha256")
+            and record["semantic_policy_sha256"] == context.get("policy_sha256"))
+
+
 def context_id(value: dict) -> str:
     return checksum({k: v for k, v in value.items() if k not in ("id", "enabled")})
 
@@ -118,7 +151,9 @@ def validate_context(value: Any) -> dict:
         "runtime_profile_sha256", "native_root", "archive_root", "native_user",
         "native_cpus", "native_gpus", "maximum_artifact_bytes", "maximum_total_artifact_bytes",
         "maximum_artifact_files", "capabilities", "allowed_artifacts"}
-    keys(value, required, {"stage_reservations", "reference_resources"})
+    keys(value, required, {"stage_reservations", "reference_resources", "source_qualification"})
+    if "source_qualification" in value:
+        validate_source_qualification(value["source_qualification"])
     windows = value.get("stage_reservations", {})
     if not isinstance(windows, dict) or set(windows) - set(KINDS):
         raise ValueError("Invalid approved native stage windows")

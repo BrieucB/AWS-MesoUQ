@@ -48,6 +48,7 @@ def test_lambda_entrypoint_preserves_old_and_new_contexts_and_v1(
     old["enabled"] = False
     new = deepcopy(old)
     new.update(enabled=True, science_revision="9" * 40)
+    new["source_qualification"]["science_revision"] = "9" * 40
     new["id"] = protocol.context_id(new)
     policies = {"p": [old, new]}
     value = codec.encode_policies(policies) if compressed else json.dumps(policies)
