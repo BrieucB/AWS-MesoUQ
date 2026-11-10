@@ -6,7 +6,6 @@ on:
       baseline_commit:
         description: Exact source commit matching the current website baseline
         required: true
-        default: 'd3ea72e842e8e6dc24120e5edf62029362f01d5b'
         type: string
       expected_source_commit:
         description: Exact reviewed main commit to publish
