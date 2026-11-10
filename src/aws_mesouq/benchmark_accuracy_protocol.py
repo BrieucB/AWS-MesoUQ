@@ -215,6 +215,9 @@ def validate_manifest_context(manifest: dict, context: dict) -> None:
         raise ValueError("Task resources differ from the reviewed execution context")
     if manifest["kind"] == "hnpe_initialize_advance" and "fused_factor_lifecycle_v1" not in context["capabilities"]:
         raise ValueError("Combined factor lifecycle requires its approved source capability")
+    fenced = INVOCATION_PROTOCOL in context["capabilities"]
+    if (manifest.get("submission_protocol") == INVOCATION_PROTOCOL) != fenced:
+        raise ValueError("Manifest invocation protocol differs from its trusted context")
 
 
 def public_context(value: dict) -> dict:
@@ -402,7 +405,9 @@ def validate_manifest(value: Any) -> dict:
         "scientific_request_hash", "transport_request_hash", "context_id",
         "source_binding_sha256", "policy_sha256", "accounting", "input_ledger_sha256",
         "reservation", "pins", "inputs"}
-    keys(value, required)
+    keys(value, required, {'submission_protocol'})
+    if "submission_protocol" in value and value["submission_protocol"] != INVOCATION_PROTOCOL:
+        raise ValueError("Unsupported immutable submission protocol")
     if value["schema"] != MANIFEST_SCHEMA or value["kind"] not in KINDS:
         raise ValueError("Invalid native task manifest")
     for name in ("campaign_instance_id", "task_id"):
@@ -974,3 +979,62 @@ def validate_publication_capsule(capsule: dict, summary: dict, *, manifest: dict
     _no_raw_secret(summary)
     _no_raw_secret(capsule)
     return qualification
+
+import math
+
+# Optional immutable capability: legacy contexts/manifests remain byte-identical.
+INVOCATION_PROTOCOL = "server_invocation_fence_v1"
+INVOCATION_AUTHORIZATION_SCHEMA = "aws_mesouq.benchmark_accuracy_invocation_authorization.v1"
+INVOCATION_ABORT_SCHEMA = "aws_mesouq.benchmark_accuracy_invocation_abort.v1"
+RECOVERY_SCHEMA = "aws_mesouq.benchmark_accuracy_recovery.v1"
+EVENTS = EVENTS | {"authorize_invocation"}
+EVENT_PAYLOAD_FIELDS["authorize_invocation"] = ({"grant_request_nonce", "submission_intent_sha256"}, set())
+
+
+def invocation_fenced(manifest):
+    return manifest.get("submission_protocol") == INVOCATION_PROTOCOL
+
+
+def validate_invocation_authorization(value, manifest, intent, nonce):
+    keys(value, {"schema", "grant_id", "grant_request_nonce", "submission_intent_sha256",
+        "task_id", "attempt", "allocation_id", "context_id", "manifest_sha256",
+        "connector_id", "lease_epoch", "authorized_at"})
+    if value["schema"] != INVOCATION_AUTHORIZATION_SCHEMA or not invocation_fenced(manifest):
+        raise ValueError("Future invocation authorization required")
+    for name in ("grant_id", "grant_request_nonce"):
+        if type(value[name]) is not str or re.fullmatch(r"[a-f0-9]{32}", value[name]) is None:
+            raise ValueError("Exact invocation nonce required")
+    expected = {"grant_request_nonce": nonce, "submission_intent_sha256": checksum(intent),
+        "task_id": manifest["task_id"], "attempt": manifest["attempt"],
+        "allocation_id": manifest["reservation"]["allocation_id"],
+        "context_id": manifest["context_id"], "manifest_sha256": checksum(manifest)}
+    if any(type(value[key]) is not type(wanted) or value[key] != wanted for key, wanted in expected.items()):
+        raise ValueError("Invocation authorization binding changed")
+    identifier(value["connector_id"])
+    integer(value["lease_epoch"], "invocation lease epoch", 1)
+    checked = value["authorized_at"]
+    if type(checked) not in (int, float) or not math.isfinite(checked) or checked < 0:
+        raise ValueError("Finite invocation authorization time required")
+    return deepcopy(value)
+
+
+def recovery_status(task):
+    """Finite derived diagnostic; never changes lifecycle or accounting."""
+    state = task.get("status")
+    if state == "cancelled" and task.get("invocation_abort_receipt") is not None:
+        pair = ("cancelled_before_invocation", "server_invocation_never_authorized")
+    elif state in ("cancelling", "submission_unknown"):
+        if not task.get("accounting_closed", False):
+            if task.get("slurm_job_id") is None:
+                code = ("invocation_authorized_unreconciled" if task.get("invocation_authorization") is not None
+                    else "submission_identity_unknown")
+                pair = ("blocked_reconciliation", code)
+            else:
+                pair = ("awaiting_accounting", "native_accounting_unresolved")
+        elif state == "cancelling":
+            pair = ("finalizing_cancellation", "accounting_closed")
+        else:
+            return None
+    else:
+        return None
+    return {"schema": RECOVERY_SCHEMA, "state": pair[0], "code": pair[1]}
