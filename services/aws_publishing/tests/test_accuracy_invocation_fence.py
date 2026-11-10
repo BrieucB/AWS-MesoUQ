@@ -1,6 +1,6 @@
 """Future-only server invocation fencing; synthetic HTTP/controller/Slurm only."""
 from copy import deepcopy
-import hashlib, subprocess, types, uuid
+import hashlib, types, uuid
 import pytest
 
 from test_benchmark import lab
@@ -282,8 +282,7 @@ def test_actual_old_sdk_parses_legacy_private_claim_and_ack_wire(ref,accuracy_la
     from pathlib import Path
     root=Path(__file__).parents[3]
     def old_module(relative,name):
-        raw=subprocess.run(["git","-C",str(root),"show",ref+":"+relative],
-            capture_output=True,check=True,timeout=5).stdout
+        raw = _legacy_source(ref, relative)
         module=types.ModuleType(name);module.__package__="aws_mesouq";module.__file__=str(root/relative)
         exec(compile(raw,module.__file__,"exec",dont_inherit=True),module.__dict__)
         return module
@@ -398,3 +397,14 @@ def test_cancelling_detail_with_missing_active_metadata_stays_pageable_but_direc
     with pytest.raises(ConnectorAPIError) as caught:parts[2].task("p",cid,missing)
     assert caught.value.status==404
     assert accuracy_lab[1].state["accuracy_allocations"]==before
+
+
+def _legacy_source(ref, relative):
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[3]
+    path = root / "tests" / "fixtures" / "accuracy_legacy_protocol" / "loader.py"
+    spec = importlib.util.spec_from_file_location("historical_accuracy_source_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_source(root, ref, relative)

@@ -433,15 +433,20 @@ print("isolated_plan_and_origins_passed")
             for name in publication.SOURCE_FILES:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("synthetic tracked source\n")
+                path.write_bytes((Path(__file__).resolve().parents[1] / name).read_bytes())
             git("add", ".")
             git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
                 "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
             expected = guard(FakeAws())
             expected["source_commit"] = git("rev-parse", "HEAD").decode().strip()
             expected["codec_sha256"] = hashlib.sha256(
-                (root / publication.SOURCE_FILES[-1]).read_bytes()).hexdigest()
+                (root / publication.POLICY_CODEC_SOURCE).read_bytes()).hexdigest()
             publication.verify_checkout(expected, root=root)
+            protocol_guard = dict(expected)
+            protocol_guard['codec_sha256'] = hashlib.sha256((root / "src/aws_mesouq/benchmark_accuracy_protocol.py").read_bytes()).hexdigest()
+            self.assertNotEqual(protocol_guard['codec_sha256'], expected['codec_sha256'])
+            with self.assertRaises(publication.PublicationError):
+                publication.verify_checkout(protocol_guard, root=root)
             stale = dict(expected, source_commit="f" * 40)
             with self.assertRaises(publication.PublicationError):
                 publication.verify_checkout(stale, root=root)
@@ -507,3 +512,12 @@ print("isolated_plan_and_origins_passed")
             path.write_text("[" * 10000 + "]" * 10000)
             with self.assertRaises(publication.PublicationError):
                 publication._private_json(path)
+
+
+    def test_named_codec_binding_survives_appended_and_reordered_inventory(self):
+        from unittest.mock import patch
+        original = publication.SOURCE_FILES
+        cases = (tuple(reversed(original)), (*original, "src/aws_mesouq/benchmark_accuracy_contexts.py"))
+        for index, source_files in enumerate(cases):
+            with self.subTest(inventory=index), patch.object(publication, "SOURCE_FILES", source_files):
+                self.test_reviewed_checkout_requires_exact_head_clean_sources_and_codec_hash()
