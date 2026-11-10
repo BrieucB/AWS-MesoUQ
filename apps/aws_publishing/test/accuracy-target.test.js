@@ -38,7 +38,7 @@ test('capability activation never bypasses server scientific approval',async()=>
 test('late capabilities from a different project are discarded',async()=>{const gate=deferred();const s=setup(()=>gate.promise);s.lab.capabilities=null;const pending=s.lab.loadCapabilities();s.lab.reset();s.setContext({api:s.api,project:'other',valid:()=>true});gate.resolve(caps);await pending;assert.equal(s.lab.capabilities,null);});
 test('wrapper preserves fixed-budget mode and gates accuracy entry',()=>{const options={context:()=>({api:{},project:'mesouq',valid:()=>true}),onChange:()=>{},download:()=>{}};const workspace=new Workspace(options);assert.equal(workspace.mode,'fixed_budget');assert.match(workspace.view(),/data-benchmark-mode="accuracy_target"[^>]*disabled/);workspace.accuracy.capabilities=caps;assert.doesNotMatch(workspace.view(),/data-benchmark-mode="accuracy_target"[^>]*disabled/);});
 test('unknown allocated cost is never displayed as zero',()=>{const html=accuracyAccounting(campaign.accounting);assert.match(html,/>0<\/td>/);assert.match(html,/Incomplete/);assert.match(html,/Unresolved allocations/);});
-test('completed or archived campaigns are not polled; active campaigns are throttled',async()=>{const s=setup();s.lab.detail=copy(campaign);await s.lab.poll();assert.equal(s.calls.length,0);s.lab.detail.status='running';await s.lab.poll();assert.equal(s.calls.length,2);await s.lab.poll();assert.equal(s.calls.length,2);s.tick(15001);s.lab.detail.status='running';await s.lab.poll();assert.equal(s.calls.length,4);});
+test('completed or archived campaigns are not polled; active campaigns are throttled',async()=>{const s=setup();s.lab.detail=closedPollingFixture(copy(campaign));await s.lab.poll();assert.equal(s.calls.length,0);s.lab.detail.status='running';await s.lab.poll();assert.equal(s.calls.length,2);await s.lab.poll();assert.equal(s.calls.length,2);s.tick(15001);s.lab.detail.status='running';await s.lab.poll();assert.equal(s.calls.length,4);});
 test('task/scientific values are escaped and no target threshold is computed in the view',()=>{const s=setup();s.lab.detail=copy(campaign);s.lab.detail.scientific_status='<script>bad</script>';s.lab.detail.tasks=[{kind:'<img>',status:'failed',attempt:1,factor:'<svg>'}];s.lab.result={scientific_status:'terminal_unmet',qualification:{source_flag:'<iframe>'}};const html=s.lab.view();assert.doesNotMatch(html,/<script>bad|<img>|<svg>|<iframe>/);assert.match(html,/&lt;iframe&gt;/);assert.match(html,/terminal unmet/);});
 test('archival requires the server capability, not just a terminal status',()=>{const s=setup();s.lab.detail=copy(campaign);s.lab.detail.archive.available=false;assert.match(s.lab.detailView(),/data-accuracy-action="archive" disabled/);s.lab.detail.archive.available=true;assert.doesNotMatch(s.lab.detailView(),/data-accuracy-action="archive" disabled/);});
 
@@ -293,4 +293,141 @@ test('source-supplied scientific limitations are shown verbatim and escaped',()=
   for(const value of limitations.slice(0,6))assert.ok(html.includes(value));
   assert.ok(html.includes('&lt;script&gt;alert(&quot;posterior&quot;)&lt;/script&gt; &amp; original'));
   assert.ok(!html.includes('<script>'));assert.deepEqual(s.lab.result.limitations,expected);
+});
+
+
+import {test as lifecycleTest} from 'node:test';
+import lifecycleAssert from 'node:assert/strict';
+import {accuracyLifecycle as inspectLifecycle, accuracyStatusMessages as inspectMessages} from '../src/benchmark-accuracy.js';
+function lifecycleCampaign(overrides={}) {
+ const zero={allocated_gpu_seconds:0,allocated_cpu_seconds:0,reserved_gpu_seconds:0,unknown_allocations:0};
+ return {id:'synthetic-cleanup',schema_version:2,status:'cancelling',scientific_status:null,configuration:{scenario:{family:'baseline',scale:1}},execution_context_id:'e'.repeat(64),configuration_hash:'a'.repeat(64),scientific_request_hash:'b'.repeat(64),methods:{hnpe:{status:'running',effort_target:1920,guide_status:null,candidate_sha256:null},tmcmc:{status:'pending',effort_target:4096,guide_status:null,candidate_sha256:null}},accounting:{hnpe:{allocated_gpu_seconds:7,allocated_cpu_seconds:112,reserved_gpu_seconds:600,unknown_allocations:1},tmcmc:{...zero},reference:{...zero},overhead:{...zero},},archive:{status:'not_requested',available:false,reason:'PRIVATE_ARCHIVE_DETAIL'},tasks:[],result:null,method_seal_sha256:null,blocked_reason:null,...overrides};
+}
+function lifecycleLab(detail) {
+ const lab=Object.create(AccuracyLab.prototype);
+ Object.assign(lab,{detail,loading:false,result:null,rawResultArtifact:null,figures:[],artifacts:[]});
+ return lab;
+}
+lifecycleTest('unresolved cancellation retains costs, polls and cannot be requested twice',()=>{
+ const campaign=lifecycleCampaign(), before=structuredClone(campaign), costs=accuracyAccounting(campaign);
+ const state=inspectLifecycle(campaign);
+ lifecycleAssert.equal(state.shouldPoll,true);lifecycleAssert.equal(state.cleanupPending,true);lifecycleAssert.equal(state.canCancel,false);
+ lifecycleAssert.deepEqual(accuracyAccounting(campaign),costs);lifecycleAssert.deepEqual(campaign,before);
+ lifecycleAssert.equal(campaign.accounting.hnpe.allocated_gpu_seconds,7);lifecycleAssert.equal(campaign.accounting.hnpe.reserved_gpu_seconds,600);
+ lifecycleAssert.match(inspectMessages(campaign).join(' '),/not measured consumption/);
+});
+lifecycleTest('blocked cleanup can be cancelled once while closed terminal states cannot',()=>{
+ lifecycleAssert.equal(inspectLifecycle(lifecycleCampaign({status:'blocked'})).canCancel,true);
+ lifecycleAssert.equal(inspectLifecycle(lifecycleCampaign({status:'blocked'})).shouldPoll,true);
+ for(const status of ['cancelled','completed','failed']) lifecycleAssert.equal(inspectLifecycle(lifecycleCampaign({status})).canCancel,false);
+ const closed=lifecycleCampaign({status:'blocked',accounting:apiClosedAccounting()});
+ lifecycleAssert.equal(inspectLifecycle(closed).canCancel,false);lifecycleAssert.equal(inspectLifecycle(closed).shouldPoll,false);
+});
+lifecycleTest('requested archival keeps a closed campaign polling until verified',()=>{
+ const closed=lifecycleCampaign({status:'completed',accounting:{},archive:{status:'requested',available:true}});
+ lifecycleAssert.equal(inspectLifecycle(closed).shouldPoll,true);
+ closed.archive.status='verified';lifecycleAssert.equal(inspectLifecycle(closed).shouldPoll,false);
+});
+lifecycleTest('missing or inconsistent accounting never becomes confirmed zero use',()=>{
+ const missing=lifecycleCampaign({accounting:undefined});lifecycleAssert.equal(inspectLifecycle(missing).cleanupPending,true);
+ const inconsistent=lifecycleCampaign();inconsistent.accounting.reservation_released=true;
+ lifecycleAssert.equal(inspectLifecycle(inconsistent).cleanupPending,true);
+});
+lifecycleTest('diagnostics never echo unknown operator details or raw failure codes',()=>{
+ const campaign=lifecycleCampaign({status:'blocked',blocked_reason:{code:'PRIVATE_CODE',message:'PRIVATE_OPERATOR_DETAIL'},tasks:[{failure_code:'PRIVATE_FAILURE_DETAIL'}]});
+ const text=inspectMessages(campaign).join(' ');lifecycleAssert.doesNotMatch(text,/PRIVATE_/);
+ lifecycleAssert.match(text,/paused/);lifecycleAssert.match(text,/not available/);lifecycleAssert.match(text,/did not finish/);
+});
+lifecycleTest('known source and archive reasons use friendly allowlisted copy',()=>{
+ const campaign=lifecycleCampaign({status:'blocked',blocked_reason:{code:'accuracy_source_unqualified',message:'PRIVATE_DETAIL'},archive:{status:'not_requested',available:false,reason:"Campaign is not terminal"}});
+ const text=inspectMessages(campaign).join(' ');lifecycleAssert.match(text,/compute profile/);lifecycleAssert.doesNotMatch(text,/PRIVATE_/);
+});
+lifecycleTest('typed recovery messages preserve legacy uncertainty and gate future authorization wording',()=>{
+ const schema='aws_mesouq.benchmark_accuracy_recovery.v1';
+ const unknown=lifecycleCampaign({recovery:{schema,state:'blocked_reconciliation',code:'submission_identity_unknown'}});
+ lifecycleAssert.match(inspectMessages(unknown).join(' '),/needs confirmation/);
+ lifecycleAssert.doesNotMatch(inspectMessages(unknown).join(' '),/before compute authorization/);
+ const granted=lifecycleCampaign({recovery:{schema,state:'blocked_reconciliation',code:'invocation_authorized_unreconciled'}});lifecycleAssert.match(inspectMessages(granted).join(' '),/needs confirmation/);lifecycleAssert.equal(granted.accounting.hnpe.reserved_gpu_seconds,600);
+ const mismatch=lifecycleCampaign({recovery:{schema,state:'cancelled_before_invocation',code:'submission_identity_unknown'}});
+ lifecycleAssert.doesNotMatch(inspectMessages(mismatch).join(' '),/before compute authorization/);
+ const future=lifecycleCampaign({recovery:{schema,state:'cancelled_before_invocation',code:'server_invocation_never_authorized'}});
+ lifecycleAssert.match(inspectMessages(future).join(' '),/Cancelled before compute authorization/);
+ lifecycleAssert.equal(future.accounting.hnpe.reserved_gpu_seconds,600);
+});
+lifecycleTest('detail renders archive explanation and a disabled cancellation acknowledgement',()=>{
+ const html=lifecycleLab(lifecycleCampaign()).detailView();
+ lifecycleAssert.match(html,/data-accuracy-action="cancel"[^>]*disabled/);
+ lifecycleAssert.match(html,/Cancellation requested/);lifecycleAssert.match(html,/Archiving is not available yet/);
+ lifecycleAssert.doesNotMatch(html,/PRIVATE_ARCHIVE_DETAIL/);
+});
+lifecycleTest('blocked detail offers first cancellation only with unresolved cleanup',()=>{
+ const pending=lifecycleLab(lifecycleCampaign({status:'blocked'})).detailView();
+ lifecycleAssert.match(pending,/data-accuracy-action="cancel"/);lifecycleAssert.doesNotMatch(pending,/data-accuracy-action="cancel"[^>]*disabled/);
+ const closed=lifecycleLab(lifecycleCampaign({status:'blocked',accounting:apiClosedAccounting()})).detailView();
+ lifecycleAssert.doesNotMatch(closed,/data-accuracy-action="cancel"/);
+});
+lifecycleTest('accepted cancellation is guarded at the action handler as well as the button',()=>{
+ const lab=lifecycleLab(lifecycleCampaign());let operations=0;lab.operation=()=>{operations++;};
+ lab.change('cancel');lab.change({dataset:{accuracyAction:'cancel'}});
+ lifecycleAssert.equal(operations,0);
+});
+
+lifecycleTest('status wrapper invokes the original detail content exactly once',()=>{const lab=lifecycleLab(lifecycleCampaign()),original=lab.detailContent;let renders=0;lab.detailContent=function(){renders++;return original.call(this);};lab.detailView();lifecycleAssert.equal(renders,1);});
+
+lifecycleTest('busy cancellation stays disabled before the server acknowledgement',()=>{const lab=lifecycleLab(lifecycleCampaign({status:'running'}));lab.loading=true;let operations=0;lab.operation=()=>{operations++;};lifecycleAssert.match(lab.detailView(),/data-accuracy-action="cancel"[^>]*disabled/);lab.change('cancel');lab.change({dataset:{accuracyAction:'cancel'}});lifecycleAssert.equal(operations,0);});
+
+lifecycleTest('extra recovery fields cannot authorize specialized cancellation wording',()=>{const campaign=lifecycleCampaign({recovery:{schema:'aws_mesouq.benchmark_accuracy_recovery.v1',state:'cancelled_before_invocation',code:'server_invocation_never_authorized',message:'PRIVATE_OPERATOR_DETAIL'}});lifecycleAssert.doesNotMatch(inspectMessages(campaign).join(' '),/before compute authorization|PRIVATE_/);});
+
+lifecycleTest('historical failure copy preserves a completed scientific outcome and accounting',()=>{const campaign=lifecycleCampaign({status:'completed',scientific_status:'passed',accounting:{},tasks:[{status:'failed',failure_code:'PRIVATE_OLD_FAILURE'}]});const before=structuredClone(campaign),text=inspectMessages(campaign).join(' ');lifecycleAssert.match(text,/did not finish/);lifecycleAssert.doesNotMatch(text,/needs attention|PRIVATE_/);lifecycleAssert.deepEqual(campaign,before);});
+
+function closedPollingFixture(value){const copy=structuredClone(value),accounting=copy.accounting??{};for(const row of Object.values(accounting)){if(row&&typeof row==='object'){row.reserved_gpu_seconds=0;row.unknown_allocations=0;}}accounting.reservation_released=true;copy.accounting=accounting;return copy;}
+
+lifecycleTest('explicit unresolved terminal costs continue polling until normal closure',()=>{for(const status of ['completed','failed','cancelled']){const campaign=lifecycleCampaign({status}),before=structuredClone(campaign);lifecycleAssert.equal(inspectLifecycle(campaign).shouldPoll,true);lifecycleAssert.deepEqual(campaign,before);}const closed=closedPollingFixture(lifecycleCampaign({status:'completed'}));lifecycleAssert.equal(inspectLifecycle(closed).shouldPoll,false);});
+
+function apiClosedAccounting(){
+  const row=()=>({allocated_gpu_seconds:7,cpu_seconds:112,settled_gpu_seconds:7,settled_cpu_seconds:112,reserved_gpu_seconds:0,unknown_allocations:0});
+  return {hnpe:row(),tmcmc:row(),reference:row(),overhead:row()};
+}
+test('API-shaped settled blocked campaign stops cleanup and offers archive',async()=>{
+  const {accuracyLifecycle}=await import('../src/benchmark-accuracy.js');
+  const campaign=lifecycleCampaign({status:'blocked',accounting:apiClosedAccounting(),archive:{status:'not_requested',available:true}});
+  const before=structuredClone(campaign),state=accuracyLifecycle(campaign);
+  assert.equal(state.cleanupPending,false);assert.equal(state.canCancel,false);assert.equal(state.shouldPoll,false);
+  assert.deepEqual(campaign,before);assert.equal('reservation_released' in campaign.accounting,false);
+  const html=lifecycleLab(campaign).detailView();
+  assert.doesNotMatch(html,/data-accuracy-action="cancel"/);assert.match(html,/data-accuracy-action="archive"/);
+  assert.doesNotMatch(html,/<button[^>]*data-accuracy-action="archive"[^>]*disabled/);
+});
+test('API-shaped settled blocked campaign keeps polling only requested archive',async()=>{
+  const {accuracyLifecycle}=await import('../src/benchmark-accuracy.js');
+  const campaign=lifecycleCampaign({status:'blocked',accounting:apiClosedAccounting(),archive:{status:'requested',available:false}});
+  const state=accuracyLifecycle(campaign);
+  assert.equal(state.cleanupPending,false);assert.equal(state.canCancel,false);assert.equal(state.shouldPoll,true);
+});
+test('actual unsettled public fields keep every terminal status polling',async()=>{
+  const {accuracyLifecycle}=await import('../src/benchmark-accuracy.js');
+  for(const status of ['blocked','cancelled','failed','completed']){
+    for(const field of ['reserved_gpu_seconds','unknown_allocations']){
+      const accounting=apiClosedAccounting();accounting.hnpe[field]=1;
+      const state=accuracyLifecycle(lifecycleCampaign({status,accounting}));
+      assert.equal(state.cleanupPending,true);assert.equal(state.shouldPoll,true);
+    }
+  }
+});
+test('blocked and cancelling remain conservative when public accounting is incomplete',async()=>{
+  const {accuracyLifecycle}=await import('../src/benchmark-accuracy.js');
+  for(const status of ['blocked','cancelling']){
+    for(const accounting of [undefined,{}, {...apiClosedAccounting(),hnpe:{reserved_gpu_seconds:0}}]){
+      const state=accuracyLifecycle(lifecycleCampaign({status,accounting}));
+      assert.equal(state.cleanupPending,true);assert.equal(state.shouldPoll,true);
+    }
+  }
+});
+
+test('zero reservations do not turn cancelling into a terminal campaign',async()=>{
+  const {accuracyLifecycle}=await import('../src/benchmark-accuracy.js');
+  const campaign=lifecycleCampaign({status:'cancelling',accounting:apiClosedAccounting(),archive:{status:'not_requested',available:false}});
+  const state=accuracyLifecycle(campaign);
+  assert.equal(state.cleanupPending,false);assert.equal(state.shouldPoll,true);assert.equal(state.canCancel,false);
+  assert.equal(campaign.status,'cancelling');assert.equal(campaign.archive.available,false);
 });
