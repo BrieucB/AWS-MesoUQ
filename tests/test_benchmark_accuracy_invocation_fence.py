@@ -12,6 +12,7 @@ fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
 native=fixtures.native
 
 def future(tmp_path,monkeypatch):
+    _portable_xattr_mock_symbols(monkeypatch)
     _,manifest,control,_,reached=fixtures.real_protocol_native_control(tmp_path,monkeypatch,"future-λ")
     context=deepcopy(control["context"])
     context["capabilities"]=sorted(context["capabilities"]+[p.INVOCATION_PROTOCOL])
@@ -45,8 +46,7 @@ def future(tmp_path,monkeypatch):
 @pytest.mark.parametrize("ref",["0369bfa6cad62517a4e01dcbaee0207c2955a2a5","ede35e7d0cfa39bf9ec6dca0af27fbfd0c6bf44f"])
 def test_actual_old_validator_accepts_legacy_but_rejects_future_manifest(ref,tmp_path,monkeypatch):
     context,manifest,control,claim,reached=future(tmp_path,monkeypatch)
-    raw=subprocess.run(["git","-C",str(ROOT),"show",ref+":src/aws_mesouq/benchmark_accuracy_protocol.py"],
-        capture_output=True,check=True,timeout=5).stdout
+    raw = _legacy_source(ref, 'src/aws_mesouq/benchmark_accuracy_protocol.py')
     namespace={"__name__":"aws_mesouq.old_protocol_fixture","__package__":"aws_mesouq","__file__":str(ROOT/"src/aws_mesouq/benchmark_accuracy_protocol.py")}
     exec(compile(raw,namespace["__file__"],"exec",dont_inherit=True),namespace)
     legacy=deepcopy(manifest);legacy.pop("submission_protocol")
@@ -76,3 +76,51 @@ def test_mixed_context_or_protocol_metadata_rejects(which,tmp_path,monkeypatch):
         context["id"]=p.context_id(context);manifest["context_id"]=context["id"]
     else:manifest["submission_protocol"]="untrusted"
     with pytest.raises(ValueError):p.validate_manifest_context(manifest,context)
+
+
+def _portable_xattr_mock_symbols(monkeypatch):
+    import errno
+    import os
+    def no_linux_acl(*args, **kwargs):
+        raise OSError(getattr(errno, "ENODATA", 61), "synthetic POSIX ACL absent")
+    for name in ("getxattr", "removexattr"):
+        if not hasattr(os, name):
+            monkeypatch.setattr(os, name, no_linux_acl, raising=False)
+
+
+def _legacy_source(ref, relative):
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    path = root / "tests" / "fixtures" / "accuracy_legacy_protocol" / "loader.py"
+    spec = importlib.util.spec_from_file_location("historical_accuracy_source_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_source(root, ref, relative)
+
+
+def test_native_future_manifest_with_absent_platform_xattrs(tmp_path, monkeypatch):
+    import os
+    for name in ("getxattr", "setxattr", "listxattr", "removexattr"):
+        monkeypatch.delattr(os, name, raising=False)
+    test_unchanged_native_adapter_prepares_and_validates_future_manifest(tmp_path, monkeypatch)
+
+
+def test_historical_source_fixture_authentication_without_git(tmp_path):
+    import shutil
+    fixture_root = Path(__file__).resolve().parents[1]
+    source = fixture_root / "tests" / "fixtures" / "accuracy_legacy_protocol"
+    target = tmp_path / "tests" / "fixtures" / "accuracy_legacy_protocol"
+    shutil.copytree(source, target)
+    spec = importlib.util.spec_from_file_location("isolated_historical_sources", target / "loader.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert not (tmp_path / ".git").exists()
+    for (ref, relative), (name, sha, blob, size) in module.SOURCES.items():
+        assert len(module.load_source(tmp_path, ref, relative)) == size
+    ref, relative = next(iter(module.SOURCES))
+    name = module.SOURCES[(ref, relative)][0]
+    path = target / name
+    path.write_bytes(path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="fixture integrity"):
+        module.load_source(tmp_path, ref, relative)
