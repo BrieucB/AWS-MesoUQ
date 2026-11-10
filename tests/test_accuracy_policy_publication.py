@@ -23,6 +23,70 @@ URI = ACCOUNT + ".dkr.ecr.eu-central-1.amazonaws.com/backend"
 IMAGE = URI + "@sha256:" + "a" * 64
 
 
+def _fixture_receipt(context):
+    """Synthetic attestation boundary; real-source generation has separate tests."""
+    bare = deepcopy(context)
+    bare.pop("source_qualification", None)
+    return {
+        "schema": "aws_mesouq.benchmark_accuracy_source_qualification_receipt.v1",
+        "qualification": deepcopy(context["source_qualification"]),
+        "input_context_id": publication.protocol.context_id(bare),
+        "qualified_context_id": context["id"],
+        "runtime_profile_sha256": context["runtime_profile_sha256"],
+        "adapter_sha256": context["adapter_sha256"],
+    }
+
+
+def _fixture_qualified_policy(policy):
+    for contexts in policy.values():
+        for value in contexts:
+            if value["enabled"]:
+                value["source_qualification"] = {
+                    "schema": publication.protocol.SOURCE_QUALIFICATION_SCHEMA,
+                    "science_revision": value["science_revision"],
+                    "source_binding_sha256": value["source_binding_sha256"],
+                    "semantic_policy_sha256": value["policy_sha256"],
+                }
+                value["id"] = publication.protocol.context_id(value)
+    return policy
+
+
+def _fixture_guard_pins(value, policy):
+    policy = target_policy() if policy is None else policy
+    import hashlib
+    pins = {context["id"]: hashlib.sha256(
+        publication.protocol.canonical(_fixture_receipt(context)) + b"\n").hexdigest()
+        for contexts in policy.values() for context in contexts
+        if context["enabled"] and "source_qualification" in context}
+    if pins:
+        value["source_qualification_receipts"] = pins
+    return value
+
+
+def _fixture_receipt_paths(policy, directory):
+    paths = []
+    for contexts in policy.values():
+        for context in contexts:
+            if context["enabled"] and "source_qualification" in context:
+                path = directory / ("qualification-" + str(len(paths)) + ".json")
+                path.write_bytes(publication.protocol.canonical(_fixture_receipt(context)) + b"\n")
+                path.chmod(0o600)
+                paths.append(path)
+    return paths
+
+
+def _publish_fixture(values):
+    from pathlib import Path
+    import tempfile
+    values = dict(values)
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary).resolve()
+        directory.chmod(0o700)
+        values.setdefault("qualification_receipts",
+            _fixture_receipt_paths(values["project_policies"], directory))
+        return publication.publish(**values)
+
+
 def context(project="p", *, revision="a", owner="alice"):
     value = {
         "schema": protocol.CONTEXT_SCHEMA, "id": "0" * 64, "enabled": True,
@@ -43,7 +107,7 @@ def context(project="p", *, revision="a", owner="alice"):
 def target_policy():
     old = context()
     old["enabled"] = False
-    return {"p": [old, context(revision="f")]}
+    return _fixture_qualified_policy({"p": [old, context(revision="f")]})
 
 
 class FakeAws:
@@ -105,7 +169,7 @@ class FakeAws:
 
 def guard(aws, policy=None):
     values = aws.cfg["Environment"]["Variables"]
-    return {
+    return _fixture_guard_pins({
         "schema": publication.GUARD_SCHEMA, "function_name": "fixture",
         "repository_uri": URI, "source_commit": "c" * 40,
         "source_repository": "https://github.com/Example/Fixture",
@@ -115,7 +179,7 @@ def guard(aws, policy=None):
         "environment_sha256": publication.checksum(values),
         "project_policy_sha256": publication.checksum(policy or target_policy()),
         "codec_sha256": "d" * 64,
-    }
+    }, policy)
 
 
 def publish(aws, **kwargs):
@@ -123,7 +187,7 @@ def publish(aws, **kwargs):
                   image_verifier=lambda *args: IMAGE, checkout_verifier=lambda value: None,
                   sleep=lambda seconds: None)
     values.update(kwargs)
-    return publication.publish(**values)
+    return _publish_fixture(values)
 
 
 class AccuracyPolicyPublicationTests(unittest.TestCase):
@@ -286,7 +350,7 @@ class CheckoutAndCliTests(unittest.TestCase):
             cwd="/tmp", env=environment, capture_output=True, text=True, timeout=10)
         self.assertEqual(invalid.returncode, 1)
         self.assertNotIn("Traceback", invalid.stderr)
-        script = r"""
+        script = r'''
 import importlib.abc, importlib.util, json, pathlib, runpy, sys, tempfile
 class NoML(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
@@ -312,14 +376,15 @@ with tempfile.TemporaryDirectory() as temporary:
         path = directory/name
         path.write_text(json.dumps(value))
         path.chmod(0o600)
-    result = entry["main"](["--guard",str(directory/"guard.json"),
+    qualification_paths = fixtures._fixture_receipt_paths(fixtures.target_policy(), directory)
+    result = entry["main"]((["--guard",str(directory/"guard.json"),
         "--project-policy",str(directory/"policy.json"),
-        "--receipt-directory",str(directory/"receipts")])
+        "--receipt-directory",str(directory/"receipts")] + [part for path in qualification_paths for part in ("--qualification-receipt", str(path))]))
     assert result == 0 and not aws.update_calls
     receipt = json.loads((directory/"receipts/receipt.json").read_text())
     assert receipt["status"] == "planned" and receipt["configuration_updates"] == 0
 print("isolated_plan_and_origins_passed")
-"""
+'''
         planned = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(ROOT)],
                                  cwd="/tmp", env=environment, capture_output=True,
                                  text=True, timeout=10)

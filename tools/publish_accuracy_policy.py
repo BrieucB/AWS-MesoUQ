@@ -22,6 +22,7 @@ sys.path[:0] = [str(SOURCE_ROOT / "tools"), str(SOURCE_ROOT / "src"),
 from publish_backend import CONFIG_KEYS, canonical, verify_source
 from publish_website import PublicationError, require
 from aws_publishing.accuracy import AccuracyApplication
+from aws_mesouq import benchmark_accuracy_protocol as protocol
 from aws_publishing.accuracy_policy_env import decode_policies, encode_policies
 
 GUARD_SCHEMA = "aws_mesouq.accuracy_policy_activation_guard.v1"
@@ -38,6 +39,7 @@ SOURCE_FILES = (
     "tools/publish_website.py",
     "services/aws_publishing/aws_publishing/accuracy.py",
     "services/aws_publishing/aws_publishing/accuracy_policy_env.py",
+    "src/aws_mesouq/benchmark_accuracy_protocol.py",
 )
 
 
@@ -73,6 +75,123 @@ def environment_size(variables):
                for key, value in variables.items())
 
 
+OPTIONAL_GUARD_KEYS = {"source_qualification_receipts"}
+QUALIFICATION_RECEIPT_SCHEMA = "aws_mesouq.benchmark_accuracy_source_qualification_receipt.v1"
+QUALIFICATION_RECEIPT_KEYS = {"schema", "qualification", "input_context_id",
+    "qualified_context_id", "runtime_profile_sha256", "adapter_sha256"}
+
+
+def _receipt_identity(info):
+    return tuple(getattr(info, name) for name in (
+        "st_dev", "st_ino", "st_uid", "st_mode", "st_nlink",
+        "st_size", "st_mtime_ns", "st_ctime_ns"))
+
+
+def _qualification_receipt(path, trusted_hashes):
+    """Read one private, SHA-pinned native-generator receipt, never a client pin."""
+    try:
+        path = Path(path)
+        require(path.is_absolute() and str(path) == str(path.resolve(strict=True)),
+                "accuracy-policy-qualification-receipt-input")
+        parent = path.parent.lstat()
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid()
+                and stat.S_IMODE(parent.st_mode) == 0o700,
+                "accuracy-policy-qualification-receipt-input")
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(directory)
+            require((parent.st_dev, parent.st_ino, parent.st_uid, parent.st_mode) ==
+                    (current.st_dev, current.st_ino, current.st_uid, current.st_mode),
+                    "accuracy-policy-qualification-receipt-input")
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+            with os.fdopen(fd, "rb") as stream:
+                before = os.fstat(stream.fileno())
+                require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+                        and before.st_nlink == 1
+                        and stat.S_IMODE(before.st_mode) in (0o400, 0o600)
+                        and 0 < before.st_size <= 4096,
+                        "accuracy-policy-qualification-receipt-input")
+                raw = stream.read(4097)
+                require(len(raw) == before.st_size
+                        and _receipt_identity(before) == _receipt_identity(os.fstat(stream.fileno()))
+                        == _receipt_identity(os.stat(path.name, dir_fd=directory, follow_symlinks=False)),
+                        "accuracy-policy-qualification-receipt-input")
+            current = path.parent.lstat()
+            require((parent.st_dev, parent.st_ino, parent.st_uid, parent.st_mode) ==
+                    (current.st_dev, current.st_ino, current.st_uid, current.st_mode),
+                    "accuracy-policy-qualification-receipt-input")
+        finally:
+            os.close(directory)
+        digest = hashlib.sha256(raw).hexdigest()
+        # Check the owner-reviewed byte pin before interpreting any receipt fields.
+        require(digest in trusted_hashes, "accuracy-policy-qualification-receipt-sha256")
+        receipt = json.loads(raw)
+        require(isinstance(receipt, dict)
+                and raw == protocol.canonical(receipt) + b"\n",
+                "accuracy-policy-qualification-receipt-invalid")
+        return receipt, digest
+    except PublicationError:
+        raise
+    except (OSError, ValueError, TypeError, RecursionError, OverflowError):
+        raise PublicationError("accuracy-policy-qualification-receipt-input") from None
+
+
+def _validate_qualification_receipts(guard, project_policies, paths):
+    """Bind qualified enabled contexts to trusted source-derived generator output."""
+    try:
+        contexts = {context["id"]: context
+                    for entries in project_policies.values() for context in entries
+                    if context["enabled"] and "source_qualification" in context}
+        require(all(protocol.source_policy_qualified(c) for c in contexts.values()),
+                "accuracy-policy-source-unqualified")
+        pins = guard.get("source_qualification_receipts", {})
+        require(isinstance(pins, dict) and len(pins) <= 16
+                and set(pins) == set(contexts),
+                "accuracy-policy-qualification-receipt-set")
+        for context_id, digest in pins.items():
+            protocol.sha(context_id)
+            protocol.sha(digest)
+        require(len(set(pins.values())) == len(pins),
+                "accuracy-policy-qualification-receipt-set")
+        require(isinstance(paths, (list, tuple)) and len(paths) == len(contexts),
+                "accuracy-policy-qualification-receipt-set")
+        seen = set()
+        for path in paths:
+            receipt, digest = _qualification_receipt(path, set(pins.values()))
+            require(set(receipt) == QUALIFICATION_RECEIPT_KEYS
+                    and receipt["schema"] == QUALIFICATION_RECEIPT_SCHEMA,
+                    "accuracy-policy-qualification-receipt-invalid")
+            context_id = protocol.sha(receipt["qualified_context_id"])
+            require(context_id in contexts and context_id not in seen
+                    and digest == pins[context_id],
+                    "accuracy-policy-qualification-receipt-binding")
+            context = contexts[context_id]
+            record = protocol.validate_source_qualification(receipt["qualification"])
+            protocol.sha(receipt["input_context_id"])
+            require(protocol.canonical(record) == protocol.canonical(context["source_qualification"])
+                    and receipt["runtime_profile_sha256"] == context["runtime_profile_sha256"]
+                    and receipt["adapter_sha256"] == context["adapter_sha256"],
+                    "accuracy-policy-qualification-receipt-binding")
+            seen.add(context_id)
+        require(seen == set(contexts), "accuracy-policy-qualification-receipt-set")
+    except PublicationError:
+        raise
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        raise PublicationError("accuracy-policy-qualification-receipt-invalid") from None
+
+
+def _validate_legacy_source_reuse(existing, update):
+    """Absent qualification may remain absent only for an unchanged enabled legacy ID."""
+    for project, contexts in update.items():
+        previous = {context["id"]: context for context in existing.get(project, [])}
+        for context in contexts:
+            if context["enabled"] and "source_qualification" not in context:
+                old = previous.get(context["id"])
+                require(old is not None and old["enabled"],
+                        "accuracy-policy-new-source-unqualified")
+
+
 def validate_policies(value):
     try:
         AccuracyApplication(None, None, accuracy_policies=value)
@@ -86,6 +205,7 @@ def verify_import_origins():
         "publish_backend": SOURCE_ROOT / "tools" / "publish_backend.py",
         "publish_website": SOURCE_ROOT / "tools" / "publish_website.py",
         "aws_mesouq": SOURCE_ROOT / "src" / "aws_mesouq" / "__init__.py",
+        "aws_mesouq.benchmark_accuracy_protocol": SOURCE_ROOT / "src" / "aws_mesouq" / "benchmark_accuracy_protocol.py",
         "aws_publishing.accuracy": SOURCE_ROOT / "services" / "aws_publishing" / "aws_publishing" / "accuracy.py",
         "aws_publishing.accuracy_policy_env": SOURCE_ROOT / "services" / "aws_publishing" / "aws_publishing" / "accuracy_policy_env.py",
     }
@@ -116,8 +236,7 @@ def verify_checkout(guard, *, root=SOURCE_ROOT):
 
 
 def _validate_guard(guard, project_policies):
-    require(isinstance(guard, dict) and set(guard) == GUARD_KEYS
-            and guard["schema"] == GUARD_SCHEMA, "accuracy-policy-guard-invalid")
+    require(isinstance(guard, dict) and GUARD_KEYS <= set(guard) and set(guard) <= GUARD_KEYS | OPTIONAL_GUARD_KEYS, "accuracy-policy-guard-invalid")
     for name in ("v1_policy_sha256", "v2_policy_sha256", "environment_sha256",
                  "project_policy_sha256", "codec_sha256"):
         require(isinstance(guard[name], str) and re.fullmatch(r"[a-f0-9]{64}", guard[name]),
@@ -159,15 +278,17 @@ def _merge_policies(existing, update):
                     {k: v for k, v in context.items() if k != "enabled"},
                     "accuracy-policy-history-conflict")
         merged[project] = deepcopy(contexts)
+    _validate_legacy_source_reuse(existing, update)
     return validate_policies(merged)
 
 
 def publish(guard, project_policies, *, apply=False, aws=None,
-            image_verifier=None, checkout_verifier=None, sleep=time.sleep):
+            image_verifier=None, checkout_verifier=None, sleep=time.sleep, qualification_receipts=()):
     """Perform at most one configuration update; ambiguous replies require reconciliation."""
     verify_import_origins()
     account, region, update = _validate_guard(guard, project_policies)
     (checkout_verifier or verify_checkout)(guard)
+    _validate_qualification_receipts(guard, project_policies, qualification_receipts)
     raw_aws = aws or _SingleAttemptAws()
 
     def call(*arguments):
@@ -290,6 +411,7 @@ def main(argv=None):
     parser.add_argument("--project-policy", required=True)
     parser.add_argument("--receipt-directory", required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--qualification-receipt", action="append", default=[])
     args = parser.parse_args(argv)
     try:
         guard, policy = _private_json(args.guard), _private_json(args.project_policy)
@@ -303,7 +425,7 @@ def main(argv=None):
             "apply": args.apply,
         })
         try:
-            result = publish(guard, policy, apply=args.apply)
+            result = publish(guard, policy, apply=args.apply, qualification_receipts=args.qualification_receipt)
         except (PublicationError, OSError, ValueError) as error:
             _save_private(directory / "failure.json", {
                 "schema": "aws_mesouq.accuracy_policy_activation_failure.v1",
