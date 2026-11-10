@@ -97,10 +97,13 @@ export function accuracyLifecycle(campaign) {
   if (!campaign) return {cleanupPending:false, archivePending:false, cancellationRequested:false, canCancel:false, shouldPoll:false};
   const status = campaign.status;
   const accounting = campaign.accounting;
-  const rows = ['hnpe','tmcmc','reference','overhead'].map(name => accounting?.[name]).filter(value => value && typeof value === 'object');
+  const rows=[...['hnpe','tmcmc'].map(key=>accounting&&Object.hasOwn(accounting,key)?accounting[key]:accounting?.methods?.[key]),accounting?.reference,accounting?.overhead].filter(row=>row&&typeof row==='object'&&!Array.isArray(row));
   const unresolved = rows.some(row => ['reserved_gpu_seconds','unknown_allocations'].some(key => row[key] !== undefined && (typeof row[key] !== 'number' || !Number.isFinite(row[key]) || row[key] < 0 || row[key] > 0)));
-  const uncertainCleanup = (status === 'blocked' || status === 'cancelling') && accounting?.reservation_released !== true;
-  const cleanupPending = accounting?.reservation_released === false || unresolved || uncertainCleanup;
+  const completeAccounting=accounting&&typeof accounting==='object'&&!Array.isArray(accounting)&&rows.length===4&&rows.every(row=>{
+    return row&&typeof row==='object'&&!Array.isArray(row)&&['reserved_gpu_seconds','unknown_allocations'].every(field=>typeof row[field]==='number'&&Number.isFinite(row[field])&&row[field]>=0);
+  });
+  const uncertainCleanup=(status==='blocked'||status==='cancelling')&&!completeAccounting;
+  const cleanupPending=unresolved||uncertainCleanup;
   const archivePending = campaign.archive?.status === 'requested';
   const cancellationRequested = status === 'cancelling' || status === 'cancelled';
   const canCancel = !cancellationRequested && typeof status === 'string' && (!terminal.has(status) || (status === 'blocked' && cleanupPending));
