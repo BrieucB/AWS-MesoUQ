@@ -62,3 +62,12 @@ an explicit owner release approval, then admit the new worker through the
 normal package/source checks. Verify that replay and historical recovery work
 before authorizing new work. An existing campaign has no context-migration
 operation: starting a corrected campaign requires a separate owner decision.
+
+
+### Qualification publication and submission recovery
+
+Policy publication verifies each enabled qualified context against an exact source-derived qualification receipt whose raw SHA-256 is pinned in the trusted activation guard. The publisher rejects missing, substituted, duplicate, or unused receipts before AWS mutation. Existing enabled legacy contexts retain their original identities; they are not silently qualified, and new work still requires source qualification. See [source-policy qualification](source-policy-qualification.md) for the publication contract.
+
+New contexts may opt future tasks into the versioned server invocation fence. The server grants submission authority atomically, and only the first successful response can authorize one native submission in that call. Cancellation before the grant can close that new allocation with a distinct server-backed abort receipt. A lost grant response, a prior grant, or an ambiguous submission remains unresolved until the same original producer and authoritative terminal accounting are reconciled. See [submission recovery](benchmark-accuracy-recovery.md) for the protocol and acceptance matrix.
+
+The optional protocol must never be added retroactively to existing manifests or history. A local journal flag or missing scheduler record does not prove that a legacy job was never submitted. The application displays that recovery state, preserves reservations and completed evidence, and blocks normal archival until terminal accounting is complete.

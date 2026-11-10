@@ -1,0 +1,1 @@
+These are unmodified Git blobs from the exact source revisions listed in source-manifest.json. The loader checks both raw SHA-256 and Git-blob SHA-1 before tests execute them. Tests require no Git history, repository metadata, network, or runtime data. The snapshots exercise the original protocol/context validators; they do not reimplement them.

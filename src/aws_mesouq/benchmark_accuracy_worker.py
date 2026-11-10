@@ -393,6 +393,10 @@ class AccuracyWorker:
         # fresh event ID and the newly authenticated lease/revision.
         entry["reconcile_event"] = None
         self.save()
+        if kind == "authorize_invocation":
+            entry["phase"] = "reconciling"
+            self.save()
+            return
         if closed and kind in ("submitted", "queued", "running", "submission_unknown", "allocation_closed"):
             entry["phase"] = "closed" if entry["native_terminal"] is not None else "waiting"
             self.save()
@@ -500,6 +504,52 @@ class AccuracyWorker:
         entry["phase"] = "prepared"
         self.save()
 
+    def _request_invocation_authorization(self, entry):
+        """Only this new request's call stack may consume a first-application ACK."""
+        nonce = uuid4().hex
+        preparation = entry["native_preparation"]
+        intent = {key: preparation[key] for key in ("script_sha256", "intent_sha256", "marker")}
+        payload = {"grant_request_nonce": nonce, "submission_intent_sha256": p.checksum(intent)}
+        try:
+            response = self._event(entry, "authorize_invocation", payload,
+                                   phase_after="invocation_authorized")
+        except ConnectorAPIError as error:
+            if error.status == 409 and error.code in (
+                    "accuracy_invocation_already_authorized", "accuracy_invocation_fence_conflict",
+                    "accuracy_invocation_forbidden"):
+                pending = entry["pending_event"]
+                if pending is not None:
+                    entry.setdefault("rejected_events", []).append({**deepcopy(pending),
+                        "body_sha256": p.checksum(pending["body"]),
+                        "rejection_code": error.code, "rejected_at": self.clock()})
+                    entry["pending_event"] = None
+                entry["phase"] = "reconciling"
+                self.save()
+                return False
+            raise
+        # Replays and recovered pending bodies never enter this new-request
+        # stack. The server also masks fresh=False on every idempotent replay.
+        if not isinstance(response, dict) or response.get("invocation_authorization_fresh") is not True:
+            entry["phase"] = "reconciling"
+            self.save()
+            return False
+        grant = p.validate_invocation_authorization(response.get("invocation_authorization"),
+            entry["claim"]["task"]["manifest"], intent, nonce)
+        lease = entry["claim"]["task"]["lease"]
+        if (grant["connector_id"] != self.client._identity()["connector_id"]
+                or grant["lease_epoch"] != lease["epoch"]):
+            raise AccuracyWorkerBlocked("Invocation authorization changed its current fence")
+        if not self._refresh(entry, force=True):
+            return False
+        if self._cancelled(entry):
+            entry["phase"] = "reconciling"
+            self.save()
+            return False
+        lease = entry["claim"]["task"]["lease"]
+        if lease["epoch"] != grant["lease_epoch"] or lease["expires_at"] <= self.clock() + 10:
+            raise AccuracyWorkerBlocked("Invocation authorization expired or transferred")
+        return True
+
     def _submit_once(self, entry):
         if not self._refresh(entry, force=True):
             return
@@ -534,6 +584,10 @@ class AccuracyWorker:
             raise AccuracyWorkerBlocked("Submission fence changed during native checks")
         self._validate_existing(entry)
         self.contexts.require_new_work(entry["context_id"])
+        if p.invocation_fenced(entry["claim"]["task"]["manifest"]):
+            if not self._request_invocation_authorization(entry):
+                return
+            lease = entry["claim"]["task"]["lease"]
         entry["submission_invoked"] = True
         entry["phase"] = "submission_invoked"
         self.save()
@@ -700,7 +754,7 @@ class AccuracyWorker:
                 ("script_sha256", "intent_sha256", "marker")}, phase_after="intent_ack")
         elif phase == "intent_ack":
             self._submit_once(entry)
-        elif phase in ("submission_invoked", "reconciling"):
+        elif phase in ("submission_invoked", "reconciling", "invocation_authorized"):
             if not self._lookup(entry) and not entry.get("unknown_reported"):
                 self._event(entry, "submission_unknown", {"marker": entry["claim"]["task"]["marker"],
                     "reason": "Scheduler acknowledgement is ambiguous; marker reconciliation only"},

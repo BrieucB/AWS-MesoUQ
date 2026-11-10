@@ -274,6 +274,9 @@ class AccuracyRoutes:
             result["verified_artifacts"] = self._verified_artifacts(state, campaign)
             rows, next_key = self._records(state, "accuracy_tasks", campaign["id"] + ":", 50, reverse=True)
             result["tasks"] = [self.public_task(task) for _, task in rows]
+            recovery = self._public_recovery(campaign, [task for _, task in rows])
+            if recovery is not None:
+                result["recovery"] = recovery
             result["next_task_cursor"] = _encoded(next_key)
         return result
 
@@ -282,6 +285,9 @@ class AccuracyRoutes:
         result = {name: deepcopy(task.get(name)) for name in (
             "id", "kind", "method", "factor", "attempt", "status", "generation",
             "effort_target", "created_at", "updated_at", "failure_code", "progress")}
+        recovery = protocol.recovery_status(task)
+        if recovery is not None:
+            result["recovery"] = recovery
         return result
 
     def capabilities(self, state, identity, sub, project):
@@ -408,6 +414,9 @@ class AccuracyRoutes:
                 campaign["methods"][task["method"]]["candidate_sha256"]
                 if task["method"] in ("hnpe", "tmcmc") else None},
             "inputs": deepcopy(inputs or {})}
+        if protocol.INVOCATION_PROTOCOL in context["capabilities"]:
+            manifest["submission_protocol"] = protocol.INVOCATION_PROTOCOL
+            manifest = protocol.validate_manifest(manifest)
         protocol.validate_manifest(manifest)
         protocol.validate_manifest_context(manifest, context)
         task["manifest"], task["manifest_sha256"] = manifest, protocol.checksum(manifest)
@@ -606,6 +615,7 @@ class AccuracyRoutes:
 
     def _private_claim_task(self, task):
         result = self.public_task(task)
+        result.pop("recovery", None)
         result.update({name: deepcopy(task[name]) for name in (
             "revision", "manifest", "manifest_sha256", "marker", "allocation_id", "slurm_job_id")})
         result["lease"] = deepcopy(task["lease"])
@@ -677,6 +687,7 @@ class AccuracyRoutes:
 
     def _ack(self, state, campaign, task):
         value = self.public_task(task)
+        value.pop("recovery", None)
         value.update({"revision": task["revision"], "lease_epoch": task["lease_epoch"],
             "lease_expires_at": task["lease"]["expires_at"] if task["lease"] else None,
             "manifest_sha256": task["manifest_sha256"], "slurm_job_id": task["slurm_job_id"]})
@@ -729,6 +740,72 @@ class AccuracyRoutes:
         if task["id"] in campaign["active_tasks"]:
             campaign["active_tasks"].remove(task["id"])
 
+    def _public_recovery(self, campaign, tasks):
+        if campaign["status"] != "cancelling":
+            return None
+        priority = {"blocked_reconciliation": 0, "awaiting_accounting": 1,
+                    "finalizing_cancellation": 2}
+        active = set(campaign["active_tasks"])
+        values = [protocol.recovery_status(task) for task in tasks if task.get("id") in active]
+        values = [value for value in values if value and value["state"] in priority]
+        return min(values, key=lambda value: priority[value["state"]]) if values else None
+
+    def _uses_invocation_fence(self, campaign, task):
+        manifest = task["manifest"]
+        if not protocol.invocation_fenced(manifest):
+            return False
+        protocol.validate_manifest_context(manifest, self._context(campaign))
+        return True
+
+    def _abort_ungranted_invocation(self, state, campaign, task):
+        # This is a server transaction fact for future opt-in tasks, never an
+        # interpretation of local journal flags or a missing scheduler record.
+        if (not self._uses_invocation_fence(campaign, task)
+                or campaign["status"] != "cancelling"
+                or task["submission_intent"] is None
+                or task.get("submission_intent_fence") is None
+                or task.get("invocation_authorization") is not None
+                or task["slurm_job_id"] is not None or task["accounting_closed"] is not False
+                or task["status"] not in ("submitting", "submission_unknown", "cancelling")
+                or task.get("native_clock") is not None or task.get("scheduler_accounting") is not None
+                or task.get("result") is not None or task.get("artifact_ids")):
+            _error(409, "accuracy_invocation_abort_forbidden", "Unresolved invocation cannot be guessed as zero")
+        row = self._row(state, campaign, task)
+        required_row = {"slurm_job_id", "allocated_gpu_seconds", "allocated_cpu_seconds",
+                        "not_submitted", "status", "reserved_gpu_seconds", "allocation_id", "attempt"}
+        fence = task["submission_intent_fence"]
+        if (not required_row <= set(row) or row["slurm_job_id"] is not None
+                or row["allocated_gpu_seconds"] is not None or row["allocated_cpu_seconds"] is not None
+                or row["not_submitted"] is not False
+                or row["status"] not in ("submitting", "submission_unknown", "cancelling")
+                or row["allocation_id"] != task["allocation_id"] or row["attempt"] != task["attempt"]
+                or type(fence) is not dict or set(fence) != {"connector_id", "lease_epoch", "event_id"}
+                or type(fence["lease_epoch"]) is not int or fence["lease_epoch"] < 1):
+            _error(409, "accuracy_invocation_abort_forbidden", "Conflicting native evidence cannot be zero-closed")
+        intent = task["submission_intent"]
+        manifest = task["manifest"]
+        task["invocation_abort_receipt"] = {
+            "schema": protocol.INVOCATION_ABORT_SCHEMA,
+            "submission_protocol": protocol.INVOCATION_PROTOCOL,
+            "basis": "server_never_authorized", "invocation_authorized": False,
+            "campaign_id": campaign["id"], "task_id": task["id"],
+            "attempt": task["attempt"], "allocation_id": task["allocation_id"],
+            "context_id": manifest["context_id"], "manifest_sha256": task["manifest_sha256"],
+            "submission_intent_sha256": protocol.checksum(intent),
+            "intent_fence": deepcopy(task["submission_intent_fence"]),
+            "closed_at": self.app.clock()}
+        row = self._row(state, campaign, task)
+        account = campaign["accounting"][row["method"]]
+        account["reserved_gpu_seconds"] -= row["reserved_gpu_seconds"]
+        account["unknown_allocations"] -= 1
+        row.update({"status": "cancelled", "allocated_gpu_seconds": 0,
+                    "allocated_cpu_seconds": 0, "reserved_gpu_seconds": 0, "not_submitted": True})
+        task["accounting_closed"] = True
+        task["status"] = "cancelled"
+        task["lease"] = None
+        campaign["ledger_revision"] += 1
+        campaign["active_tasks"].remove(task["id"])
+
     def cancel(self, state, campaign):
         if campaign["status"] in ("completed", "cancelled") or (campaign["status"] == "failed" and not campaign["active_tasks"]):
             return
@@ -738,6 +815,10 @@ class AccuracyRoutes:
             task = self._task(state, campaign, ident, mutable=True)
             if task["status"] in ("ready", "claimed") and task["submission_intent"] is None:
                 self._never_submitted(state, campaign, task, "cancelled")
+            elif (self._uses_invocation_fence(campaign, task)
+                    and task["submission_intent"] is not None
+                    and task.get("invocation_authorization") is None):
+                self._abort_ungranted_invocation(state, campaign, task)
             else:
                 task["status"] = "cancelling"
                 if not task["accounting_closed"]:
@@ -817,7 +898,10 @@ class AccuracyRoutes:
         if prior:
             if prior["hash"] != digest:
                 _error(409, "idempotency_conflict", "Event ID already binds a different payload")
-            return 200, deepcopy(prior["response"])
+            response = deepcopy(prior["response"])
+            if value["type"] == "authorize_invocation":
+                response["invocation_authorization_fresh"] = False
+            return 200, response
         if value["attempt"] != task["attempt"] or value["manifest_sha256"] != task["manifest_sha256"]:
             _error(409, "accuracy_task_conflict", "Immutable task identity changed")
         lease = task["lease"]
@@ -833,6 +917,36 @@ class AccuracyRoutes:
         extras = {}
         if kind == "heartbeat":
             pass
+        elif kind == "authorize_invocation":
+            context = self._context(campaign)
+            if (not context["enabled"] or not protocol.source_policy_qualified(context)
+                    or not self._uses_invocation_fence(campaign, task)
+                    or status != "submitting" or campaign["status"] == "cancelling"
+                    or task["submission_intent"] is None or task["slurm_job_id"] is not None
+                    or task["accounting_closed"] or task.get("invocation_abort_receipt") is not None):
+                _error(409, "accuracy_invocation_forbidden", "Task has no current invocation authority")
+            if task.get("invocation_authorization") is not None:
+                _error(409, "accuracy_invocation_already_authorized", "Invocation already has one durable grant")
+            fence = task.get("submission_intent_fence")
+            if (not isinstance(fence, dict) or fence["connector_id"] != value["connector_id"]
+                    or fence["lease_epoch"] != value["lease_epoch"]):
+                _error(409, "accuracy_invocation_fence_conflict", "Original invocation lease fence changed")
+            nonce = payload["grant_request_nonce"]
+            if type(nonce) is not str or re.fullmatch(r"[a-f0-9]{32}", nonce) is None:
+                raise ValueError("Exact invocation request nonce required")
+            if payload["submission_intent_sha256"] != protocol.checksum(task["submission_intent"]):
+                _error(409, "accuracy_invocation_intent_conflict", "Immutable submission intent changed")
+            grant = {"schema": protocol.INVOCATION_AUTHORIZATION_SCHEMA,
+                "grant_id": secrets.token_hex(16), "grant_request_nonce": nonce,
+                "submission_intent_sha256": payload["submission_intent_sha256"],
+                "task_id": task["id"], "attempt": task["attempt"],
+                "allocation_id": task["allocation_id"], "context_id": task["manifest"]["context_id"],
+                "manifest_sha256": task["manifest_sha256"], "connector_id": value["connector_id"],
+                "lease_epoch": value["lease_epoch"], "authorized_at": self.app.clock()}
+            protocol.validate_invocation_authorization(grant, task["manifest"], task["submission_intent"], nonce)
+            task["invocation_authorization"] = deepcopy(grant)
+            extras["invocation_authorization"] = deepcopy(grant)
+            extras["invocation_authorization_fresh"] = True
         elif kind == "submitting":
             if status != "claimed" or task["submission_intent"] is not None or campaign["status"] == "cancelling":
                 _error(409, "accuracy_submission_conflict", "Task cannot submit another native allocation")
@@ -840,9 +954,14 @@ class AccuracyRoutes:
             if payload["marker"] != task["marker"]:
                 raise ValueError("Native owned marker changed")
             task["submission_intent"] = deepcopy(payload)
+            if self._uses_invocation_fence(campaign, task):
+                task["submission_intent_fence"] = {"connector_id": value["connector_id"],
+                    "lease_epoch": value["lease_epoch"], "event_id": value["event_id"]}
             task["status"] = "submitting"
             self._row(state, campaign, task)["status"] = "submitting"
         elif kind in ("submitted", "queued", "running"):
+            if self._uses_invocation_fence(campaign, task) and task.get("invocation_authorization") is None:
+                _error(409, "accuracy_invocation_not_authorized", "Future native producer requires its server grant")
             if task["accounting_closed"]:
                 _error(409, "accuracy_accounting_closed", "Closed native allocation cannot reopen")
             if status not in ("submitting", "submission_unknown", "submitted", "queued", "running", "cancelling"):
