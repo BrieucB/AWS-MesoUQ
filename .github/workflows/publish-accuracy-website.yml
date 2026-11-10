@@ -160,7 +160,25 @@ jobs:
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.css",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/app.js"
-                  ]
+                  ],
+                  "Condition": {
+                    "Null": {
+                      "s3:if-match": "false"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": [
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-accuracy.js",
+                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js"
+                  ],
+                  "Condition": {
+                    "StringEquals": {
+                      "s3:if-none-match": "*"
+                    }
+                  }
                 }
               ]
             }
