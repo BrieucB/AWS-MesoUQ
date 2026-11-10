@@ -33,6 +33,7 @@ GUARD_KEYS = {
     "v1_policy_sha256", "v2_policy_sha256", "environment_sha256",
     "project_policy_sha256", "codec_sha256",
 }
+POLICY_CODEC_SOURCE = "services/aws_publishing/aws_publishing/accuracy_policy_env.py"
 SOURCE_FILES = (
     "tools/publish_accuracy_policy.py",
     "tools/publish_backend.py",
@@ -228,7 +229,7 @@ def verify_checkout(guard, *, root=SOURCE_ROOT):
                                   capture_output=True, timeout=10, check=False)
             require(blob.returncode == 0 and blob.stdout == (root / name).read_bytes(),
                     "accuracy-policy-source-conflict")
-        codec = root / SOURCE_FILES[-1]
+        codec = root / POLICY_CODEC_SOURCE
         require(hashlib.sha256(codec.read_bytes()).hexdigest() == guard["codec_sha256"],
                 "accuracy-policy-codec-conflict")
     except (OSError, UnicodeError, subprocess.TimeoutExpired):

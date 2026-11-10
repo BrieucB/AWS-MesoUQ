@@ -181,6 +181,7 @@ def test_legacy_rpc_routes_do_not_call_new_work_qualification(monkeypatch, opera
 
 
 def test_prepare_rejects_record_source_mismatch_before_effects(tmp_path, monkeypatch):
+    _portable_xattr_mock_symbols(monkeypatch)
     _, manifest, control, path, reached = real_protocol_native_control(
         tmp_path, monkeypatch, "qualification-λ")
     context = deepcopy(control["context"])
@@ -228,3 +229,20 @@ def test_actual_source_mismatch_filters_one_context_but_admits_next(monkeypatch)
     executor._rpc = rpc
     assert executor.admitted_contexts() == [second["id"]]
     assert set(calls) == {first["id"], second["id"]}
+
+
+def _portable_xattr_mock_symbols(monkeypatch):
+    import errno
+    import os
+    def no_linux_acl(*args, **kwargs):
+        raise OSError(getattr(errno, "ENODATA", 61), "synthetic POSIX ACL absent")
+    for name in ("getxattr", "removexattr"):
+        if not hasattr(os, name):
+            monkeypatch.setattr(os, name, no_linux_acl, raising=False)
+
+
+def test_prepare_source_mismatch_with_absent_platform_xattrs(tmp_path, monkeypatch):
+    import os
+    for name in ("getxattr", "setxattr", "listxattr", "removexattr"):
+        monkeypatch.delattr(os, name, raising=False)
+    test_prepare_rejects_record_source_mismatch_before_effects(tmp_path, monkeypatch)
