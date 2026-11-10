@@ -6,7 +6,6 @@ on:
       baseline_commit:
         description: Exact source commit matching the current website baseline
         required: true
-        default: 'd3ea72e842e8e6dc24120e5edf62029362f01d5b'
         type: string
       expected_source_commit:
         description: Exact reviewed main commit to publish
@@ -160,25 +159,7 @@ jobs:
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-lab.css",
                     "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/app.js"
-                  ],
-                  "Condition": {
-                    "Null": {
-                      "s3:if-match": "false"
-                    }
-                  }
-                },
-                {
-                  "Effect": "Allow",
-                  "Action": "s3:PutObject",
-                  "Resource": [
-                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-accuracy.js",
-                    "arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/src/benchmark-workspace.js"
-                  ],
-                  "Condition": {
-                    "StringEquals": {
-                      "s3:if-none-match": "*"
-                    }
-                  }
+                  ]
                 }
               ]
             }

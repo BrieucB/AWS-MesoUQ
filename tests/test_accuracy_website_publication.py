@@ -125,9 +125,13 @@ class AccuracyPublicationTests(unittest.TestCase):
         self.assertEqual(set(write['Resource']), {'arn:aws:s3:::${{ env.WEBSITE_BUCKET }}/' + key for key in ORDER})
 
     def test_publication_baseline_matches_the_last_successful_private_entry_release(self):
-        baseline = 'd3ea72e842e8e6dc24120e5edf62029362f01d5b'
-        self.assertEqual(WORKFLOW.count(baseline), 2)
-        self.assertNotIn('dace4a501cb539d61ecad42e592f36b8666f2cc1', WORKFLOW)
+        workflow = WORKFLOW
+        match = re.search('(?m)^      baseline_commit:\\n(?:        [^\\n]*\\n)+', workflow)
+        self.assertIsNotNone(match)
+        block = match.group()
+        self.assertRegex(block, '(?m)^        required: true$')
+        self.assertRegex(block, '(?m)^        type: string$')
+        self.assertNotRegex(block, '(?m)^        default:')
 
     def test_workflow_runs_the_actual_accuracy_build_gate_before_credentials(self):
         command = 'python3 tests/test_accuracy_website_publication.py AccuracyBuildTests -v'
