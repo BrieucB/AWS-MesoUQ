@@ -314,6 +314,7 @@ def test_script_has_one_gpu_no_untrusted_import_path_and_bounded_clock(tmp_path)
 
 def test_rpc_bootstrap_binds_exact_entrypoint_and_refuses_changed_bytes(tmp_path):
     entry = private(tmp_path / "adapter.py",
+        b"def _verify_profile(*args, **kwargs): raise AssertionError('unused profile boundary')\n"
         b"def remote_request(request): return {'verified': True}\n")
     request = {"operation": "verify_profile",
         "context": {"adapter_sha256": digest(entry.read_bytes())},
@@ -334,7 +335,8 @@ def test_executor_uses_only_fixed_existing_transport_and_cancel_guard():
         def context(self, identity): return {"id": identity}
         def operator(self, identity): return {"adapter_path": "/safe/adapter.py"}
         def supported(self): return ["approved"]
-        def validate_claim(self, claim): return claim
+        def validate_claim(self, claim, *, recovery=False): return claim
+        def require_new_work(self, identity): return self.context(identity)
     class Transport:
         staging_python = "/usr/bin/python3.11"
         calls = []
@@ -768,6 +770,8 @@ def test_low_quota_prepare_has_no_staging_side_effect(tmp_path, monkeypatch):
     monkeypatch.setattr(native, "_verify_profile", lambda *a, **kw: Guard())
     monkeypatch.setattr(protocol, "validate_context", lambda value: value)
     monkeypatch.setattr(protocol, "validate_manifest", lambda value: value)
+    monkeypatch.setattr(protocol, "validate_manifest_context", lambda *a: None)
+    monkeypatch.setattr(native, "_require_new_work_qualification", lambda *a: None)
     monkeypatch.setattr(native, "_home_preflight", lambda *a, **kw:
         (_ for _ in ()).throw(native.NativeContractError("quota refused")))
     monkeypatch.setattr(native, "_mkdir", lambda *a, **kw: pytest.fail("Staging ran before quota eligibility"))
@@ -823,6 +827,7 @@ def test_explicit_bytecode_disabled_bootstrap_creates_no_home_cache(tmp_path):
     probe = private(tmp_path / "probe.py", b"VALUE = 1\n")
     code = ("import sys\nsys.path.insert(0, " + repr(str(tmp_path)) + ")\n"
             "import probe\n"
+            "def _verify_profile(*args, **kwargs): raise AssertionError('unused profile boundary')\n"
             "def remote_request(request): return {'verified': True}\n").encode()
     entry = private(tmp_path / "adapter.py", code)
     request = {"operation": "verify_profile", "context": {"adapter_sha256": digest(code)},
@@ -881,13 +886,14 @@ def test_pre_submission_rechecks_exact_script_and_intent_before_quota(tmp_path, 
     calls = []
     quota = parse_quota(quota_text())
     monkeypatch.setattr(native, "_home_preflight", lambda *a, **kw: calls.append(True) or quota)
-    result = native._prepared_preflight({"context": context, "entry": entry})
+    monkeypatch.setattr(native, "_require_new_work_qualification", lambda *a: None)
+    result = native._prepared_preflight({"context": context, "entry": entry}, None)
     assert result["context_id"] == context["id"]
     assert result["manifest_sha256"] == control["manifest_sha256"]
     assert calls == [True]
     private(script, b"#!/bin/bash\nexit 1\n")
     with pytest.raises(native.NativeContractError, match="script/intent bytes changed"):
-        native._prepared_preflight({"context": context, "entry": entry})
+        native._prepared_preflight({"context": context, "entry": entry}, None)
     assert calls == [True]
 
 
@@ -897,7 +903,7 @@ def test_disabled_context_cannot_authorize_first_submission(tmp_path, monkeypatc
     monkeypatch.setattr(native, "_home_preflight", lambda *a, **kw:
         pytest.fail("Disabled context reached new-work quota authorization"))
     with pytest.raises(native.NativeContractError, match="Disabled"):
-        native._prepared_preflight({"context": context, "entry": entry})
+        native._prepared_preflight({"context": context, "entry": entry}, None)
 
 
 @pytest.mark.parametrize("changed", ["source", "control"])
@@ -939,7 +945,8 @@ def test_typed_quota_denial_rpc_preserves_exact_task_binding():
     class Contexts:
         def context(self, identity): return {"id": identity}
         def operator(self, identity): return {}
-        def validate_claim(self, claim): return claim
+        def validate_claim(self, claim, *, recovery=False): return claim
+        def require_new_work(self, identity): return self.context(identity)
     class Transport:
         def run_bytes(self, argv, *, data):
             return native.canonical({"schema": "aws_mesouq.benchmark_accuracy_native_error.v1",
@@ -980,7 +987,8 @@ def test_native_rpc_never_serializes_full_coordinator_entry(tmp_path, operation)
     class Contexts:
         def context(self, identity): return {"id": identity}
         def operator(self, identity): return {"adapter_path": "/safe/adapter.py"}
-        def validate_claim(self, claim): return claim
+        def validate_claim(self, claim, *, recovery=False): return claim
+        def require_new_work(self, identity): return self.context(identity)
     class Transport:
         calls = []
         def run_bytes(self, argv, *, data):
@@ -1029,7 +1037,8 @@ def test_secret_in_immutable_native_input_fails_closed_instead_of_transferring(t
 @pytest.mark.parametrize("authorization", [False, None, 0, "yes"])
 def test_cancel_requires_explicit_true_even_when_slurm_ignores_callback_return(authorization):
     class Contexts:
-        def validate_claim(self, claim): return claim
+        def validate_claim(self, claim, *, recovery=False): return claim
+        def require_new_work(self, identity): return self.context(identity)
     class Slurm:
         transport = None
         invoked = False
@@ -1490,6 +1499,9 @@ def real_protocol_native_control(tmp_path, monkeypatch, nonce, *, portable_recor
         "maximum_artifact_files": 64,
         "capabilities": sorted(protocol.REQUIRED_CAPABILITIES),
         "allowed_artifacts": {"guide_preparation": []}}
+    context["source_qualification"] = {"schema": protocol.SOURCE_QUALIFICATION_SCHEMA,
+        "science_revision": "f"*40, "source_binding_sha256": "d"*64,
+        "semantic_policy_sha256": "e"*64}
     context["id"] = protocol.context_id(context)
     protocol.validate_context(context)
     scientific = protocol.wire.scientific_request_checksum(request)
@@ -1521,7 +1533,22 @@ def real_protocol_native_control(tmp_path, monkeypatch, nonce, *, portable_recor
     claim = {"task": {"manifest": manifest, "manifest_sha256": expected,
                      "marker": "mqacc-"+manifest["campaign_instance_id"]+"-"+manifest["task_id"]}}
     class Guard:
-        def install(self): return self
+        def __init__(self):
+            self.context = context
+            self.installed = False
+        def install(self):
+            self.installed = True
+            package = ModuleType("meso_uq.benchmark_lab.accuracy_v2")
+            policy = ModuleType(package.__name__ + ".policy")
+            policy.policy_fingerprint = lambda: "e"*64
+            package.policy = policy
+            for name in ("meso_uq", "meso_uq.benchmark_lab"):
+                parent = ModuleType(name)
+                parent.__path__ = []
+                monkeypatch.setitem(sys.modules, name, parent)
+            monkeypatch.setitem(sys.modules, package.__name__, package)
+            monkeypatch.setitem(sys.modules, policy.__name__, policy)
+            return self
         def check(self): return None
         def close(self): return None
     monkeypatch.setattr(native, "_verify_profile", lambda *a, **kw: Guard())
@@ -1709,6 +1736,8 @@ def test_native_prepare_releases_source_lease_even_when_preflight_fails(tmp_path
     monkeypatch.setattr(native, "_verify_profile", lambda *args, **kwargs: Guard())
     monkeypatch.setattr(protocol, "validate_context", lambda value: value)
     monkeypatch.setattr(protocol, "validate_manifest", lambda value: value)
+    monkeypatch.setattr(protocol, "validate_manifest_context", lambda *a: None)
+    monkeypatch.setattr(native, "_require_new_work_qualification", lambda *a: None)
     monkeypatch.setattr(native, "_require_scratch", lambda value: value)
     monkeypatch.setattr(native, "_home_preflight", lambda *args, **kwargs:
         (_ for _ in ()).throw(native.NativeContractError("preflight stopped")))

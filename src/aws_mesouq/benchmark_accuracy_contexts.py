@@ -207,7 +207,15 @@ class AccuracyExecutionContexts:
         return cls(read_registry(path), project=project, owner_sub=owner_sub)
 
     def supported(self):
-        return sorted(key for key, value in self.entries.items() if value["context"]["enabled"])
+        return sorted(key for key, value in self.entries.items()
+                      if value["context"]["enabled"]
+                      and protocol.source_policy_qualified(value["context"]))
+
+    def require_new_work(self, context_id):
+        context = self.context(context_id)
+        if not context["enabled"] or not protocol.source_policy_qualified(context):
+            raise ValueError("Accuracy source policy is not qualified for new native work")
+        return context
 
     def context(self, context_id):
         try:
@@ -219,7 +227,9 @@ class AccuracyExecutionContexts:
         self.context(context_id)
         return deepcopy(self.entries[context_id]["operator"])
 
-    def validate_claim(self, claim):
+    def validate_claim(self, claim, *, recovery=False):
+        if type(recovery) is not bool:
+            raise ValueError("Typed accuracy recovery mode required")
         protocol.keys(claim, {"campaign", "task"})
         if claim["campaign"] is None or claim["task"] is None:
             if claim["campaign"] is not None or claim["task"] is not None:
@@ -228,7 +238,7 @@ class AccuracyExecutionContexts:
         campaign, task = claim["campaign"], claim["task"]
         manifest = protocol.validate_manifest(task["manifest"])
         context = self.context(manifest["context_id"])
-        if not context["enabled"] and not task["reconcile_only"]:
+        if not context["enabled"] and not task["reconcile_only"] and not recovery:
             raise ValueError("Disabled accuracy context cannot start new native work")
         if (campaign["id"] != manifest["campaign_instance_id"]
                 or task["id"] != manifest["task_id"]
